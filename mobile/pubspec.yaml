@@ -43,6 +43,14 @@ dependencies:
   dio: ^5.7.0                    # REST client with X-API-Version header + 401/429 handling
   uuid: ^4.5.1                   # UUID v7 (time-ordered, 74-bit random suffix)
 
+  # PR-11: web dashboard — fl_chart BarChart + LineChart widgets.
+  # Pinned to 0.69.x: that release is the last one where `LineChart`'s
+  # `LineChartData` `lineBarsData` and `BarChart`'s `BarChartData`
+  # `barGroups` use the simple positional models documented in
+  # HANDOFF §4.2 PR-11. Newer majors (>= 1.0) renamed and retyped
+  # several fields.
+  fl_chart: ^0.69.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
