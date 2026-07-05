@@ -115,6 +115,10 @@ var _ OperatorLookup = (*MNPTRAdapter)(nil)
 // LookupByPhone resolves an E.164 number to a TR operator. Errors:
 //   - ErrInvalidInput: not E.164 or not a +90 number
 //   - ErrUnknownOperator: +90 but the 3-digit prefix is not in the table
+//
+// PRIVACY (ADR-0006): info.QueryValue is set to the MASKED form
+// (MaskPhoneE164) — never the raw E.164. The Service layer will
+// not re-mask; the masked value is what lands in cache + REST.
 func (a *MNPTRAdapter) LookupByPhone(_ context.Context, e164 string) (*OperatorInfo, error) {
 	if !looksLikeE164(e164) {
 		return nil, fmt.Errorf("phone %q: %w", e164, ErrInvalidInput)
@@ -137,9 +141,9 @@ func (a *MNPTRAdapter) LookupByPhone(_ context.Context, e164 string) (*OperatorI
 	// hundred, switch to a map[string]trPrefix keyed by opCode.
 	for _, row := range trMNPTable {
 		if row.Prefix == opCode {
-			return &OperatorInfo{
+			info := &OperatorInfo{
 				QueryType:    QueryPhoneE164,
-				QueryValue:   e164,
+				QueryValue:   "", // filled in below
 				Operator:     row.Operator,
 				OperatorName: row.OperatorName,
 				Country:      trCountryISO,
@@ -148,7 +152,11 @@ func (a *MNPTRAdapter) LookupByPhone(_ context.Context, e164 string) (*OperatorI
 				Source:       SourceTRMNPAPI,
 				Confidence:   0.95,
 				Timestamp:    a.now().UTC(),
-			}, nil
+			}
+			// Apply the privacy mask before returning. NEVER return the
+			// raw E.164.
+			applyPhoneMask(info, e164)
+			return info, nil
 		}
 	}
 	return nil, fmt.Errorf("phone %q (op-code %s): %w", e164, opCode, ErrUnknownOperator)

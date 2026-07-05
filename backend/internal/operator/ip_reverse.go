@@ -179,9 +179,9 @@ func (a *IPReverseAdapter) LookupByIP(ctx context.Context, ip string) (*Operator
 			if addr.Is6() && !addr.Is4In6() {
 				qt = QueryIPv6
 			}
-			return &OperatorInfo{
+			info := &OperatorInfo{
 				QueryType:    qt,
-				QueryValue:   ip,
+				QueryValue:   "", // filled below
 				Operator:     e.Operator,
 				OperatorName: e.OperatorName,
 				Country:      e.Country,
@@ -190,7 +190,11 @@ func (a *IPReverseAdapter) LookupByIP(ctx context.Context, ip string) (*Operator
 				Source:       e.Source,
 				Confidence:   0.80,
 				Timestamp:    a.now().UTC(),
-			}, nil
+			}
+			// PRIVACY (ADR-0006): apply MaskIP before returning. The
+			// raw IP MUST NEVER land in cache or response.
+			applyIPMask(info, ip)
+			return info, nil
 		}
 	}
 
@@ -198,10 +202,13 @@ func (a *IPReverseAdapter) LookupByIP(ctx context.Context, ip string) (*Operator
 	if a.whoisLookup != nil {
 		info, err := a.whoisLookup(ctx, addr)
 		if err == nil && info != nil {
-			// Override the query value with the original string the
-			// caller passed (the whois closure may not preserve it).
+			// Override the query value with the MASKED form (the
+			// whois closure may have set the raw IP). Apply masking
+			// even if the closure already masked — idempotent.
 			if info.QueryValue == "" {
-				info.QueryValue = ip
+				applyIPMask(info, ip)
+			} else {
+				applyIPMask(info, info.QueryValue)
 			}
 			if info.Timestamp.IsZero() {
 				info.Timestamp = a.now().UTC()

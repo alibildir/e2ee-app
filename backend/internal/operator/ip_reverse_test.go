@@ -48,9 +48,9 @@ func TestIPReverseAdapter_LookupByIP_KnownTR(t *testing.T) {
 			t.Errorf("LookupByIP(%q).MNC = %q, want %q",
 				c.ip, got.MNC, c.wantMNC)
 		}
-		if got.QueryValue != c.ip {
-			t.Errorf("LookupByIP(%q).QueryValue = %q, want %q",
-				c.ip, got.QueryValue, c.ip)
+		if got.QueryValue != MaskIP(c.ip) {
+			t.Errorf("LookupByIP(%q).QueryValue = %q, want %q (masked /24 form — ADR-0006 §Veri Minimizasyonu)",
+				c.ip, got.QueryValue, MaskIP(c.ip))
 		}
 		if got.QueryType != QueryIPv4 {
 			t.Errorf("LookupByIP(%q).QueryType = %q, want %q",
@@ -160,8 +160,8 @@ func TestIPReverseAdapter_WhoisIsCalledOnMiss(t *testing.T) {
 	if got.Source != SourceARINWhois {
 		t.Errorf("Source = %q, want %q", got.Source, SourceARINWhois)
 	}
-	if got.QueryValue != "1.2.3.4" {
-		t.Errorf("QueryValue = %q, want 1.2.3.4 (caller's original)", got.QueryValue)
+	if got.QueryValue != MaskIP("1.2.3.4") {
+		t.Errorf("QueryValue = %q, want %q (masked /24 form — ADR-0006)", got.QueryValue, MaskIP("1.2.3.4"))
 	}
 }
 

@@ -61,9 +61,9 @@ func TestMNPTRAdapter_LookupByPhone_KnownPrefixes(t *testing.T) {
 			t.Errorf("LookupByPhone(%q).QueryType = %q, want %q",
 				c.phone, got.QueryType, QueryPhoneE164)
 		}
-		if got.QueryValue != c.phone {
-			t.Errorf("LookupByPhone(%q).QueryValue = %q, want %q",
-				c.phone, got.QueryValue, c.phone)
+		if got.QueryValue != MaskPhoneE164(c.phone) {
+			t.Errorf("LookupByPhone(%q).QueryValue = %q, want %q (masked form — ADR-0006 §Veri Minimizasyonu)",
+				c.phone, got.QueryValue, MaskPhoneE164(c.phone))
 		}
 		if got.Timestamp.IsZero() {
 			t.Errorf("LookupByPhone(%q).Timestamp is zero", c.phone)
