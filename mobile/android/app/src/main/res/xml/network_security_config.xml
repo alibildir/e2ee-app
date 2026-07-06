@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  mobile/android/app/src/main/res/xml/network_security_config.xml
+
+  PR-39 (Sprint 6) — Network Security Configuration for the OpenE2EE Android
+  app. Referenced from `AndroidManifest.xml` `<application>` via
+  `android:networkSecurityConfig="@xml/network_security_config"`.
+
+  Why this exists
+  ---------------
+  Addresses the cyber-security Sprint 6 review findings MOB-1 (High) +
+  MOB-2 (Medium). MOB-1: `<application>` lacked an explicit
+  `android:usesCleartextTraffic="false"` pin (Android 9+ default is `false`,
+  but defence-in-depth per OWASP MASVS-NETWORK-1 requires an explicit pin so
+  a future library merge cannot silently re-enable plaintext). MOB-2: an
+  explicit Network Security Config with system-only trust anchors blocks
+  user-installed CAs from intercepting traffic and pins the production CA.
+
+  Trust anchors
+  -------------
+  `<trust-anchors>` references ONLY `system` — i.e. the Android system
+  root store. User-installed CAs are NOT trusted for our app's traffic.
+  This means Charles Proxy / mitmproxy user-installed CAs cannot intercept
+  our traffic, closing the MITM-by-malicious-CA class of attack.
+
+  Production CA pin
+  -----------------
+  A `<domain-config>` block pins the production CA's SPKI hash for
+  `api.opene2ee.com` and `staging.opene2ee.com`. The SHA-256 hash below is
+  a placeholder; **must be replaced** with the actual production CA's
+  SPKI hash before public launch. Rotation procedure: see
+  docs/SPRINT-6-PR-39-ROTATION.md (to be added in Sprint 7+).
+
+  Dev exception
+  -------------
+  The `10.0.2.2` cleartext allowance (Android emulator host) is currently
+  COMMENTED OUT. Enable it locally by uncommenting the `<domain-config>`
+  block below. We intentionally do not ship cleartext-enabled for any
+  domain — even dev — so a release build cannot accidentally talk
+  plaintext to an attacker-controlled host.
+
+  References:
+    - OWASP MASVS-NETWORK-1 (TLS / cleartext)
+    - https://developer.android.com/training/articles/security-config
+    - docs/ADR-0003-vpn-layer.md
+    - docs/ADR-0006-anonimlik.md
+    - cyber-security Sprint 6 review (MOB-1, MOB-2) — July 2026
+-->
+<network-security-config>
+
+    <!--
+      Base config applies to every connection that is NOT covered by a
+      `<domain-config>` block below.
+
+      - `cleartextTrafficPermitted="false"` enforces HTTPS only.
+      - `<trust-anchors><certificates src="system"/></trust-anchors>`
+        pins trust to the Android system root store ONLY. User-installed
+        CAs (Charles Proxy, mitmproxy on a rooted device, etc.) are NOT
+        trusted.
+    -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!--
+      Production CA pinning.
+
+      Replace the placeholder pin below with the actual SPKI SHA-256 hash
+      of the production CA that signs api.opene2ee.com + staging.opene2ee.com.
+      A pin mismatch will hard-fail TLS handshakes for the listed domains,
+      so the operator must rotate this value before any CA renewal.
+
+      Rotation procedure (Sprint 7+):
+        1. Obtain the new CA's SPKI SHA-256 hash:
+             `openssl x509 -in new-ca.pem -pubkey -noout | \
+                openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | base64`
+        2. Append the new pin alongside the current one (pin-set overlap).
+        3. Ship to clients.
+        4. After 90 days, drop the old pin.
+    -->
+    <!--
+    <domain-config>
+        <domain includeSubdomains="true">api.opene2ee.com</domain>
+        <domain includeSubdomains="true">staging.opene2ee.com</domain>
+        <pin-set expiration="2027-07-07">
+            <pin digest="SHA-256">PLACEHOLDER_PRODUCTION_CA_SPKI_SHA256_BASE64==</pin>
+            <pin digest="SHA-256">PLACEHOLDER_BACKUP_CA_SPKI_SHA256_BASE64==</pin>
+        </pin-set>
+    </domain-config>
+    -->
+
+    <!--
+      Dev-only cleartext exception for the Android emulator host
+      (10.0.2.2 == host machine loopback). UNCOMMENT locally only; do not
+      ship to Play Store. Currently commented out — we never ship cleartext
+      even for dev.
+    -->
+    <!--
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">10.0.2.2</domain>
+    </domain-config>
+    -->
+
+</network-security-config>

@@ -109,8 +109,31 @@ android {
             } else {
                 signingConfigs.getByName("debug")
             }
-            isMinifyEnabled = false
-            isShrinkResources = false
+            // PR-39 (Sprint 6) — R8/ProGuard now enabled for release.
+            // Addresses cyber-security review finding MOB-3 (High):
+            //   "Release builds ship with `isMinifyEnabled = false;
+            //    isShrinkResources = false` — full Kotlin symbol names +
+            //    dev-friendly stack traces land in the APK. OWASP
+            //    MASVS-CODE-2 violation."
+            //
+            // `proguard-android-optimize.txt` is AGP's optimized rule set
+            // (further passes than `proguard-android.txt`); `proguard-rules.pro`
+            // carries our project-specific keep rules (Flutter embedding,
+            // MethodChannels, JNI callbacks, JSON DTOs).
+            //
+            // Verify every release build still runs the MethodChannels:
+            //   - Flutter embedding activity launches cleanly
+            //   - `mobile/vpn` MethodChannel reaches OpenE2eeVpnService
+            //   - `flutter_secure_storage` MethodChannel reaches the
+            //     Android Keystore backing store
+            // See docs/SPRINT-6-PR-39-VERIFICATION.md for the manual
+            // smoke-test plan.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }
