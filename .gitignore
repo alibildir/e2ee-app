@@ -1,0 +1,192 @@
+# OpenE2EE monorepo — Multi-OS + multi-editor artifacts
+# ADR-0008 §2.3 — Sprint 2 PR-MP-3
+# OS-agnostic kalıp korunmuş + multi-OS/editor/Flutter/Go artifact'ları eklenmiş.
+
+# ─────────────────────────────────────────────────────────────
+# macOS
+# ─────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+._*
+.fseventsd
+
+# ─────────────────────────────────────────────────────────────
+# Windows
+# ─────────────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.url
+[Dd]esktop.ini
+
+# ─────────────────────────────────────────────────────────────
+# Linux / KDE / GNOME
+# ─────────────────────────────────────────────────────────────
+.directory
+.fuse_hidden*
+.Trash-*
+.nfs*
+
+# ─────────────────────────────────────────────────────────────
+# Editor / IDE
+# ─────────────────────────────────────────────────────────────
+# Visual Studio (NOT VSCode — farklı araç, farklı klasör)
+.vs/
+
+# VSCode — ignore everything except team-tracked config (PR-MP-6)
+# Syntax: .vscode/* matches files inside; negation re-includes specific files.
+# .vscode/ (directory-only) yerine .vscode/* kullanıldı → negation semantics reliable
+# (deeper dirs'da bile: matched files are explicitly re-included).
+# user-specific auto-generated dosyalar (argv.json, .browse.VC.db, vb.) ignored kalır.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# IntelliJ / GoLand / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Eclipse
+.bundle/
+.project
+.classpath
+.settings/
+
+# Vim / Emacs / Nano
+*.swp
+*.swo
+*~
+.\#*
+\#*\#
+.emacs.desktop
+.sticky.el
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# ─────────────────────────────────────────────────────────────
+# Flutter / Dart
+# ─────────────────────────────────────────────────────────────
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/.pub-cache/
+**/.pub/
+**/build/
+**/.fvm/
+**/.dart_tool/
+
+# iOS (CocoaPods)
+**/ios/Pods/
+**/ios/.symlinks/
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/ServiceDefinitions.json
+**/ios/Runner.xcworkspace/xcuserdata/
+
+# macOS Flutter desktop
+**/macos/Pods/
+**/macos/Flutter/ephemeral/
+
+# Android
+**/android/.gradle/
+**/android/captures/
+**/android/gradlew
+**/android/gradlew.bat
+**/android/local.properties
+**/android/key.properties
+**/*.jks
+
+# IDE files (Flutter)
+**/*.iml
+**/*.ipr
+**/*.iws
+
+# ─────────────────────────────────────────────────────────────
+# Go
+# ─────────────────────────────────────────────────────────────
+# Test binary & output
+*.test
+*.out
+*.cov
+*.cover
+coverage.out
+coverage.html
+coverage.xml
+$covFile
+
+# Vendoring (canonical Go ignore — go mod vendor kullanılmıyorsa)
+vendor/
+
+# Go workspace
+go.work
+go.work.sum
+
+# ─────────────────────────────────────────────────────────────
+# Node (eğer kullanılır)
+# ─────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log
+yarn-error.log
+.pnpm-debug.log
+.pnpm-store/
+
+# ─────────────────────────────────────────────────────────────
+# Secrets / env
+# ─────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+**/.env
+**/.env.local
+**/.env.*.local
+!**/infra/.env.example
+!**/.env.example
+!**/.env.sample
+
+# ─────────────────────────────────────────────────────────────
+# Build outputs / binaries
+# ─────────────────────────────────────────────────────────────
+*.exe
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+target/
+*.app
+*.ipa
+*.apk
+*.aab
+*.wasm
+*.map
+
+# ─────────────────────────────────────────────────────────────
+# Logs / temp
+# ─────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.temp
+.cache/
+.tmp/
+
+# ─────────────────────────────────────────────────────────────
+# Backups
+# ─────────────────────────────────────────────────────────────
+*.bak
+*.orig
+*.rej
+*.patch
+*.diff
