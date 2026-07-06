@@ -1,10 +1,15 @@
-## OpenE2EE — mobile/android — gitignore (combined from PR-22a Android VPN + Sprint 3 §9 native dev tooling)
+## OpenE2EE — mobile/android — gitignore (combined from PR-22a Android VPN +
+## Sprint 3 §9 native dev tooling + Sprint 5 PR-28 Android Gradle config)
 
 # Anything produced by `flutter pub get`, `flutter analyze`, the Android
-# Gradle Plugin, or `flutter build apk` should NOT be checked in. SPRINT-3
-# wires up only the source files (AndroidManifest.xml + Kotlin sources in
-# `app/src/main/kotlin/`); the full Gradle build config (gradle/, app/build.gradle,
-# settings.gradle, gradle-wrapper, etc.) is added in a follow-up PR.
+# Gradle Plugin, or `flutter build apk` should NOT be checked in.
+#
+# PR-28 (Sprint 5) lands the full Gradle build config: `settings.gradle.kts`,
+# root `build.gradle.kts`, `app/build.gradle.kts`, and
+# `gradle/wrapper/gradle-wrapper.properties` are all committed. The files
+# in the .gitignore rules below (build outputs, the wrapper JAR binary,
+# GeneratedPluginRegistrant, IDE caches, keystores) remain generated or
+# developer-local and MUST stay out of source control.
 
 # Local machine config — points at the developer's Flutter SDK.
 local.properties
