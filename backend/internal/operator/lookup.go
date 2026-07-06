@@ -37,6 +37,9 @@ package operator
 import (
 	"context"
 	"errors"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -124,6 +127,56 @@ const MaxE164Length = 16
 // MinE164Length is the shortest valid E.164 number. Country code "1"
 // + a single subscriber digit + "+" = 3 chars.
 const MinE164Length = 3
+
+// DefaultLookupBootstrapRetries is the default number of attempts
+// the RDAP bootstrap discovery makes before giving up. The first
+// request to rdap.org/ip/<ip> can transiently 404 for newly
+// allocated IP blocks (the central registry hasn't yet synced the
+// delegation); retries with exponential backoff absorb this race.
+//
+// Exported so callers and tests can reference the canonical
+// default without duplicating the magic number.
+const DefaultLookupBootstrapRetries = 3
+
+// LookupBootstrapBackoffs is the per-attempt delay schedule used
+// by the RDAP bootstrap retry policy. The first attempt fires
+// immediately (no delay), the second waits 50ms, the third waits
+// 200ms, and any further attempt waits 1s. With
+// DefaultLookupBootstrapRetries=3 the cumulative worst-case wall
+// time is ~250ms — well under the per-request HTTP timeout so
+// callers don't notice the retry.
+//
+// Exported so tests can assert the schedule and operators can
+// tune it via a future env var without chasing a magic number.
+var LookupBootstrapBackoffs = []time.Duration{
+	0,             // attempt 1: immediate
+	50 * time.Millisecond,
+	200 * time.Millisecond,
+	1 * time.Second,
+}
+
+// LookupBootstrapRetriesEnv is the env-var name consumed by
+// LoadLookupBootstrapRetriesFromEnv. Exported so main / config
+// code can reference it without a string-literal drift.
+const LookupBootstrapRetriesEnv = "OPERATOR_LOOKUP_BOOTSTRAP_RETRIES"
+
+// LoadLookupBootstrapRetriesFromEnv reads
+// OPERATOR_LOOKUP_BOOTSTRAP_RETRIES from the process environment.
+// Format: a positive integer string. When unset / empty /
+// malformed / non-positive, returns DefaultLookupBootstrapRetries.
+// The function reads the env directly (no caching) so tests can
+// swap the env var between calls without touching package state.
+func LoadLookupBootstrapRetriesFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv(LookupBootstrapRetriesEnv))
+	if raw == "" {
+		return DefaultLookupBootstrapRetries
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return DefaultLookupBootstrapRetries
+	}
+	return n
+}
 
 // OperatorLookup is the single dependency the REST layer (PR-7) has
 // on this package. The two production adapters — MNPTRAdapter and
