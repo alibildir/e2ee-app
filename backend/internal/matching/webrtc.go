@@ -82,6 +82,15 @@ import (
 // Mirrors the W3C RTCPeerConnectionState enum, trimmed to the
 // states PR-21a cares about (PR-21b Flutter integration may add
 // `disconnected` / `failed` probes later).
+//
+// Sprint 5 PR-31: extends the state machine with SessionStateFailedOffer
+// (FAILED_OFFER) — a dedicated terminal state for "the offer itself was
+// malformed" (e.g. SDP failed Validate, peer_hash mismatch on /offer).
+// Splitting "the offer I sent was bad" from the catch-all
+// SessionStateFailed lets the mobile UI distinguish between
+// "redial / rebuild the offer" (FAILED_OFFER, transient) and
+// "DTLS / ICE ran but failed" (FAILED, deeper). Per Sprint 3
+// PR-21a verifier §6 non-blocking follow-up note.
 type SessionState string
 
 // The legal states. Constant strings keep wire/JSON shape stable
@@ -99,16 +108,28 @@ const (
 	// SessionStateClosed: explicit "bye" or hard timeout.
 	// Terminal — no further transitions.
 	SessionStateClosed SessionState = "closed"
-	// SessionStateFailed: protocol violation / bad SDP /
-	// unexpected answer / etc. Terminal.
+	// SessionStateFailed: protocol violation / unexpected answer
+	// / DTLS-ICE failure on the wire / etc. Terminal — deeper
+	// than FAILED_OFFER (use FAILED_OFFER for "the offer SDP
+	// was rejected before it ever hit the network").
 	SessionStateFailed SessionState = "failed"
+	// SessionStateFailedOffer (FAILED_OFFER): the /offer POST
+	// carried an SDP that failed Validate (or an obvious
+	// offer-shape violation like peer_hash mismatch). Terminal,
+	// distinct from SessionStateFailed so the offerer can tell
+	// "I should rebuild the offer and retry" apart from "the
+	// peer connection ran but failed mid-handshake". The
+	// rejection reason is captured on WebRTCSession.FailedReason
+	// and surfaced via Snapshot() / WebRTCSessionView.
+	SessionStateFailedOffer SessionState = "failed_offer"
 )
 
 // Valid reports whether s is a known SessionState.
 func (s SessionState) Valid() bool {
 	switch s {
 	case SessionStateNew, SessionStateConnecting,
-		SessionStateConnected, SessionStateClosed, SessionStateFailed:
+		SessionStateConnected, SessionStateClosed,
+		SessionStateFailed, SessionStateFailedOffer:
 		return true
 	}
 	return false
@@ -126,11 +147,12 @@ var ErrInvalidStateTransition = errors.New("matching: invalid state transition")
 //
 // Allowed:
 //
-//	new        → connecting | failed
+//	new        → connecting | failed | failed_offer (Sprint 5 PR-31)
 //	connecting → connected | failed
 //	connected  → closed | failed
 //	closed     → (none — terminal)
 //	failed     → (none — terminal)
+//	failed_offer → (none — terminal, Sprint 5 PR-31)
 //
 // `force=true` lets cleanup/timeout paths mark closed sessions
 // as closed-again without error. Use sparingly.
@@ -162,7 +184,14 @@ func (ws *WebRTCSession) transitionLocked(to SessionState, force bool, now time.
 	if !force {
 		switch ws.State {
 		case SessionStateNew:
-			if to != SessionStateConnecting && to != SessionStateFailed {
+			// Sprint 5 PR-31: FAILED_OFFER is reachable from
+			// SessionStateNew only — that's "the offer itself
+			// was malformed". Connecting/Connected cannot
+			// transition into FAILED_OFFER (those are
+			// in-flight/established sessions; once we're
+			// past new we use SessionStateFailed for deeper
+			// problems).
+			if to != SessionStateConnecting && to != SessionStateFailed && to != SessionStateFailedOffer {
 				return fmt.Errorf("%w: new → %s not allowed", ErrInvalidStateTransition, to)
 			}
 		case SessionStateConnecting:
@@ -173,7 +202,10 @@ func (ws *WebRTCSession) transitionLocked(to SessionState, force bool, now time.
 			if to != SessionStateClosed && to != SessionStateFailed {
 				return fmt.Errorf("%w: connected → %s not allowed", ErrInvalidStateTransition, to)
 			}
-		case SessionStateClosed, SessionStateFailed:
+		case SessionStateClosed, SessionStateFailed, SessionStateFailedOffer:
+			// Sprint 5 PR-31: FAILED_OFFER is terminal,
+			// grouped with closed/failed for the rejection
+			// shortcut.
 			return fmt.Errorf("%w: session is terminal (%s)", ErrInvalidStateTransition, ws.State)
 		default:
 			return fmt.Errorf("%w: unknown current state %q", ErrInvalidStateTransition, ws.State)
@@ -287,6 +319,17 @@ type WebRTCSession struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
+	// FailedReason is set when the session transitions to
+	// SessionStateFailed or SessionStateFailedOffer (Sprint 5
+	// PR-31). It is the validation-error string that drove the
+	// transition (e.g. "matching: sdp is empty" or the
+	// offerer-mismatch message). Surfaced via WebRTCSessionView
+	// so the offerer can show "your SDP was rejected because
+	// X" instead of a bare 400. ADVISORY only — clients
+	// should NOT log or render the value as user-facing
+	// content if it might echo a peer-supplied substring.
+	FailedReason string `json:"failed_reason,omitempty"`
+
 	mu sync.Mutex // guards all fields above
 }
 
@@ -298,14 +341,15 @@ func (ws *WebRTCSession) Snapshot() WebRTCSessionView {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	return WebRTCSessionView{
-		ID:        ws.ID,
-		State:     ws.State,
-		Offerer:   ws.Offerer,
-		Answerer:  ws.Answerer,
-		HasOffer:  ws.Offer != nil,
-		HasAnswer: ws.Answer != nil,
-		CreatedAt: ws.CreatedAt,
-		UpdatedAt: ws.UpdatedAt,
+		ID:           ws.ID,
+		State:        ws.State,
+		Offerer:      ws.Offerer,
+		Answerer:     ws.Answerer,
+		HasOffer:     ws.Offer != nil,
+		HasAnswer:    ws.Answer != nil,
+		CreatedAt:    ws.CreatedAt,
+		UpdatedAt:    ws.UpdatedAt,
+		FailedReason: ws.FailedReason,
 	}
 }
 
@@ -314,14 +358,15 @@ func (ws *WebRTCSession) Snapshot() WebRTCSessionView {
 // retrieve them via the dedicated /ice endpoint so the wire
 // surface stays small.
 type WebRTCSessionView struct {
-	ID        string       `json:"id"`
-	State     SessionState `json:"state"`
-	Offerer   string       `json:"offerer,omitempty"`
-	Answerer  string       `json:"answerer,omitempty"`
-	HasOffer  bool         `json:"has_offer"`
-	HasAnswer bool         `json:"has_answer"`
-	CreatedAt time.Time    `json:"created_at"`
-	UpdatedAt time.Time    `json:"updated_at"`
+	ID           string       `json:"id"`
+	State        SessionState `json:"state"`
+	Offerer      string       `json:"offerer,omitempty"`
+	Answerer     string       `json:"answerer,omitempty"`
+	HasOffer     bool         `json:"has_offer"`
+	HasAnswer    bool         `json:"has_answer"`
+	CreatedAt    time.Time    `json:"created_at"`
+	UpdatedAt    time.Time    `json:"updated_at"`
+	FailedReason string       `json:"failed_reason,omitempty"` // Sprint 5 PR-31 — populated only when State is Failed/FailedOffer
 }
 
 // RemoteCandidates returns the candidates posted by peer `peer`.
@@ -620,15 +665,38 @@ func (m *Manager) CreateSession(id, offerer string) (*WebRTCSession, error) {
 // is past SessionStateNew. The session must already exist
 // (offerer calls CreateSession first; offerer is also the
 // ApplyOffer caller in MVP).
+//
+// Sprint 5 PR-31: when the SDP itself fails Validate, the
+// session is marked SessionStateFailedOffer (FAILED_OFFER) with
+// the validation error captured into ws.FailedReason before the
+// ErrInvalidEnvelope is surfaced. This lets observers
+// distinguish "I should rebuild the offer" (FAILED_OFFER) from
+// "the wire handshake failed mid-flight" (FAILED). Note that
+// we call GetSession FIRST now so the manager can transition an
+// existing session; an unknown session id still returns
+// ErrSessionNotFound (no record to mark).
+//
+// Locking note: we hold ws.mu for the full check-then-tag-then-fail
+// sequence. The offerer-mismatch branch inlines the equivalent of
+// FailOffer's transition + map-removal directly, because invoking
+// FailOffer here would require manually unlocking ws.mu first (to
+// avoid the deferred-unlock on return firing twice). Inline avoids
+// that dance while preserving the same observable behaviour: state
+// goes to FAILED_OFFER, ws.FailedReason is captured, the record
+// is removed from m.sessions under m.mu, and ErrInvalidEnvelope
+// is returned.
 func (m *Manager) ApplyOffer(id, peerHash string, sdp *SDPPayload) (*WebRTCSession, error) {
-	if err := sdp.Validate(); err != nil {
-		return nil, err
-	}
 	ws, err := m.GetSession(id)
 	if err != nil {
 		return nil, err
 	}
-	if err != nil {
+	if err := sdp.Validate(); err != nil {
+		// PR-31: tag the session as FAILED_OFFER with the
+		// validation error captured. Best-effort — if the
+		// state has somehow drifted (e.g. another goroutine
+		// closed it) FailOffer is a no-op and we still
+		// surface the validation error to the caller.
+		_ = m.FailOffer(id, err.Error())
 		return nil, err
 	}
 	ws.mu.Lock()
@@ -638,8 +706,21 @@ func (m *Manager) ApplyOffer(id, peerHash string, sdp *SDPPayload) (*WebRTCSessi
 			ErrInvalidStateTransition, ws.State)
 	}
 	if peerHash != ws.Offerer {
-		return nil, fmt.Errorf("%w: offerer mismatch: session=%s peer=%s",
-			ErrInvalidEnvelope, ws.Offerer, peerHash)
+		// Offerer mismatch is also a FAILED_OFFER event — the
+		// offer itself (with its offerer-bound identity) is
+		// the thing that's wrong, not the wire handshake.
+		// Tag-and-fail so a retry with a different peer_hash
+		// gets a fresh session. Inline the FailOffer body
+		// here to avoid double-locking ws.mu.
+		reason := fmt.Sprintf("offerer mismatch: session=%s peer=%s",
+			ws.Offerer, peerHash)
+		ws.FailedReason = reason
+		if tErr := ws.transitionLocked(SessionStateFailedOffer, false, m.now()); tErr == nil {
+			m.mu.Lock()
+			delete(m.sessions, id)
+			m.mu.Unlock()
+		}
+		return nil, fmt.Errorf("%w: %s", ErrInvalidEnvelope, reason)
 	}
 	ws.Offer = sdp
 	if err := ws.transitionLocked(SessionStateConnecting, false, m.now()); err != nil {
@@ -746,8 +827,20 @@ func (m *Manager) CloseSession(id string) error {
 }
 
 // FailSession marks a session SessionStateFailed with an
-// optional reason (returned to the caller; NOT stored on the
-// session — keep the record small for memory hygiene).
+// optional reason. The reason (when non-empty) is captured on
+// WebRTCSession.FailedReason before the transition, and is
+// surfaced through Snapshot() / WebRTCSessionView for the
+// caller (or subsequent /healthz / log scrape) to inspect.
+//
+// Sprint 5 PR-31 update: previously the reason was a
+// call-site-only hint (no observation). Now that the state
+// machine has FAILED_OFFER as a distinct terminal state, we
+// keep reason on the session record so the wire response can
+// include it for debugging. ADVISORY: callers MUST treat the
+// reason as untrusted — it may echo peer-supplied substrings.
+//
+// Idempotent on terminal states. Always removes the session
+// from the active map on a successful Failed transition.
 func (m *Manager) FailSession(id, reason string) error {
 	ws, err := m.GetSession(id)
 	if err != nil {
@@ -758,7 +851,52 @@ func (m *Manager) FailSession(id, reason string) error {
 	if isTerminal(ws.State) {
 		return nil
 	}
+	ws.FailedReason = reason
 	if err := ws.transitionLocked(SessionStateFailed, true, m.now()); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	delete(m.sessions, id)
+	m.mu.Unlock()
+	return nil
+}
+
+// FailOffer marks a still-fresh session (SessionStateNew) as
+// SessionStateFailedOffer (Sprint 5 PR-31) with a reason that
+// is captured into WebRTCSession.FailedReason for the wire
+// snapshot. Use this when the /offer POST itself was malformed
+// — SDP failed Validate, peer_hash mismatch, etc. — distinct
+// from the deeper SessionStateFailed ("we got past the offer
+// and the DTLS/ICE path failed").
+//
+// Behaviour:
+//   - Only applicable from SessionStateNew. Any other state is
+//     returned as a no-op (returns nil) — the offerer either
+//     already pushed us to "connecting" (success), or the
+//     session is terminal for some other reason; do not
+//     double-tag.
+//   - Removes the session from the active map on success. The
+//     offerer retries with a fresh session id, never with the
+//     same id. This matches the existing CloseSession /
+//     FailSession remove-from-map semantics.
+//   - The `reason` is the validation error string. Validate()
+//     produces messages like "matching: sdp is empty" or
+//     "matching: offerer mismatch: ...". These are advisory
+//     only — clients MUST NOT log them verbatim (they may echo
+//     peer-supplied substrings per RISKS §F12 / F25).
+func (m *Manager) FailOffer(id, reason string) error {
+	ws, err := m.GetSession(id)
+	if err != nil {
+		return err
+	}
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.State != SessionStateNew {
+		// past-new sessions use FailSession (FAILED) instead.
+		return nil
+	}
+	ws.FailedReason = reason
+	if err := ws.transitionLocked(SessionStateFailedOffer, false, m.now()); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -805,8 +943,14 @@ func (m *Manager) expireLocked(now time.Time) int {
 
 // isTerminal reports whether the given state is a terminal
 // one (no further transitions allowed).
+//
+// Sprint 5 PR-31: FAILED_OFFER is also terminal — once we mark
+// an offer-side failure the session is gone from the active map
+// and the offerer would start a brand-new session id on retry.
 func isTerminal(s SessionState) bool {
-	return s == SessionStateClosed || s == SessionStateFailed
+	return s == SessionStateClosed ||
+		s == SessionStateFailed ||
+		s == SessionStateFailedOffer
 }
 
 // isDeviceHashShape enforces the same length window the

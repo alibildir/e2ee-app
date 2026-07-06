@@ -88,6 +88,8 @@ func TestSessionState_Valid(t *testing.T) {
 	for _, st := range []SessionState{
 		SessionStateNew, SessionStateConnecting, SessionStateConnected,
 		SessionStateClosed, SessionStateFailed,
+		// Sprint 5 PR-31: FAILED_OFFER is a legal state.
+		SessionStateFailedOffer,
 	} {
 		if !st.Valid() {
 			t.Errorf("%q should be valid", st)
@@ -102,12 +104,14 @@ func TestSessionState_Valid(t *testing.T) {
 
 func TestSessionState_IsTerminal(t *testing.T) {
 	cases := map[SessionState]bool{
-		SessionStateNew:        false,
-		SessionStateConnecting: false,
-		SessionStateConnected:  false,
-		SessionStateClosed:     true,
-		SessionStateFailed:     true,
-		"":                     false,
+		SessionStateNew:          false,
+		SessionStateConnecting:   false,
+		SessionStateConnected:    false,
+		SessionStateClosed:       true,
+		SessionStateFailed:       true,
+		// Sprint 5 PR-31: FAILED_OFFER is terminal.
+		SessionStateFailedOffer: true,
+		"":                       false,
 	}
 	for st, want := range cases {
 		if got := isTerminal(st); got != want {
@@ -163,7 +167,11 @@ func TestTransition_ConnectedToClosed(t *testing.T) {
 }
 
 func TestTransition_TerminalRejectsAll(t *testing.T) {
-	for _, st := range []SessionState{SessionStateClosed, SessionStateFailed} {
+	for _, st := range []SessionState{
+		SessionStateClosed, SessionStateFailed,
+		// Sprint 5 PR-31: FAILED_OFFER is also terminal.
+		SessionStateFailedOffer,
+	} {
 		ws := &WebRTCSession{State: st}
 		for _, to := range []SessionState{
 			SessionStateNew, SessionStateConnecting, SessionStateConnected,
@@ -198,6 +206,39 @@ func TestTransition_UnknownTargetRejected(t *testing.T) {
 	ws := &WebRTCSession{State: SessionStateNew}
 	if err := ws.transition("invalid", true); !errors.Is(err, ErrInvalidStateTransition) {
 		t.Fatalf("expected ErrInvalidStateTransition for unknown target, got %v", err)
+	}
+}
+
+// TestTransition_NewToFailedOffer (Sprint 5 PR-31) — FAILED_OFFER is
+// reachable directly from SessionStateNew for "the offer itself was
+// malformed" (SDP validation, offerer mismatch, etc.). It does NOT
+// override the connecting/connected path — those still flow to
+// SessionStateConnected and on through SessionStateFailed for deeper
+// wire-handshake problems.
+func TestTransition_NewToFailedOffer(t *testing.T) {
+	ws := &WebRTCSession{State: SessionStateNew, UpdatedAt: time.Now()}
+	if err := ws.transition(SessionStateFailedOffer, false); err != nil {
+		t.Fatalf("new → failed_offer: unexpected error: %v", err)
+	}
+	if ws.State != SessionStateFailedOffer {
+		t.Errorf("state = %q, want failed_offer", ws.State)
+	}
+}
+
+// TestTransition_FailedOfferIsTerminal (Sprint 5 PR-31) — once a
+// session is in FAILED_OFFER, no transition is allowed out. The
+// terminal-rejection tests above (TestTransition_TerminalRejectsAll)
+// loop over closed/failed; this one specifically exercises
+// failed_offer as the source state.
+func TestTransition_FailedOfferIsTerminal(t *testing.T) {
+	ws := &WebRTCSession{State: SessionStateFailedOffer, UpdatedAt: time.Now()}
+	for _, to := range []SessionState{
+		SessionStateNew, SessionStateConnecting, SessionStateConnected,
+		SessionStateClosed, SessionStateFailed,
+	} {
+		if err := ws.transition(to, false); !errors.Is(err, ErrInvalidStateTransition) {
+			t.Errorf("failed_offer → %s should reject, got %v", to, err)
+		}
 	}
 }
 
@@ -695,6 +736,93 @@ func TestManager_FailSession(t *testing.T) {
 	}
 }
 
+// TestManager_FailOffer_FromNewState (Sprint 5 PR-31) — calling FailOffer
+// from a fresh new-state session transitions to FAILED_OFFER and removes
+// the session from the active map. Mirrors FailSession semantics but uses
+// the new state.
+func TestManager_FailOffer_FromNewState(t *testing.T) {
+	m := newTestManager()
+	ws, _ := m.CreateSession("", offerer)
+	if err := m.FailOffer(ws.ID, "test-reason-validation-failure"); err != nil {
+		t.Fatalf("FailOffer: %v", err)
+	}
+	// FAILED_OFFER is terminal + removed-from-map, just like FAILED.
+	if _, err := m.GetSession(ws.ID); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("after failed_offer, session should be removed: %v", err)
+	}
+}
+
+// TestManager_FailOffer_NotApplicableFromConnecting (Sprint 5 PR-31) —
+// once the offer was applied successfully (state=connecting), a stray
+// FailOffer is a no-op so callers don't accidentally re-tag an active
+// session as FAILED_OFFER. Past-new states use FailSession instead.
+func TestManager_FailOffer_NotApplicableFromConnecting(t *testing.T) {
+	m := newTestManager()
+	ws, _ := m.CreateSession("", offerer)
+	_, _ = m.ApplyOffer(ws.ID, offerer, goodOffer()) // new → connecting
+	if err := m.FailOffer(ws.ID, "should be ignored"); err != nil {
+		t.Errorf("FailOffer from connecting should be no-op, got %v", err)
+	}
+	got, err := m.GetSession(ws.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if got.State != SessionStateConnecting {
+		t.Errorf("state = %q, want connecting (still alive)", got.State)
+	}
+}
+
+// TestManager_ApplyOffer_BadSDP_MarksFailedOffer (Sprint 5 PR-31) —
+// integration: a bad SDP on the /offer HTTP path still produces a 400
+// (ErrInvalidEnvelope), but the session itself is now tagged FAILED_OFFER
+// and removed from the active map so observability can distinguish a
+// failed offer from a successful offer that later failed mid-flight.
+func TestManager_ApplyOffer_BadSDP_MarksFailedOffer(t *testing.T) {
+	m := newTestManager()
+	ws, _ := m.CreateSession("", offerer)
+	bad := &SDPPayload{SDPType: "offer", SDP: "garbage-not-sdp"}
+	if _, err := m.ApplyOffer(ws.ID, offerer, bad); err == nil {
+		t.Errorf("bad SDP should still error out")
+	}
+	// Session must be gone — same observable behaviour as FailSession.
+	if _, err := m.GetSession(ws.ID); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("session should be removed after FAILED_OFFER: %v", err)
+	}
+}
+
+// TestManager_ApplyOffer_OffererMismatch_MarksFailedOffer (Sprint 5
+// PR-31) — offerer-mismatch on /offer also drives the session to
+// FAILED_OFFER (the offer itself is the thing that's wrong, with its
+// offerer-bound identity).
+func TestManager_ApplyOffer_OffererMismatch_MarksFailedOffer(t *testing.T) {
+	m := newTestManager()
+	ws, _ := m.CreateSession("", offerer)
+	if _, err := m.ApplyOffer(ws.ID, offererOther, goodOffer()); err == nil {
+		t.Errorf("offerer-mismatch should still error out")
+	}
+	if _, err := m.GetSession(ws.ID); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("session should be removed after FAILED_OFFER (offerer mismatch): %v", err)
+	}
+}
+
+// TestManager_FailSession_StoresReason_OnFreshSession (Sprint 5
+// PR-31) — FailSession captures its reason into the session record
+// even though the session is removed from the map immediately. We
+// can't observe it through GetSession after the call, so this test
+// only asserts the call succeeds; reason propagation to wire is
+// covered by TestSnapshot_FailedReason.
+func TestManager_FailSession_StoresReason_OnFreshSession(t *testing.T) {
+	m := newTestManager()
+	ws, _ := m.CreateSession("", offerer)
+	// No ApplyOffer yet — session stays in new state.
+	if err := m.FailSession(ws.ID, "audit-reason"); err != nil {
+		t.Errorf("FailSession: %v", err)
+	}
+	if _, err := m.GetSession(ws.ID); !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("session should be removed after FailSession: %v", err)
+	}
+}
+
 func TestManager_ExpireLazy(t *testing.T) {
 	clock := newTestClock(time.Date(2026, 7, 6, 14, 0, 0, 0, time.UTC))
 	m := NewManagerWith(
@@ -845,6 +973,33 @@ func TestSnapshot_Serialisable(t *testing.T) {
 	s := string(b)
 	if strings.Contains(s, "candidate:") {
 		t.Errorf("snapshot must not include candidates: %s", s)
+	}
+	// Sprint 5 PR-31: no reason set → "failed_reason" must be
+	// omitted (omitempty). Connecting state shouldn't carry a reason.
+	if strings.Contains(s, "failed_reason") {
+		t.Errorf("snapshot must omit failed_reason when empty: %s", s)
+	}
+}
+
+// TestSnapshot_FailedReason (Sprint 5 PR-31) — when the session
+// carries a FailedReason, the snapshot serialises it through. The
+// reason is used by callers (and the API response in HandleOffer)
+// to give context for FAILED / FAILED_OFFER transitions.
+func TestSnapshot_FailedReason(t *testing.T) {
+	ws := &WebRTCSession{
+		ID:           "ts-test-fail",
+		State:        SessionStateFailedOffer,
+		Offerer:      offerer,
+		FailedReason: "matching: sdp is empty",
+	}
+	v := ws.Snapshot()
+	if v.FailedReason != "matching: sdp is empty" {
+		t.Errorf("FailedReason not propagated: got %q", v.FailedReason)
+	}
+	b, _ := json.Marshal(v)
+	s := string(b)
+	if !strings.Contains(s, `"failed_reason":"matching: sdp is empty"`) {
+		t.Errorf("expected failed_reason in JSON: %s", s)
 	}
 }
 

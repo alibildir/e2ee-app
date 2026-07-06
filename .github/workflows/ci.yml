@@ -106,9 +106,9 @@ jobs:
 
       - name: go test
         # No -race: cross-OS matrix is hermetic-friendly; -race is
-        # exercised by the legacy backend-test job on Linux. The
-        # matrix's job is to confirm the suite PASSES on all 3
-        # runners with the same source.
+        # exercised by the dedicated `go-test-race` job on Linux
+        # only (Sprint 5 PR-31). The matrix's job is to confirm
+        # the suite PASSES on all 3 runners with the same source.
         run: go test -count=1 ./...
 
   flutter-analyze-test:
@@ -339,6 +339,106 @@ jobs:
         with:
           name: backend-coverage
           path: backend/coverage.out
+
+  # ---------------------------------------------------------------------------
+  # Backend — race detection (Sprint 5 PR-31)
+  # ---------------------------------------------------------------------------
+  # Folds out the `-race` portion of `backend-test` into its own
+  # dedicated job so the race-detection signal is explicit in the
+  # workflow UI and not bundled with the coverage run. Per Sprint 3
+  # PR-21a verifier non-blocking follow-up: "TestManager_ConcurrentIceIsRaceFree
+  # -race flag Linux CI'da". The matrix job (`go-build-test`) and
+  # this job share the same go-test source; this one surfaces any
+  # data races the matrix would miss (it does not enable -race for
+  # hermetic-fast feedback).
+  #
+  # Why a dedicated job:
+  #   - Race failures are loud (panic + stack); a dedicated job
+  #     page is easier to triage than a coverage-upload failure
+  #     that happens to be a race.
+  #   - Some packages set GOMAXPROCS=1 in test helpers (the
+  #     WebRTC concurrent ICE fuzz test, etc.). Running those
+  #     under -race catches ordering bugs that the matrix
+  #     `go test -count=1 ./...` can't see.
+  #   - Ubuntu-only is intentional — `-race` uses thread-sanitiser
+  #     runtime overhead which roughly doubles wall-clock time;
+  #     doing it on Linux only keeps Windows/macOS matrix legs
+  #     fast.
+  # ---------------------------------------------------------------------------
+  go-test-race:
+    name: Backend — race detection (Ubuntu)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: timescale/timescaledb-ha:pg16
+        env:
+          POSTGRES_USER: opene2ee_test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: opene2ee_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: opene2ee_test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: opene2ee_test
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('backend/go.sum') }}
+
+      - name: Install deps
+        run: go mod download
+
+      - name: Wait for Postgres
+        run: |
+          until pg_isready -h localhost -p 5432; do
+            sleep 2
+          done
+
+      - name: go test -race ./...
+        # Sprint 5 PR-31: dedicated -race job for the WebRTC
+        # state-machine tests (TestManager_ConcurrentIceIsRaceFree,
+        # the FAILED_OFFER transition tests, etc.). The matrix
+        # job runs `go test -count=1 ./...` WITHOUT -race so
+        # Linux doesn't pay the 2x wall-time cost twice; this
+        # job is the canonical -race gate. Override
+        # GOMAXPROCS to 4 so multi-core race detection has
+        # enough scheduling headroom on the github-hosted
+        # ubuntu runners.
+        env:
+          GOMAXPROCS: 4
+        run: go test -race -count=1 ./...
 
   backend-build:
     name: Backend — docker build
