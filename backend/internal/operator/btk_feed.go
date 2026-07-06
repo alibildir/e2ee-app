@@ -48,6 +48,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -317,14 +318,25 @@ type BTKWebhookHandler func(ctx context.Context, ev BTKWebhookEvent) error
 // Sprint 3 uses a synchronous in-process delivery model — there
 // is no queue yet. The on-disk WAL / outbox pattern is a Sprint 4
 // concern (HANDOFF §9 "event sourcing backlog").
+//
+// MaxSkew is the replay-protection window: events whose timestamp
+// differs from now() by more than MaxSkew (in either direction) are
+// rejected as stale. The default is 5 minutes; production deployments
+// can tune it via the OPERATOR_BTK_MAX_SKEW env var (loaded with
+// LoadBTKMaxSkewFromEnv) and assign to MaxSkew before any Verify
+// call. A value <= 0 disables skew checking — useful for tests
+// that don't care about clock drift, NOT recommended in production.
 type BTKWebhookSubscription struct {
 	secret  []byte
 	handler BTKWebhookHandler
 	now     func() time.Time
 
-	// Replay protection: reject events with a timestamp older
-	// than maxSkew. Default 5 minutes.
-	maxSkew time.Duration
+	// MaxSkew is the maximum allowed clock drift between the
+	// webhook timestamp and the server's wall clock. Events
+	// outside this window are rejected as replay attacks. Default
+	// (set by NewBTKWebhookSubscription) is 5 minutes; overrideable
+	// via env var OPERATOR_BTK_MAX_SKEW (LoadBTKMaxSkewFromEnv).
+	MaxSkew time.Duration
 
 	// observed is a small LRU of recently-seen (timestamp, sig)
 	// tuples so a BTK retry of an already-processed event does
@@ -333,9 +345,49 @@ type BTKWebhookSubscription struct {
 	observed map[string]struct{}
 }
 
+// DefaultBTKMaxSkew is the fallback window applied by
+// NewBTKWebhookSubscription when no env var is set. Exported so
+// callers and tests can reference the canonical default without
+// duplicating the magic number.
+const DefaultBTKMaxSkew = 5 * time.Minute
+
+// BTKMaxSkewEnv is the env-var name used by LoadBTKMaxSkewFromEnv.
+// Exported so main / config code can reference it without a string
+// literal drift.
+const BTKMaxSkewEnv = "OPERATOR_BTK_MAX_SKEW"
+
+// LoadBTKMaxSkewFromEnv reads OPERATOR_BTK_MAX_SKEW from the
+// process environment. Format: a Go duration string accepted by
+// time.ParseDuration (e.g. "5m", "30s", "1h", "500ms"). When unset
+// or empty, returns DefaultBTKMaxSkew (5m). When set but malformed,
+// returns DefaultBTKMaxSkew AND logs nothing — main() can decide
+// whether to surface a warning. This is a helper, NOT a fatal
+// config failure: a bad value should not prevent startup, since
+// the operator service still works with the default window.
+//
+// The function reads the env directly (no caching) so tests can
+// swap the env var between calls without touching package state.
+func LoadBTKMaxSkewFromEnv() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(BTKMaxSkewEnv))
+	if raw == "" {
+		return DefaultBTKMaxSkew
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return DefaultBTKMaxSkew
+	}
+	return d
+}
+
 // NewBTKWebhookSubscription wires a handler. secret must be the
 // same HMAC key BTK uses to sign bodies; handler is the callback
-// for verified events.
+// for verified events. MaxSkew defaults to DefaultBTKMaxSkew (5m);
+// callers that need to apply LoadBTKMaxSkewFromEnv should assign
+// to the returned subscription's MaxSkew field before invoking
+// Verify, e.g.:
+//
+//	sub, _ := NewBTKWebhookSubscription(secret, handler)
+//	sub.MaxSkew = LoadBTKMaxSkewFromEnv()
 func NewBTKWebhookSubscription(secret []byte, handler BTKWebhookHandler) (*BTKWebhookSubscription, error) {
 	if len(secret) == 0 {
 		return nil, errors.New("operator: NewBTKWebhookSubscription: empty secret")
@@ -347,7 +399,7 @@ func NewBTKWebhookSubscription(secret []byte, handler BTKWebhookHandler) (*BTKWe
 		secret:   append([]byte(nil), secret...), // copy
 		handler:  handler,
 		now:      time.Now,
-		maxSkew:  5 * time.Minute,
+		MaxSkew:  DefaultBTKMaxSkew,
 		observed: make(map[string]struct{}),
 	}, nil
 }
@@ -369,9 +421,9 @@ func (s *BTKWebhookSubscription) Verify(ctx context.Context, body []byte, signat
 	if err != nil {
 		return fmt.Errorf("btk webhook: bad timestamp %q: %w", timestamp, ErrInvalidInput)
 	}
-	if d := s.now().Sub(ts); d > s.maxSkew || d < -s.maxSkew {
+	if d := s.now().Sub(ts); d > s.MaxSkew || d < -s.MaxSkew {
 		return fmt.Errorf("btk webhook: timestamp skew %s exceeds max %s: %w",
-			d, s.maxSkew, ErrInvalidInput)
+			d, s.MaxSkew, ErrInvalidInput)
 	}
 	// Replay-protection dedupe key: (timestamp, signature).
 	key := timestamp + "|" + signature
@@ -389,7 +441,7 @@ func (s *BTKWebhookSubscription) Verify(ctx context.Context, body []byte, signat
 		for i := 0; i < len(k); i++ {
 			if k[i] == '|' {
 				kts, perr := time.Parse(time.RFC3339, k[:i])
-				if perr == nil && s.now().Sub(kts) > 2*s.maxSkew {
+				if perr == nil && s.now().Sub(kts) > 2*s.MaxSkew {
 					delete(s.observed, k)
 				}
 				break

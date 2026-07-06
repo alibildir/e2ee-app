@@ -292,3 +292,143 @@ func TestBTKWebhook_RequiresSecretAndHandler(t *testing.T) {
 		t.Error("nil handler accepted")
 	}
 }
+
+// TestBTKWebhook_DefaultMaxSkew documents the default skew window
+// applied by NewBTKWebhookSubscription. If a future PR changes the
+// default (or removes the field), this catches it.
+func TestBTKWebhook_DefaultMaxSkew(t *testing.T) {
+	sub, err := NewBTKWebhookSubscription([]byte("s3cr3t"), func(_ context.Context, _ BTKWebhookEvent) error { return nil })
+	if err != nil {
+		t.Fatalf("NewBTKWebhookSubscription: %v", err)
+	}
+	if sub.MaxSkew != DefaultBTKMaxSkew {
+		t.Errorf("default MaxSkew = %s, want %s", sub.MaxSkew, DefaultBTKMaxSkew)
+	}
+	if DefaultBTKMaxSkew != 5*time.Minute {
+		t.Errorf("DefaultBTKMaxSkew drifted: %s, want 5m", DefaultBTKMaxSkew)
+	}
+}
+
+// TestBTKWebhook_NonDefaultMaxSkew exercises the tunable MaxSkew
+// field. We construct a subscription with a tighter 30-second
+// window and verify:
+//   - a 10-second-old timestamp is accepted (within window).
+//   - a 60-second-old timestamp is rejected as stale (ErrInvalidInput).
+//   - a future-leaning timestamp beyond the window is also rejected
+//     (replay protection covers both directions).
+func TestBTKWebhook_NonDefaultMaxSkew(t *testing.T) {
+	sub, err := NewBTKWebhookSubscription([]byte("s3cr3t"), func(_ context.Context, _ BTKWebhookEvent) error { return nil })
+	if err != nil {
+		t.Fatalf("NewBTKWebhookSubscription: %v", err)
+	}
+	sub.MaxSkew = 30 * time.Second
+
+	body := []byte(`{"msisdn":"+905320000000"}`)
+	sig := sub.Sign(body)
+
+	// (a) 10s in the past → well within the 30s window.
+	within := time.Now().UTC().Add(-10 * time.Second).Format(time.RFC3339)
+	if err := sub.Verify(context.Background(), body, sig, within); err != nil {
+		t.Errorf("Verify (within window): %v, want nil", err)
+	}
+
+	// (b) 60s in the past → outside the 30s window. The handler
+	// would be called for case (a), so we use a fresh sig/body for
+	// case (b) to avoid the replay-dedupe short-circuit.
+	body2 := []byte(`{"msisdn":"+905320000001"}`)
+	sig2 := sub.Sign(body2)
+	stale := time.Now().UTC().Add(-60 * time.Second).Format(time.RFC3339)
+	if err := sub.Verify(context.Background(), body2, sig2, stale); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("Verify (60s old): err = %v, want ErrInvalidInput", err)
+	}
+
+	// (c) 60s in the future → also outside the 30s window. Use a
+	// unique body so we don't trip the replay dedupe.
+	body3 := []byte(`{"msisdn":"+905320000002"}`)
+	sig3 := sub.Sign(body3)
+	future := time.Now().UTC().Add(60 * time.Second).Format(time.RFC3339)
+	if err := sub.Verify(context.Background(), body3, sig3, future); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("Verify (60s future): err = %v, want ErrInvalidInput", err)
+	}
+}
+
+// TestLoadBTKMaxSkewFromEnv exercises the env-var reader across
+// the documented branches. The test sets and clears the env var
+// with t.Setenv so the change is automatically reverted.
+func TestLoadBTKMaxSkewFromEnv(t *testing.T) {
+	// (a) Unset / empty → default.
+	t.Setenv(BTKMaxSkewEnv, "")
+	if got := LoadBTKMaxSkewFromEnv(); got != DefaultBTKMaxSkew {
+		t.Errorf("empty env: got %s, want %s", got, DefaultBTKMaxSkew)
+	}
+
+	// (b) Whitespace-only → default.
+	t.Setenv(BTKMaxSkewEnv, "   ")
+	if got := LoadBTKMaxSkewFromEnv(); got != DefaultBTKMaxSkew {
+		t.Errorf("whitespace env: got %s, want %s", got, DefaultBTKMaxSkew)
+	}
+
+	// (c) Valid duration string → parsed value.
+	t.Setenv(BTKMaxSkewEnv, "30s")
+	if got := LoadBTKMaxSkewFromEnv(); got != 30*time.Second {
+		t.Errorf("30s env: got %s, want 30s", got)
+	}
+
+	// (d) Larger window via hour unit.
+	t.Setenv(BTKMaxSkewEnv, "1h")
+	if got := LoadBTKMaxSkewFromEnv(); got != time.Hour {
+		t.Errorf("1h env: got %s, want 1h", got)
+	}
+
+	// (e) Malformed value → fall back to default (graceful
+	// degradation, not a fatal config error).
+	t.Setenv(BTKMaxSkewEnv, "not-a-duration")
+	if got := LoadBTKMaxSkewFromEnv(); got != DefaultBTKMaxSkew {
+		t.Errorf("malformed env: got %s, want default %s", got, DefaultBTKMaxSkew)
+	}
+
+	// (f) Zero / negative durations → fall back to default. A
+	// zero-duration MaxSkew would defeat replay protection, so
+	// the loader rejects the env value rather than passing it
+	// through.
+	t.Setenv(BTKMaxSkewEnv, "0s")
+	if got := LoadBTKMaxSkewFromEnv(); got != DefaultBTKMaxSkew {
+		t.Errorf("zero env: got %s, want default %s", got, DefaultBTKMaxSkew)
+	}
+	t.Setenv(BTKMaxSkewEnv, "-5m")
+	if got := LoadBTKMaxSkewFromEnv(); got != DefaultBTKMaxSkew {
+		t.Errorf("negative env: got %s, want default %s", got, DefaultBTKMaxSkew)
+	}
+}
+
+// TestBTKWebhook_MaxSkewFromEnv_RoundTrip wires the env reader to
+// the subscription's MaxSkew field end-to-end. This is the path
+// main() will use at startup; documenting it in a test prevents
+// the helper and the field from drifting apart.
+func TestBTKWebhook_MaxSkewFromEnv_RoundTrip(t *testing.T) {
+	t.Setenv(BTKMaxSkewEnv, "20s")
+	sub, err := NewBTKWebhookSubscription([]byte("s3cr3t"), func(_ context.Context, _ BTKWebhookEvent) error { return nil })
+	if err != nil {
+		t.Fatalf("NewBTKWebhookSubscription: %v", err)
+	}
+	sub.MaxSkew = LoadBTKMaxSkewFromEnv()
+	if sub.MaxSkew != 20*time.Second {
+		t.Fatalf("MaxSkew after env apply = %s, want 20s", sub.MaxSkew)
+	}
+
+	// 5s in the past → accepted under 20s window.
+	body := []byte(`{"msisdn":"+905321111111"}`)
+	sig := sub.Sign(body)
+	within := time.Now().UTC().Add(-5 * time.Second).Format(time.RFC3339)
+	if err := sub.Verify(context.Background(), body, sig, within); err != nil {
+		t.Errorf("Verify (5s old, 20s window): %v, want nil", err)
+	}
+
+	// 60s in the past → rejected under 20s window.
+	body2 := []byte(`{"msisdn":"+905321111112"}`)
+	sig2 := sub.Sign(body2)
+	stale := time.Now().UTC().Add(-60 * time.Second).Format(time.RFC3339)
+	if err := sub.Verify(context.Background(), body2, sig2, stale); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("Verify (60s old, 20s window): err = %v, want ErrInvalidInput", err)
+	}
+}
