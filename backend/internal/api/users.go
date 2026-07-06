@@ -22,6 +22,21 @@ package api
 //     {deleted:true, device_id_hash:<hash>}. We do NOT echo
 //     any record of what was deleted (the mobile UI doesn't
 //     need it).
+//
+// AUTHZ (Sprint 6 PR-37, hand-off from cyber-security review —
+// AUTHZ-1 / STRIDE-6-04):
+//   - Until a Users table lands (Sprint 6+, ADR-0006), the
+//     login handler accepts any non-empty user_id. Any holder
+//     of a JWT therefore has the same authority as the device
+//     whose device_id_hash is in `sub`. Combined with the open
+//     DELETE /users/{hash} path, that meant a logged-in device
+//     could issue a KVKK delete against any OTHER device's
+//     salted hash. PR-37 closes this: the JWT subject MUST equal
+//     the path hash, else 403. The login endpoint stays open
+//     per its ADV-3 contract; only the destructive endpoints
+//     close the loop on `sub`. When the real Users table ships
+//     the same handler must additionally confirm the device row
+//     is still active — see ADR-0006 §Risk Register E3.
 
 import (
 	"context"
@@ -44,6 +59,41 @@ func (a *API) handleDeleteUser() http.HandlerFunc {
 		hash := chi.URLParam(r, "device_id_hash")
 		if !isValidDeviceHash(hash) {
 			writeBadRequest(w, "device_id_hash must be 16-64 lowercase hex characters")
+			return
+		}
+
+		// (0) AUTHZ (Sprint 6 PR-37): the JWT subject MUST equal
+		// the path hash. The IsAuthorized middleware has already
+		// verified the bearer and stamped the subject into the
+		// request context (auth.UserIDFromContext). A mismatch
+		// returns 403 with a generic message — we deliberately do
+		// not distinguish "no such device" from "wrong owner" so
+		// an attacker cannot enumerate device_id_hash values by
+		// probing this endpoint.
+		//
+		// Defence-in-depth note: even if Kong is bypassed (local
+		// dev, integration tests, future internal services) the
+		// Go middleware re-verifies the token — so by the time we
+		// reach this branch the subject is trustworthy. The
+		// dev-fallback JWT secret (cmd/server/main.go SEC-1) is
+		// documented as a no-go in production, so a production
+		// attacker cannot forge a token either.
+		subject := UserIDFromContext(r.Context())
+		if subject == "" {
+			// Defensive: should be unreachable because the
+			// route sits inside the IsAuthorized subtree. If it
+			// ever fires, the middleware wiring is broken —
+			// fail closed with 401 rather than run a destructive
+			// handler on an unverified request.
+			writeUnauthorized(w, "missing bearer token")
+			return
+		}
+		if subject != hash {
+			a.deps.Cfg.Logger.Warn("delete-user cross-device attempt blocked",
+				"err_kind", "authz",
+				"sub_matches_path", false,
+			)
+			writeForbidden(w, "authenticated subject is not authorized for this device")
 			return
 		}
 

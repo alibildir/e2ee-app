@@ -116,6 +116,14 @@ func TestRouter_AllRoutesMounted(t *testing.T) {
 	headers := withAPIHeaders(t, nil)
 	// Each route should respond with SOMETHING (even 405, 400, 500) — the
 	// point is they are mounted, not 404 from chi's NotFoundHandler.
+	//
+	// DELETE /api/v1/users/{hash} — Sprint 6 PR-37 — requires the
+	// JWT subject to equal the path hash (AUTHZ-1, cyber-security
+	// hand-off). The default header helper mints a bearer for
+	// "test-user-default" so we have to override the Authorization
+	// header to a subject that matches the placeholder path hash.
+	deleteHash := "abcdef1234567890abcdef1234567890"
+	headers[HeaderAuthorization] = "Bearer " + TestBearerToken(t, deleteHash)
 	cases := []struct {
 		method string
 		path   string
@@ -125,7 +133,7 @@ func TestRouter_AllRoutesMounted(t *testing.T) {
 		{"GET", "/api/v1/sessions", http.StatusOK},
 		{"GET", "/api/v1/matrix", http.StatusOK},
 		{"GET", "/api/v1/operator/lookup?qtype=phone_e164&q=%2B905321234567", http.StatusOK},
-		{"DELETE", "/api/v1/users/abcdef1234567890abcdef1234567890", http.StatusOK},
+		{"DELETE", "/api/v1/users/" + deleteHash, http.StatusOK},
 		// webrtc/*: newTestAPI doesn't wire a matching.Manager —
 		// /config returns 500 (WebRTC is nil), POSTs return 500
 		// for the same reason. The route is mounted (not 404);
