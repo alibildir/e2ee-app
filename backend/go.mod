@@ -2,6 +2,37 @@ module github.com/opene2ee-com/e2ee-app/backend
 
 go 1.25.0
 
+// pgx/v5 pin rationale (Sprint 6 PR-38 — hand-off from cyber-security
+// report §2.1 SCA-1 / SCA-2 / SCA-3; see
+// ~/.mavis/agents/cyber-security/workspace/reports/sprint6-security-review.md).
+//
+// Pinned version: v5.10.0 (latest stable as of 2026-07-07; confirmed
+// by `go list -m -u github.com/jackc/pgx/v5` returning no upgrade and
+// `govulncheck@v1.5.0` (DB 2026-06-26) reporting zero findings).
+//
+// Why this pin matters — three CVEs close at this version:
+//
+//   CVE-2026-33816  memory-safety bug in pgproto3 (fuzz-found; no known
+//                   in-the-wild exploit). Fixed in v5.9.0.
+//   CVE-2024-27304  SQL injection via Postgres protocol message-size
+//                   integer overflow (attacker splits one query into
+//                   multiple messages). Fixed in v5.5.4.
+//   CVE-2024-27289  SQL injection via the simple protocol when a
+//                   placeholder is immediately preceded by a minus
+//                   sign + a second string placeholder. Fixed in v5.5.4.
+//
+// The first CVE's < 5.9.0 affected range makes v5.9.0 the universal
+// floor — v5.10.0 covers all three. Do NOT bump below v5.9.0; the
+// hermetic test backend/internal/storage/pgx_pin_test.go
+// (TestPgxVersion_PostCVEChain) enforces this floor on every CI run,
+// and the `backend-govulncheck` GitHub Actions job in
+// .github/workflows/ci.yml re-verifies against the live vulnerability
+// DB on every PR.
+//
+// To bump: edit the require line, run `go mod tidy`, run
+// `govulncheck ./...` locally, and verify the new version covers all
+// three CVEs (consult https://github.com/jackc/pgx/releases).
+
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/go-chi/chi/v5 v5.3.0

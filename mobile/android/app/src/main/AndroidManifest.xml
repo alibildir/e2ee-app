@@ -23,6 +23,7 @@
   identifiers are forbidden.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools"
           package="com.opene2ee.opene2ee">
 
     <uses-permission android:name="android.permission.INTERNET" />
@@ -43,7 +44,10 @@
         android:label="OpenE2EE"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
-        android:enableOnBackInvokedCallback="true">
+        android:enableOnBackInvokedCallback="true"
+        android:usesCleartextTraffic="false"
+        tools:remove="android:usesCleartextTraffic"
+        android:networkSecurityConfig="@xml/network_security_config">
 
         <!--
           MainActivity — owns the VPN permission handshake

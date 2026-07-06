@@ -341,6 +341,73 @@ jobs:
           path: backend/coverage.out
 
   # ---------------------------------------------------------------------------
+  # Backend — govulncheck (Sprint 6 PR-38 — hand-off from cyber-security
+  # review §2.1 SCA-1/2/3)
+  # ---------------------------------------------------------------------------
+  # Runs `govulncheck ./...` against the backend module and fails on
+  # ANY known vulnerability. The canonical answer to "is pgx/v5 at
+  # v5.10.0 still affected by CVE-2026-33816 / CVE-2024-27304 /
+  # CVE-2024-27289?" — as of 2026-07-07, the answer is no (v5.10.0 is
+  # post-patch for all three), and govulncheck@v1.5.0 (vuln DB
+  # 2026-06-26) reports "No vulnerabilities found." against the
+  # current backend. This job re-verifies that posture on every PR.
+  #
+  # Companion to backend/internal/storage/pgx_pin_test.go — that test
+  # is the hermetic floor (no DB deps, no network), this job is the
+  # canonical live scan (uses vuln.go.dev at runtime). Both must pass
+  # for the security gate to be green.
+  # ---------------------------------------------------------------------------
+  backend-govulncheck:
+    name: Backend — govulncheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-govulncheck-${{ hashFiles('backend/go.sum') }}
+
+      - name: Install govulncheck
+        # Pinned at @latest for now — govulncheck releases are
+        # backwards-compatible with the vuln DB schema; bump to a
+        # concrete version once the project settles on a release
+        # cadence (Sprint 7+).
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        # `-show=verbose` prints every reached symbol with its vuln
+        # status, so the run log answers "did govulncheck actually
+        # walk the entry points?" in addition to the headline pass.
+        # Default exit code is non-zero on any finding; CI fails the
+        # job automatically. Uploads the JSON output as an artifact
+        # so future audits can replay the exact vuln DB snapshot.
+        run: |
+          set -euo pipefail
+          govulncheck -show=verbose ./... 2>&1 | tee govulncheck.log
+          govulncheck -json ./... > govulncheck.json || true
+
+      - name: Upload govulncheck logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-govulncheck
+          path: |
+            backend/govulncheck.log
+            backend/govulncheck.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
   # Backend — race detection (Sprint 5 PR-31)
   # ---------------------------------------------------------------------------
   # Folds out the `-race` portion of `backend-test` into its own

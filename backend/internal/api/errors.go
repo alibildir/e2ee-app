@@ -30,6 +30,7 @@ const (
 	CodeSchemaValidation    ErrorCode = "schema_validation"       // 400 — body failed JSON-Schema
 	CodeMethodNotAllowed    ErrorCode = "method_not_allowed"      // 405
 	CodeNotFound            ErrorCode = "not_found"               // 404
+	CodeForbidden           ErrorCode = "forbidden"               // 403 — authenticated but not authorized (e.g. cross-device)
 	CodeRateLimited         ErrorCode = "rate_limited"            // 429
 	CodePayloadTooLarge     ErrorCode = "payload_too_large"       // 413
 	CodeInternal            ErrorCode = "internal_error"          // 500 — never leak details
@@ -97,6 +98,28 @@ func writeValidation(w http.ResponseWriter, err *ValidationError) {
 func writeNotFound(w http.ResponseWriter, msg string) {
 	writeError(w, http.StatusNotFound, ErrorBody{
 		Code:    CodeNotFound,
+		Message: msg,
+	})
+}
+
+// writeForbidden is used by handlers that pass the IsAuthorized
+// middleware (so the request IS authenticated) but the caller
+// is not authorized to act on the target resource. The classic
+// case is a cross-device KVKK delete: sub=hashA trying to delete
+// hashB. We deliberately do NOT distinguish "no such device"
+// from "wrong owner" — both return 403 with a generic message
+// so a probing attacker cannot enumerate device_id_hash values.
+//
+// SECURITY (Sprint 6 PR-37, hand-off from cyber-security review):
+// Until a Users table lands (Sprint 6+, ADR-0006) the login
+// handler accepts any non-empty user_id, so the JWT subject is
+// itself unauthenticated — but the JWT is still the only handle
+// we have on the requesting device. Closing the destructive
+// endpoints on `sub == path hash` is the minimum-acceptable
+// AuthZ posture until the real Users table ships.
+func writeForbidden(w http.ResponseWriter, msg string) {
+	writeError(w, http.StatusForbidden, ErrorBody{
+		Code:    CodeForbidden,
 		Message: msg,
 	})
 }
