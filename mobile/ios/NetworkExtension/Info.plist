@@ -22,10 +22,14 @@
     time so the FQDN resolves to
     `OpenE2eeTunnelProvider.OpenE2eeTunnelProvider`.
   - `CFBundlePackageType` = `XPC!` — required for app extensions.
-  - `MinimumOSVersion` = 14.0 — matches the Runner target. NE per-app
+  - `MinimumOSVersion` = 15.0 — matches the Runner target. NE per-app
     VPN (`NEAppRules`) is iOS 14+; deny-list (`excludeAppRules`) is
-    iOS 15+. Sprint 4 raises to iOS 15+ once the deployment target
-    gate is opened.
+    iOS 15+. PR-39 (Sprint 6) raises the NE target to 15.0 to match the
+    Runner target (Runner/Info.plist line 98). Previously 14.0 here was
+    inconsistent with Runner's 15.0 pin, causing a user on iOS 14 to see
+    a cryptic install error when the extension tried to load on a host
+    that required iOS 15+. Cyber-security Sprint 6 review finding
+    STRIDE-6-01 / AUTHZ-9 / MOB-7 (High).
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -49,7 +53,7 @@
     <key>CFBundleVersion</key>
     <string>$(CURRENT_PROJECT_VERSION)</string>
     <key>MinimumOSVersion</key>
-    <string>14.0</string>
+    <string>15.0</string>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionPointIdentifier</key>
