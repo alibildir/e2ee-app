@@ -1,0 +1,99 @@
+#!/usr/bin/env pwsh
+# scripts/build-web.ps1 - Flutter web build wrapper (PR-27)
+# ADR-0008 S2.4 - PowerShell native fallback (mirrors scripts/build-web.sh)
+#
+# Why this script exists
+# ----------------------
+# `flutter build web` defaults to `lib/main.dart`. OpenE2EE deliberately
+# keeps a SEPARATE entry point for the web dashboard at `lib/web/main.dart`
+# (see mobile/lib/web/main.dart for the rationale, HANDOFF S4.2 PR-11).
+# Until the mobile-only `lib/main.dart` exists (future PR), running
+# `flutter build web` without `--target` produces a confusing
+# "Target of URI doesn't exist" error against `lib/main.dart`.
+#
+# This wrapper hard-codes the correct invocation:
+#     flutter build web --target=lib/web/main.dart
+# (run from inside the `mobile/` Flutter package)
+#
+# Usage:
+#   pwsh -File scripts/build-web.ps1
+#   pwsh -File scripts/build-web.ps1 -Release
+#   pwsh -File scripts/build-web.ps1 -Release -Renderer canvaskit
+#
+# Equivalent to: make build-web  (cross-platform Make target)
+
+[CmdletBinding()]
+param(
+    # Pass --release to flutter. Default: omitted (flutter default = release).
+    [switch]$Release,
+
+    # --web-renderer <canvaskit|html|wasm>. Default: omitted (flutter default).
+    [string]$Renderer
+)
+
+$ErrorActionPreference = 'Stop'
+
+# --- Resolve repo root from this script's location -------------------------
+$ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot   = (Resolve-Path (Join-Path $ScriptDir '..')).Path
+$MobileDir  = Join-Path $RepoRoot 'mobile'
+$TargetDart = Join-Path $MobileDir 'lib/web/main.dart'
+
+# --- Friendly pre-flight: ensure flutter project + web entry exist ----------
+if (-not (Test-Path $MobileDir)) {
+    Write-Host ''
+    Write-Error "Flutter project not found at '$MobileDir'. Did you clone the full repo?"
+    exit 1
+}
+
+if (-not (Test-Path $TargetDart)) {
+    Write-Host ''
+    Write-Host "ERROR: Flutter web entry not found at expected path:" -ForegroundColor Red
+    Write-Host "    $TargetDart"
+    Write-Host ''
+    Write-Host 'Why this happens:' -ForegroundColor Yellow
+    Write-Host '  OpenE2EE uses a non-standard Flutter web entry point at'
+    Write-Host '  mobile/lib/web/main.dart (PR-11 web dashboard). The default'
+    Write-Host '  `flutter build web` targets mobile/lib/main.dart (the future'
+    Write-Host '  mobile entry point, not yet in this checkout).'
+    Write-Host ''
+    Write-Host 'Fix one of:' -ForegroundColor Yellow
+    Write-Host '  - Restore mobile/lib/web/main.dart (the canonical web entry).'
+    Write-Host '  - Or update the --target=<path> flag in this wrapper if you'
+    Write-Host '    intentionally moved the web entry.'
+    Write-Host ''
+    exit 1
+}
+
+# --- Resolve flutter --------------------------------------------------------
+$flutterExe = (Get-Command flutter -ErrorAction SilentlyContinue).Source
+if (-not $flutterExe) {
+    Write-Error "flutter not found on PATH. Install Flutter SDK: https://docs.flutter.dev/get-started/install"
+    exit 1
+}
+
+# --- Compose flutter args ---------------------------------------------------
+$flutterArgs = @('build', 'web', '--target=lib/web/main.dart')
+if ($Release)  { $flutterArgs += '--release' }
+if ($Renderer) { $flutterArgs += @('--web-renderer', $Renderer) }
+
+# --- Header: Sprint 4 PR-27 context ----------------------------------------
+Write-Host '==> OpenE2EE Flutter web build (PR-27 wrapper)'
+Write-Host '    entry:   mobile/lib/web/main.dart (non-standard; see CONTRIBTING.md)'
+Write-Host "    args:     flutter $($flutterArgs -join ' ')"
+Write-Host '    output:  mobile/build/web'
+Write-Host ''
+
+# --- Run --------------------------------------------------------------------
+Push-Location $MobileDir
+try {
+    & $flutterExe @flutterArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "flutter build web failed (exit $LASTEXITCODE)"
+    }
+} finally {
+    Pop-Location
+}
+
+Write-Host ''
+Write-Host '==> Done. Output: mobile/build/web'
