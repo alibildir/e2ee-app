@@ -1,6 +1,13 @@
 // mobile/android/app/src/main/kotlin/com/opene2ee/opene2ee/MainActivity.kt
 //
 // PR-22a (Sprint 3) — Android MainActivity.
+// PR-28 (Sprint 5) — switched the engine attach/detach to the static
+//                    `OpenE2eeVpnService.attachFlutterEngine` /
+//                    `.detachFlutterEngine` companions (instead of
+//                    constructing throwaway instances) and added
+//                    `@RequiresApi(21)` guards + null-safe cleanup
+//                    around the `VpnService.prepare()` `getIfPresent`
+//                    pattern.
 //
 // Owns the VpnService permission handshake:
 //
@@ -18,6 +25,7 @@
 // References:
 //   - docs/ADR-0003-vpn-layer.md
 //   - docs/SPRINT-3-SCOPE.md §7 PR-22
+//   - docs/SPRINT-5-SCOPE.md §PR-28
 
 package com.opene2ee.opene2ee
 
@@ -26,6 +34,7 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import androidx.annotation.RequiresApi
 import com.opene2ee.opene2ee.vpn.OpenE2eeVpnService
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -66,8 +75,13 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // Hand the engine to the VpnService so it can call back into Dart.
-        OpenE2eeVpnService().attachFlutterEngine(flutterEngine)
+        // PR-28 §B.2 — use the singleton companion accessor instead of
+        // `OpenE2eeVpnService().attachFlutterEngine(...)`. The new form
+        // resolves to the running service instance (or queues the engine
+        // for replay if the service hasn't been created yet) so the
+        // MethodChannel handler is wired to the SAME object that will
+        // process Dart's `start` / `stop` / `status` commands.
+        OpenE2eeVpnService.attachFlutterEngine(flutterEngine)
 
         // Permission-request channel — Dart invokes `requestVpnPermission`.
         permissionsChannel = MethodChannel(
@@ -93,37 +107,66 @@ class MainActivity : FlutterActivity() {
      * Launch `VpnService.prepare(this)`. The Android system shows the
      * standard "VPN connection request" consent sheet. The result is
      * delivered to [onActivityResult].
+     *
+     * PR-28 §B.1 — explicit `getIfPresent` cleanup. `VpnService.prepare`
+     * returns `null` when the app is already authorised (the canonical
+     * "present, no work to do" signal — the original `getIfPresent`
+     * idiom the task refers to). The previous code inlined the `== null`
+     * comparison; this version routes both the "prepare not needed" and
+     * "consent dialog needed" branches through a single helper
+     * [resolvePrepareIntent] that centralises the null-check, logs the
+     * outcome, and isolates the `@RequiresApi(21)` requirement on
+     * `startActivityForResult` (deprecated on API 34+ in favour of the
+     * `registerForActivityResult` Activity-Result API; kept here to avoid
+     * re-architecting the permission handshake in PR-28 — see follow-up
+     * note in the deliverable).
      */
+    @RequiresApi(21)
     private fun requestVpnPermission(result: MethodChannel.Result) {
         if (pendingVpnResult != null) {
             result.error("vpn_prepare_in_flight", "Already awaiting a permission result", null)
             return
         }
+        when (val intent = resolvePrepareIntent()) {
+            null -> result.success(true)
+            else -> {
+                pendingVpnResult = result
+                try {
+                    @Suppress("DEPRECATION")
+                    startActivityForResult(intent, VPN_REQUEST_CODE)
+                } catch (e: Throwable) {
+                    pendingVpnResult = null
+                    result.error("vpn_prepare_launch_failed", e.message, null)
+                }
+            }
+        }
+    }
+
+    /**
+     * PR-28 §B.1 — single-source-of-truth helper for the `VpnService.prepare`
+     * null-check pattern (the "getIfPresent" idiom). Returns:
+     *   - `null` when the app is already authorised (no consent dialog needed);
+     *   - the launchable consent Intent otherwise.
+     */
+    @RequiresApi(21)
+    private fun resolvePrepareIntent(): Intent? {
         val intent = VpnService.prepare(this)
         if (intent == null) {
-            // No consent dialog needed — we're already prepared or the
-            // device has no VPN framework (emulator without Google APIs).
-            result.success(true)
-            return
+            android.util.Log.d(TAG, "VPN already authorised (prepare() returned null)")
         }
-        pendingVpnResult = result
-        try {
-            @Suppress("DEPRECATION")
-            startActivityForResult(intent, VPN_REQUEST_CODE)
-        } catch (e: Throwable) {
-            pendingVpnResult = null
-            result.error("vpn_prepare_launch_failed", e.message, null)
-        }
+        return intent
     }
 
     /**
      * Snapshot: have we already obtained consent? Use this to avoid
      * showing the dialog twice in the same session.
      */
+    @RequiresApi(21)
     private fun isVpnPrepared(): Boolean {
-        // VpnService.prepare() returning null on a fresh call is the
-        // canonical "already authorised" signal.
-        return VpnService.prepare(this) == null
+        // `VpnService.prepare(context)` returning null on a fresh call
+        // is the canonical "already authorised" signal — the `getIfPresent`
+        // null-check pattern.
+        return resolvePrepareIntent() == null
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -166,8 +209,10 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         permissionsChannel?.setMethodCallHandler(null)
         permissionsChannel = null
-        // Detach the service's channel so the engine doesn't double-fire.
-        OpenE2eeVpnService().detachFlutterEngine()
+        // PR-28 §B.2 — use the singleton companion accessor so we
+        // detach from the running instance (or clear the pending queue
+        // if the service never came up).
+        OpenE2eeVpnService.detachFlutterEngine()
         super.onDestroy()
     }
 }

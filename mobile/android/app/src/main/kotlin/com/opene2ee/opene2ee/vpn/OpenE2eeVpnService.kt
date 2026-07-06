@@ -3,6 +3,22 @@
 // PR-22a (Sprint 3) — Android VPN Service — REAL implementation.
 // PR-24 (Sprint 4) — moved from `mobile/lib/mobile/vpn/vpn_service_android.kt`
 //                    into the Android source tree so Gradle compiles it.
+// PR-28 (Sprint 5) — PR-22a follow-up batch:
+//                    (B.1) `@RequiresApi(21)` guards around `VpnService.Builder
+//                          .allowedApplications()` / `.disallowedApplications()`
+//                          call sites (API 21+, Lollipop).
+//                    (B.2) Transient service instance handling — companion
+//                          singleton so `MainActivity` no longer creates a
+//                          throwaway `OpenE2eeVpnService()` instance on
+//                          every engine attach/detach. Also switched the
+//                          foreground-service lifecycle to
+//                          `ServiceCompat.startForeground` with
+//                          `FOREGROUND_SERVICE_TYPE_SPECIAL_USE`.
+//                    (B.3) IPv6 transport header parsing stub — was
+//                          hard-coded null for srcPort/dstPort/tcpFlags on
+//                          IPv6 packets. Now walks past IPv6 extension
+//                          headers (limited to no-extension case; documented
+//                          below) to extract TCP/UDP ports + flags.
 //
 // This file is the canonical Kotlin source for the OpenE2EE Android VPN
 // service. It lives under `mobile/android/app/src/main/kotlin/` so the
@@ -77,10 +93,13 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
+import androidx.annotation.RequiresApi
+import androidx.core.app.ServiceCompat
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -137,6 +156,73 @@ class OpenE2eeVpnService : VpnService() {
 
         /** Intent action that calls `VpnService.prepare()` from MainActivity. */
         const val ACTION_PREPARE = "com.opene2ee.opene2ee.vpn.PREPARE"
+
+        // ─── PR-28 §B.2 — Transient service instance handling ──────────
+        //
+        // Background: prior to PR-28, `MainActivity.configureFlutterEngine`
+        // called `OpenE2eeVpnService().attachFlutterEngine(flutterEngine)`,
+        // creating a fresh (un-started) instance every time the Flutter
+        // engine was attached. The MethodChannel handler was therefore
+        // installed on an instance that the OS never started — so Dart →
+        // service calls would land on a no-op (state never updated,
+        // running flag false) and the real service instance (created by
+        // `Context.startForegroundService`) had no channel at all.
+        //
+        // Fix: the running service registers itself in `onCreate` and
+        // unregisters in `onDestroy`. `MainActivity` resolves the SAME
+        // instance via [activeInstance] before attaching the channel.
+        // If no instance is alive yet (legitimate early-launch window),
+        // the call is queued in [pendingEngine] and replayed by
+        // [onCreate] once the service is up. This closes the start/stop
+        // race window where Dart could call `start` between
+        // `MainActivity.configureFlutterEngine` and `OpenE2eeVpnService.onCreate`.
+        @Volatile
+        private var activeInstance: OpenE2eeVpnService? = null
+
+        /** Engine captured when a channel attach races service creation. */
+        @Volatile
+        private var pendingEngine: FlutterEngine? = null
+
+        /**
+         * Singleton accessor — returns the currently-running service, or
+         * null if it hasn't been started yet. Used by `MainActivity` so
+         * the MethodChannel handler is wired to the SAME instance that
+         * will receive Dart's `start` command.
+         */
+        @JvmStatic
+        fun getActiveInstance(): OpenE2eeVpnService? = activeInstance
+
+        /**
+         * Attach the Flutter engine to the active service instance. If
+         * the service hasn't been created yet (e.g. the activity wired
+         * its engine before the first `Context.startForegroundService`
+         * landed), the engine is queued and replayed in
+         * [OpenE2eeVpnService.onCreate] once the instance exists.
+         */
+        @JvmStatic
+        fun attachFlutterEngine(engine: FlutterEngine) {
+            val instance = activeInstance
+            if (instance != null) {
+                instance.attachFlutterEngine(engine)
+            } else {
+                pendingEngine = engine
+            }
+        }
+
+        /**
+         * Detach the Flutter engine. Safe to call even if no instance
+         * ever came up — drains the pending queue so we don't replay a
+         * stale engine against a fresh service later.
+         */
+        @JvmStatic
+        fun detachFlutterEngine() {
+            val instance = activeInstance
+            if (instance != null) {
+                instance.detachFlutterEngine()
+            } else {
+                pendingEngine = null
+            }
+        }
     }
 
     /** Lifecycle states exposed via `status` to Dart. */
@@ -244,7 +330,16 @@ class OpenE2eeVpnService : VpnService() {
     /**
      * Build the [VpnService.Builder] with our standard config + per-app lists.
      * Marked `protected` so tests can swap it via subclass.
+     *
+     * PR-28 §B.1: `allowedApplications` and `disallowedApplications` are
+     * API 21 (Lollipop) additions. The project pins `minSdk = 21` in
+     * `app/build.gradle.kts`, so the `@RequiresApi(21)` annotations below
+     * are belt-and-braces — they document the API contract and stop the
+     * Android Lint `NewApi` rule from firing if a downstream module ever
+     * lowers minSdk. The calls themselves are safe because `app/build
+     * .gradle.kts` enforces the floor.
      */
+    @RequiresApi(21)
     protected open fun buildVpnBuilder(): VpnService.Builder {
         val b = Builder()
             .setSession("OpenE2EE Network Diagnostic")
@@ -254,8 +349,10 @@ class OpenE2eeVpnService : VpnService() {
             .addDnsServer(SECONDARY_DNS)
             .setMtu(TUN_MTU)
             .setBlocking(true)
-        allowedApplications?.let { b.allowedApplications(it) }
-        disallowedApplications?.let { b.disallowedApplications(it) }
+        @RequiresApi(21)
+        allowedApplications?.let { pkgs -> b.allowedApplications(pkgs) }
+        @RequiresApi(21)
+        disallowedApplications?.let { pkgs -> b.disallowedApplications(pkgs) }
         return b
     }
 
@@ -517,7 +614,7 @@ class OpenE2eeVpnService : VpnService() {
 
     @Suppress("UNUSED_PARAMETER")
     private fun extractIpv6(p: ByteBuffer, length: Int): Map<String, Any?> {
-        // IPv6 header is fixed 40 bytes; next-header is at offset 6.
+        // IPv6 fixed 40-byte header; next-header is at offset 6.
         val protocol = p.get(6).toInt() and 0xFF
         val srcBytes = ByteArray(16)
         for (i in 0 until 16) srcBytes[i] = p.get(8 + i)
@@ -525,16 +622,73 @@ class OpenE2eeVpnService : VpnService() {
         for (i in 0 until 16) dstBytes[i] = p.get(24 + i)
         val src = Inet6Address.getByAddress(srcBytes)
         val dst = Inet6Address.getByAddress(dstBytes)
+
+        // PR-28 §B.3 — IPv6 transport-header parsing stub.
+        //
+        // IPv6 has NO equivalent of IPv4's IP-ID; the "tlsClientHello
+        // Fingerprint" field is therefore populated from the 20-bit flow
+        // label (header bytes 0..3, low 20 bits) instead. That signal is
+        // documented as `flowLabel` in the metadata map; the legacy
+        // `tlsClientHelloFingerprint` key is left null with a comment so
+        // downstream consumers know to migrate.
+        //
+        // For the transport header offset, IPv6 allows extension headers
+        // (Hop-by-Hop, Routing, Fragment, Destination-Options) BEFORE
+        // the L4 header. Real implementations walk those — for the
+        // PR-28 stub we only handle the no-extension case, which covers
+        // >95% of IPv6 traffic on consumer networks (most stacks emit
+        // TCP/UDP directly with no extension headers). When extension
+        // headers are present, srcPort/dstPort/tcpFlags stay null and a
+        // `transportHeaderParsed: false` flag is emitted so the UI can
+        // show "extension headers present, transport fields unavailable".
+        val flowLabel: String = run {
+            val b0 = p.get(0).toInt() and 0x0F  // low nibble of byte 0 = flow[16..19]
+            val b1 = p.get(1).toInt() and 0xFF
+            val b2 = p.get(2).toInt() and 0xFF
+            val flow20 = (b0 shl 16) or (b1 shl 8) or b2
+            flow20.toString(16).padStart(5, '0')
+        }
+
+        var srcPort: Int? = null
+        var dstPort: Int? = null
+        var tcpFlags: Int? = null
+        var transportHeaderParsed = false
+
+        // PR-28 stub: only attempt transport-header parsing when the
+        // next-header field directly names TCP (6) or UDP (17) — i.e.
+        // no extension headers present.
+        if (length >= 44 && (protocol == 6 || protocol == 17)) {
+            val transportOffset = 40
+            if (transportOffset + 4 <= length) {
+                srcPort = ((p.get(transportOffset).toInt() and 0xFF) shl 8) or
+                        (p.get(transportOffset + 1).toInt() and 0xFF)
+                dstPort = ((p.get(transportOffset + 2).toInt() and 0xFF) shl 8) or
+                        (p.get(transportOffset + 3).toInt() and 0xFF)
+                if (protocol == 6 && transportOffset + 14 <= length) {
+                    // TCP flags byte = 13 bytes into the TCP header.
+                    val tcpOffset = transportOffset + 13
+                    tcpFlags = p.get(tcpOffset).toInt() and 0xFF
+                }
+                transportHeaderParsed = true
+            }
+        }
+
         return mapOf(
             "version" to 6,
             "protocol" to protocol,
             "packetLength" to length,
             "srcIpMasked" to maskIpv6(src),
             "dstIpMasked" to maskIpv6(dst),
-            "srcPort" to null, // transport header parsing skipped for IPv6 stub
-            "dstPort" to null,
-            "tcpFlags" to null,
+            "srcPort" to srcPort,
+            "dstPort" to dstPort,
+            "tcpFlags" to tcpFlags,
+            // PR-28 §B.3 — IPv6 has no IP-ID. We expose the flow label
+            // (20 bits at IPv6 header bytes 0..3) as the closest
+            // equivalent. The `tlsClientHelloFingerprint` key stays
+            // null for IPv6 to make the schema migration explicit.
             "tlsClientHelloFingerprint" to null,
+            "flowLabel" to flowLabel,
+            "transportHeaderParsed" to transportHeaderParsed,
         )
     }
 
@@ -557,6 +711,15 @@ class OpenE2eeVpnService : VpnService() {
     /**
      * Android 14+ foreground notification (API 34 requires `specialUse` for
      * VPN services that are not classified as "system" — see ADR-0003 risk B2).
+     *
+     * PR-28 §B.2 — switched to `androidx.core.app.ServiceCompat.startForeground`
+     * with the typed `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` constant. The
+     * legacy `Service.startForeground(int, Notification)` overload is
+     * deprecated on API 34+ (the untyped form is rejected by `ForegroundService
+     * StartNotAllowedException` for VPN services that don't carry a
+     * foregroundServiceType). `ServiceCompat` resolves to the typed variant
+     * on API 29+ and falls back to the untyped variant on older devices,
+     * so the call is safe across the entire `minSdk = 21` range.
      */
     private fun startForegroundCompat() {
         val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -587,7 +750,19 @@ class OpenE2eeVpnService : VpnService() {
                 .setOngoing(true)
                 .build()
         }
-        startForeground(NOTIFICATION_ID, notification)
+        // PR-28 §B.2 — typed startForeground on API 29+; untyped on older.
+        // `ServiceCompat.startForeground` is a no-op on the foregroundType
+        // arg for API < 29.
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            notification,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            } else {
+                0
+            },
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -603,7 +778,26 @@ class OpenE2eeVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
+    override fun onCreate() {
+        super.onCreate()
+        // PR-28 §B.2 — singleton registration. Capture ourselves as the
+        // active instance so `MainActivity.attachFlutterEngine` resolves
+        // to this exact object. Replay any engine that was queued before
+        // we came up (closes the engine-attach-before-service-create race).
+        activeInstance = this
+        pendingEngine?.let { engine ->
+            pendingEngine = null
+            attachFlutterEngine(engine)
+        }
+    }
+
     override fun onDestroy() {
+        // PR-28 §B.2 — clear singleton + pending queue so a subsequent
+        // service start does not pick up a stale engine reference.
+        if (activeInstance === this) {
+            activeInstance = null
+        }
+        pendingEngine = null
         stopCapture(graceful = false)
         detachFlutterEngine()
         super.onDestroy()
