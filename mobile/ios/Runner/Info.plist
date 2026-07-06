@@ -82,12 +82,20 @@
     </array>
 
     <!--
-      Minimum iOS version. NetworkExtension target support is iOS 14+,
-      per-app VPN (`NEAppRules`) is iOS 14+, and `NEAppRules.matchedURLs`
-      requires iOS 15+. We require iOS 14.
+      Minimum iOS version. PR-29 (Sprint 5) bumps the deployment target from
+      14.0 to 15.0. PR-22b / PR-25 had to keep iOS 14 as the floor because
+      `NEAppRules.includeAppRules` is iOS 14+ but `excludeAppRules` (the
+      canonical deny-list path) is iOS 15+; the previous Sprint kept an
+      `#available(iOS 15.0, *)` guard and an iOS-14 fallback that logged a
+      breadcrumb while continuing to cover all apps (PR-29 §C removes that
+      fallback now that the deployment target is iOS 15+ across all
+      targets). Per-app VPN is fully supported on iOS 15+, Apple CryptoKit
+      HKDF + AES.GCM invariants are unchanged, and Keychain access groups
+      work as designed (Runner.entitlements declares
+      `group.com.opene2ee.opene2ee`).
     -->
     <key>MinimumOSVersion</key>
-    <string>14.0</string>
+    <string>15.0</string>
 
     <!--
       Standard Flutter launch screen — retained for the Runner target.

@@ -35,12 +35,14 @@ import CryptoKit
 #if canImport(NetworkExtension)
 import NetworkExtension
 #endif
-// Sprint 3 §10 wires the OpenE2eeTunnelProvider into a dedicated
-// `NetworkExtension` Xcode target (separate from Runner). At that
-// point this import becomes `@testable import NetworkExtension`.
-// Until then the file compiles to nothing on macOS dev machines —
-// it's source-of-truth for the §6 review and the Sprint 4 follow-up.
-@testable import Runner
+// PR-29 (Sprint 5) — wire these tests against the
+// `OpenE2eeTunnelProvider` Xcode target (the one that actually owns
+// `OpenE2eeTunnelProvider.swift`). PR-25 left this as
+// `@testable import Runner`; with PR-29 the pbxproj gets a dedicated
+// `RunnerTests` test bundle whose dependencies include the
+// `OpenE2eeTunnelProvider` target, so importing the NE target is the
+// canonical home.
+@testable import OpenE2eeTunnelProvider
 
 final class OpenE2eeTunnelProviderTests: XCTestCase {
 

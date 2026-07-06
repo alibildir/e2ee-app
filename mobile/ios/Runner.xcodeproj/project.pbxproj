@@ -12,6 +12,7 @@
 		A100000000000000000000A3 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B2 /* AppDelegate.swift */; };
 		A100000000000000000000A4 /* Runner.entitlements in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B3 /* Runner.entitlements */; };
 		A100000000000000000000A5 /* OpenE2eeTunnelProvider.entitlements in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B4 /* OpenE2eeTunnelProvider.entitlements */; };
+		A100000000000000000000AE /* OpenE2eeTunnelProviderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B7 /* OpenE2eeTunnelProviderTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -21,6 +22,27 @@
 			proxyType = 1;
 			remoteGlobalIDString = A100000000000000000000F2;
 			remoteInfo = OpenE2eeTunnelProvider;
+		};
+		A100000000000000000000D2 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A100000000000000000000E1 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A100000000000000000000F7;
+			remoteInfo = RunnerTests;
+		};
+		A100000000000000000000D3 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A100000000000000000000E1 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A100000000000000000000F2;
+			remoteInfo = OpenE2eeTunnelProvider;
+		};
+		A100000000000000000000D4 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A100000000000000000000E1 /* Project object */;
+			proxyType = 2;
+			remoteGlobalIDString = A100000000000000000000F1;
+			remoteInfo = Runner;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -45,8 +67,10 @@
 		A100000000000000000000B4 /* OpenE2eeTunnelProvider.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OpenE2eeTunnelProvider.entitlements; sourceTree = "<group>"; };
 		A100000000000000000000B5 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		A100000000000000000000B6 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		A100000000000000000000B7 /* OpenE2eeTunnelProviderTests.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = OpenE2eeTunnelProviderTests.swift; sourceTree = "<group>"; };
 		A100000000000000000000C1 /* OpenE2eeTunnelProvider.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = OpenE2eeTunnelProvider.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A100000000000000000000C2 /* Runner.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Runner.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A100000000000000000000C3 /* RunnerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RunnerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -64,6 +88,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A100000000000000000000B0 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -72,6 +103,7 @@
 			children = (
 				A100000000000000000000G2 /* Runner */,
 				A100000000000000000000G3 /* NetworkExtension */,
+				A100000000000000000000G5 /* RunnerTests */,
 				A100000000000000000000G4 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -101,8 +133,17 @@
 			children = (
 				A100000000000000000000C2 /* Runner.app */,
 				A100000000000000000000C1 /* OpenE2eeTunnelProvider.appex */,
+				A100000000000000000000C3 /* RunnerTests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000G5 /* RunnerTests */ = {
+			isa = PBXGroup;
+			children = (
+				A100000000000000000000B7 /* OpenE2eeTunnelProviderTests.swift */,
+			);
+			path = RunnerTests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -121,6 +162,7 @@
 			);
 			dependencies = (
 				A100000000000000000000AB /* PBXTargetDependency */,
+				A100000000000000000000BA /* PBXTargetDependency */,
 			);
 			name = Runner;
 			productName = Runner;
@@ -144,6 +186,25 @@
 			productReference = A100000000000000000000C1 /* OpenE2eeTunnelProvider.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		A100000000000000000000F7 /* RunnerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A100000000000000000000F6 /* Build configuration list for PBXNativeTarget "RunnerTests" */;
+			buildPhases = (
+				A100000000000000000000AF /* Sources */,
+				A100000000000000000000B0 /* Frameworks */,
+				A100000000000000000000B9 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A100000000000000000000BB /* PBXTargetDependency */,
+				A100000000000000000000BC /* PBXTargetDependency */,
+			);
+			name = RunnerTests;
+			productName = RunnerTests;
+			productReference = A100000000000000000000C3 /* RunnerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -159,6 +220,10 @@
 					};
 					A100000000000000000000F2 = {
 						CreatedOnToolsVersion = 15.0;
+					};
+					A100000000000000000000F7 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = A100000000000000000000F1;
 					};
 				};
 			};
@@ -177,6 +242,7 @@
 			targets = (
 				A100000000000000000000F1 /* Runner */,
 				A100000000000000000000F2 /* OpenE2eeTunnelProvider */,
+				A100000000000000000000F7 /* RunnerTests */,
 			);
 		};
 /* End PBXProject section */
@@ -190,6 +256,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A100000000000000000000AD /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A100000000000000000000B9 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -217,6 +290,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A100000000000000000000AF /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A100000000000000000000AE /* OpenE2eeTunnelProviderTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -224,6 +305,21 @@
 			isa = PBXTargetDependency;
 			target = A100000000000000000000F2 /* OpenE2eeTunnelProvider */;
 			targetProxy = A100000000000000000000D1 /* PBXContainerItemProxy */;
+		};
+		A100000000000000000000BA /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A100000000000000000000F7 /* RunnerTests */;
+			targetProxy = A100000000000000000000D2 /* PBXContainerItemProxy */;
+		};
+		A100000000000000000000BB /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A100000000000000000000F1 /* Runner */;
+			targetProxy = A100000000000000000000D4 /* PBXContainerItemProxy */;
+		};
+		A100000000000000000000BC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A100000000000000000000F2 /* OpenE2eeTunnelProvider */;
+			targetProxy = A100000000000000000000D3 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -278,7 +374,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -333,7 +429,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 14.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
@@ -433,6 +529,54 @@
 			};
 			name = Release;
 		};
+		A100000000000000000000H7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.opene2ee.opene2ee.RunnerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Runner.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Runner";
+				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = Debug;
+		};
+		A100000000000000000000H8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.opene2ee.opene2ee.RunnerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Runner.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Runner";
+				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -459,6 +603,15 @@
 			buildConfigurations = (
 				A100000000000000000000H1 /* Debug */,
 				A100000000000000000000H2 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A100000000000000000000F6 /* Build configuration list for PBXNativeTarget "RunnerTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A100000000000000000000H7 /* Debug */,
+				A100000000000000000000H8 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

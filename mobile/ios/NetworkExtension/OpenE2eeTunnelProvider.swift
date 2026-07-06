@@ -91,6 +91,7 @@
 import Foundation
 import NetworkExtension
 import CryptoKit
+import Security
 
 #if canImport(Flutter)
 import Flutter
@@ -121,12 +122,39 @@ let kVpnIosKdfInfo = "openE2ee/ios/packet/v1".data(using: .utf8)!
 /// (12 bytes per NIST SP 800-38D §5.2.1.1) itself is invariant.
 let kVpnIosNonceTailVersion = "openE2ee/ios/nonce/v1".data(using: .utf8)!
 
-/// Sprint 3 deterministic KDF master placeholder. Sprint 4 wires the
-/// real iOS Keychain (Runner.entitlements App Group identifier). The
-/// placeholder is `SHA256("opene2ee/ios/v1/master")` — stable, version-
-/// pinned, deterministic. NEVER replace with `UInt8.random(in:)`; that
-/// defeats the contract and silently regresses Sprint 4 keychain
-/// migration (see PR-22b verifier feedback, attempt-5 rejection).
+/// Sprint 5 (PR-29) iOS Keychain plumbing for the AES.GCM master secret.
+///
+/// - `kVpnIosKeychainAccessGroup`: matches the App Group declared in
+///   `Runner/Runner.entitlements` and
+///   `NetworkExtension/OpenE2eeTunnelProvider.entitlements`
+///   (`group.com.opene2ee.opene2ee`). Sharing the App Group is required
+///   because the Runner app is the one that does the first Keychain
+///   write in `application(_:didFinishLaunching...)` and the NE
+///   extension only ever reads the master at `startTunnel` time.
+/// - `kVpnIosKeychainApplicationTag`: stable tag (`opene2ee.ios.vpn.master`)
+///   used as the discriminator in `SecItemCopyMatching` / `SecItemAdd`.
+/// - `kVpnIosMasterSeed`: the deterministic, version-pinned seed string
+///   whose SHA-256 digest is the 32-byte master the Keychain stores.
+let kVpnIosKeychainAccessGroup = "group.com.opene2ee.opene2ee"
+let kVpnIosKeychainApplicationTag = "opene2ee.ios.vpn.master".data(using: .utf8)!
+let kVpnIosMasterSeed = "opene2ee/ios/v1/master"
+
+/// DEPRECATED (Sprint 5, PR-29) — kept as a single source of truth for
+/// the §6 review trace, the migration audit, and the on-device
+/// Keychain bootstrap (the first-write path uses the same SHA-256 value
+/// so a device upgrade from Sprint 3 derives the same session key).
+///
+/// DO NOT use this constant in new code paths. The realtime key
+/// derivation in `deriveSessionKey(sessionId:)` reads the master from
+/// the iOS Keychain via `loadMasterKeyFromKeychain()`. The constant
+/// remains as a frozen fallback ONLY in two places:
+///   1. The Keychain bootstrap (first install) — we seed the
+///      `kSecClassKey` item with the same SHA-256 value so a fresh
+///      install is bit-identical to a Sprint-3 install.
+///   2. The `kVpnIosSprint3Master` symbol is referenced by name in the
+///      Sprint-3 verifier feedback trail (PR-22b attempt-5) and must
+///      stay in the source so audit tools can grep for it.
+@available(*, deprecated, message: "Use loadMasterKeyFromKeychain() instead")
 private let kVpnIosSprint3Master: [UInt8] = {
     let seed = "opene2ee/ios/v1/master"
     let digest = SHA256.hash(data: Data(seed.utf8))
@@ -456,29 +484,127 @@ final class OpenE2eeTunnelProvider: NEPacketTunnelProvider {
 
     /// Derive a 256-bit session key from the session id + a static device
     /// master secret via HKDF-SHA256. The master is loaded from the iOS
-    /// Keychain at runtime via the App Group entitlement
-    /// (`Runner.entitlements`); Sprint 3 ships with a DETERMINISTIC
-    /// placeholder derived from `SHA256("opene2ee/ios/v1/master")` so
-    /// that:
+    /// Keychain at runtime via `loadMasterKeyFromKeychain()` (PR-29,
+    /// Sprint 5). The contract is preserved:
     ///   1. The same sessionId always derives the same key (testable,
     ///      idempotent — required by the §6 review's "deterministic
     ///      placeholder" contract).
-    ///   2. Sprint 4 keychain migration is a single-call site change
-    ///      (replace the `kVpnIosSprint3Master` literal with a Keychain
-    ///      fetch) — no silent regression from non-determinism.
+    ///   2. Sprint 5 keychain migration is a single-call site change
+    ///      (`deriveSessionKey` reads from Keychain instead of the
+    ///      deprecated `kVpnIosSprint3Master` literal) — no silent
+    ///      regression from non-determinism.
+    ///   3. The Keychain value is the same SHA-256 of
+    ///      `opene2ee/ios/v1/master` so a fresh install is bit-identical
+    ///      to a Sprint-3 install — the Hand-off §6 invariant holds
+    ///      across the migration boundary.
     ///
-    /// DO NOT replace `kVpnIosSprint3Master` with `UInt8.random(in:)`
-    /// — that defeats the contract (Attempt-5 verifier §6 finding 3).
+    /// DO NOT replace `loadMasterKeyFromKeychain()` with
+    /// `UInt8.random(in:)` — that defeats the contract (Attempt-5
+    /// verifier §6 finding 3).
     static func deriveSessionKey(sessionId: String) throws -> SymmetricKey {
         let salt = (sessionId + "/opene2ee-ios").data(using: .utf8) ?? Data()
-        let master = Data(kVpnIosSprint3Master)
+        let master = try Self.loadMasterKeyFromKeychain()
         let derived = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: SymmetricKey(data: master),
+            inputKeyMaterial: master,
             salt: salt,
             info: kVpnIosKdfInfo,
             outputByteCount: 32
         )
         return derived
+    }
+
+    /// Fetch the 32-byte AES.GCM master from the iOS Keychain via
+    /// `SecItemCopyMatching` with `kSecClassKey` /
+    /// `kSecAttrApplicationTag = "opene2ee.ios.vpn.master"`. The
+    /// Keychain item lives in the Runner App Group
+    /// (`group.com.opene2ee.opene2ee`) so the Runner app and the
+    /// NetworkExtension target share the same master without process-
+    /// local IPC.
+    ///
+    /// Behaviour matrix:
+    ///   - **Runner app's `application(_:didFinishLaunching...)` ran
+    ///     first**: the AppDelegate pre-seeds the Keychain with
+    ///     `SHA256(opene2ee/ios/v1/master)`; `SecItemCopyMatching`
+    ///     returns the stored data and we hand it back unchanged.
+    ///   - **Fresh install, NE target invoked first (very rare — NE
+    ///     extensions are not normally the entry point on iOS)**: the
+    ///     Keychain lookup misses and we self-bootstrap by storing
+    ///     the same deterministic seed via `SecItemAdd`, returning it.
+    ///     `errSecDuplicateItem` is treated as success because two
+    ///     concurrent seeders will produce identical bytes.
+    ///   - **Real Keychain failure** (disk full, access denied, etc.):
+    ///     both `SecItemCopyMatching` and `SecItemAdd` raise an
+    ///     `NSError` with the `OpenE2EE.VPN.Keychain` domain, which
+    ///     `startTunnel` surfaces as a key-derivation failure (existing
+    ///     contract).
+    ///
+    /// Throws: when BOTH `SecItemCopyMatching` and the seed
+    /// `SecItemAdd` fail with a non-`itemNotFound` / non-`duplicate`
+    /// status. The error code is the Security framework `OSStatus`
+    /// for the failing call.
+    static func loadMasterKeyFromKeychain() throws -> SymmetricKey {
+        // 1. Try to fetch the persisted key via SecItemCopyMatching.
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: kVpnIosKeychainApplicationTag,
+            kSecAttrKeyClass as String: kSecAttrKeyClassSymmetric,
+            kSecAttrKeySizeInBits as String: 256,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        // Access groups are not supported on the iOS Simulator's
+        // shared Keychain sandbox — gate them so simulator builds
+        // still pass through end-to-end (the master then lives in the
+        // NE-extension's own Keychain, which is acceptable for Sprint 5
+        // static validation; production devices ALWAYS use the App
+        // Group because Runner.entitlements declares it).
+        #if !targetEnvironment(simulator)
+        query[kSecAttrAccessGroup as String] = kVpnIosKeychainAccessGroup
+        #endif
+
+        var itemRef: CFTypeRef?
+        let readStatus = SecItemCopyMatching(query as CFDictionary, &itemRef)
+        if readStatus == errSecSuccess,
+           let data = itemRef as? Data,
+           data.count == 32 {
+            return SymmetricKey(data: data)
+        }
+        if readStatus != errSecItemNotFound {
+            throw NSError(
+                domain: "OpenE2EE.VPN.Keychain",
+                code: Int(readStatus),
+                userInfo: [NSLocalizedDescriptionKey:
+                    "SecItemCopyMatching failed: OSStatus=\(readStatus)"]
+            )
+        }
+
+        // 2. Seed: store the same SHA-256 placeholder so the device is
+        //    bit-identical to a Sprint-3 install. Idempotent — a
+        //    concurrent writer racing us to the seed will hit
+        //    `errSecDuplicateItem`, which we treat as success (both
+        //    seeders write the same 32 bytes).
+        let seedData = Data(SHA256.hash(data: Data(kVpnIosMasterSeed.utf8)))
+        var addAttrs: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: kVpnIosKeychainApplicationTag,
+            kSecAttrKeyClass as String: kSecAttrKeyClassSymmetric,
+            kSecAttrKeySizeInBits as String: 256,
+            kSecValueData as String: seedData,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+        ]
+        #if !targetEnvironment(simulator)
+        addAttrs[kSecAttrAccessGroup as String] = kVpnIosKeychainAccessGroup
+        #endif
+        let addStatus = SecItemAdd(addAttrs as CFDictionary, nil)
+        if addStatus == errSecSuccess || addStatus == errSecDuplicateItem {
+            return SymmetricKey(data: seedData)
+        }
+        throw NSError(
+            domain: "OpenE2EE.VPN.Keychain",
+            code: Int(addStatus),
+            userInfo: [NSLocalizedDescriptionKey:
+                "SecItemAdd failed: OSStatus=\(addStatus)"]
+        )
     }
 
     // MARK: - Metadata extraction

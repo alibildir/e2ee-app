@@ -245,7 +245,7 @@ final class AppDelegate: FlutterAppDelegate {
         }
     }
 
-    /// Apply per-app allow / deny rules (iOS 14+) to the tunnel config.
+    /// Apply per-app allow / deny rules (iOS 15+) to the tunnel config.
 /// Re-creates the `NETunnelProviderProtocol` with `NEAppRules` and
 /// persists it via `NETunnelProviderManager`.
 ///
@@ -255,10 +255,10 @@ final class AppDelegate: FlutterAppDelegate {
 ///     `proto.includeAppRules` (iOS 14+) so iOS does the filtering.
 ///   - **Deny list** (`denied` non-empty, allow list empty): matching
 ///     apps bypass the tunnel. Implemented via
-///     `proto.excludeAppRules` (iOS 15+); on iOS 14 we log a warning
-///     because there is no canonical API for exclude rules — Sprint 4
-///     will raise the deployment target to iOS 15+ and remove the
-///     fallback path.
+///     `proto.excludeAppRules` (iOS 15+). PR-29 (Sprint 5) bumped the
+///     deployment target to iOS 15+ so the canonical deny-list path is
+///     always available — the prior Sprint 3 iOS 14 fallback (breadcrumb
+///     log + tunnel-covers-all) has been removed.
 ///   - **Empty**: tunnel covers all app traffic (default iOS behavior).
 ///
 /// CRITICAL: the previous attempt built `NEAppRules` and stuffed the
@@ -281,71 +281,52 @@ final class AppDelegate: FlutterAppDelegate {
                 proto.providerBundleIdentifier = AppDelegate.tunnelBundleId
                 proto.serverAddress = "127.0.0.1"
 
-                if #available(iOS 14.0, *) {
-                    proto.includeAllNetworks = false
-                    proto.excludeLocalNetworks = true
+                // PR-29: deployment target is iOS 15+, so both
+                // `includeAppRules` and `excludeAppRules` are always
+                // available — the Sprint 3 `#available(iOS 14.0, *)`
+                // outer guard and iOS-14 deny-list fallback are gone.
+                proto.includeAllNetworks = false
+                proto.excludeLocalNetworks = true
 
-                    if !allowedBundleIds.isEmpty {
-                        // iOS 14+ canonical allow-list path.
-                        let rules = allowedBundleIds.map { bundleId in
-                            NEAppRule(
-                                signingIdentifier: bundleId,
-                                designatedRequirement: nil,
-                                path: nil
-                            )
-                        }
-                        let appRules = NEAppRules(rules: rules)
-                        proto.includeAppRules = appRules
-                        // providerConfiguration kept as a parallel debug
-                        // breadcrumb so verifiers / logs can see the list
-                        // without re-querying NETunnelProviderManager.
-                        proto.providerConfiguration = [
-                            "rulesType": "allow",
-                            "rules": allowedBundleIds,
-                            "appliedVia": "includeAppRules",
-                        ]
-                    } else if !denied.isEmpty {
-                        if #available(iOS 15.0, *) {
-                            // iOS 15+ canonical deny-list path.
-                            let rules = denied.map { bundleId in
-                                NEAppRule(
-                                    signingIdentifier: bundleId,
-                                    designatedRequirement: nil,
-                                    path: nil
-                                )
-                            }
-                            let appRules = NEAppRules(rules: rules)
-                            proto.excludeAppRules = appRules
-                            proto.providerConfiguration = [
-                                "rulesType": "deny",
-                                "rules": denied,
-                                "appliedVia": "excludeAppRules",
-                            ]
-                        } else {
-                            // iOS 14 has no `excludeAppRules`. Sprint 3
-                            // gracefully degrades: tunnel covers all apps,
-                            // the deny list is logged as a breadcrumb and
-                            // applied once the deployment target moves
-                            // to iOS 15+ in Sprint 4.
-                            NSLog(
-                                "OpenE2EE: deny-list rules require iOS 15+; running iOS 14 fallback (tunnel covers all apps). bundleIds=%@",
-                                denied
-                            )
-                            proto.providerConfiguration = [
-                                "rulesType": "deny",
-                                "rules": denied,
-                                "appliedVia": "ios14-fallback-tunnel-all",
-                            ]
-                        }
-                    } else {
-                        // No per-app rules: tunnel covers all app traffic.
-                        proto.providerConfiguration = [:]
+                if !allowedBundleIds.isEmpty {
+                    // iOS 14+ canonical allow-list path (always reachable
+                    // now that the deployment target is iOS 15+).
+                    let rules = allowedBundleIds.map { bundleId in
+                        NEAppRule(
+                            signingIdentifier: bundleId,
+                            designatedRequirement: nil,
+                            path: nil
+                        )
                     }
+                    let appRules = NEAppRules(rules: rules)
+                    proto.includeAppRules = appRules
+                    // providerConfiguration kept as a parallel debug
+                    // breadcrumb so verifiers / logs can see the list
+                    // without re-querying NETunnelProviderManager.
+                    proto.providerConfiguration = [
+                        "rulesType": "allow",
+                        "rules": allowedBundleIds,
+                        "appliedVia": "includeAppRules",
+                    ]
+                } else if !denied.isEmpty {
+                    // iOS 15+ canonical deny-list path — no fallback
+                    // needed since the deployment target is iOS 15+.
+                    let rules = denied.map { bundleId in
+                        NEAppRule(
+                            signingIdentifier: bundleId,
+                            designatedRequirement: nil,
+                            path: nil
+                        )
+                    }
+                    let appRules = NEAppRules(rules: rules)
+                    proto.excludeAppRules = appRules
+                    proto.providerConfiguration = [
+                        "rulesType": "deny",
+                        "rules": denied,
+                        "appliedVia": "excludeAppRules",
+                    ]
                 } else {
-                    // Pre-iOS 14: NetworkExtension target support is iOS
-                    // 14+ per Runner.entitlements (packet-tunnel-provider
-                    // requires iOS 14+). This branch is unreachable in
-                    // practice but kept for completeness.
+                    // No per-app rules: tunnel covers all app traffic.
                     proto.providerConfiguration = [:]
                 }
 
