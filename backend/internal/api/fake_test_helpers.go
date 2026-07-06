@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/opene2ee-com/e2ee-app/backend/internal/auth"
 	"github.com/opene2ee-com/e2ee-app/backend/internal/operator"
 	"github.com/opene2ee-com/e2ee-app/backend/internal/storage"
 )
@@ -369,6 +370,7 @@ func newTestAPI(t *testing.T) *testAPI {
 		Devices:         store,
 		RateLimit:       rl,
 		MaxBodyBytes:    1024 * 1024, // 1 MB in tests
+		JWTSecret:       TestJWTSecret,
 	})
 	if err != nil {
 		t.Fatalf("api.New: %v", err)
@@ -396,4 +398,42 @@ func readJSON(t *testing.T, r io.Reader, v any) {
 func jsonDecode(r io.Reader, v any) error {
 	dec := json.NewDecoder(r)
 	return dec.Decode(v)
+}
+
+// -----------------------------------------------------------------------------
+// Test JWT helpers (Sprint 5 PR-32, ADV-3)
+// -----------------------------------------------------------------------------
+
+// TestJWTSecret is the HS256 secret every test API is wired
+// with. Long enough to look like a production secret and stable
+// across the test suite so a token minted in helper X verifies
+// in helper Y. Do NOT change without also changing every test
+// that issues its own token.
+var TestJWTSecret = []byte("opene2ee-jwt-test-secret-32-bytes-min!")
+
+// TestBearerToken mints a valid JWT for the given subject using
+// TestJWTSecret. Tests that need an Authorization header pull
+// this once per subtest (no caching needed — the cost is
+// sub-microsecond).
+func TestBearerToken(t *testing.T, subject string) string {
+	t.Helper()
+	tok, err := auth.IssueJWT(subject, time.Hour, TestJWTSecret)
+	if err != nil {
+		t.Fatalf("TestBearerToken: IssueJWT: %v", err)
+	}
+	return tok
+}
+
+// WithBearerHeader returns a copy of headers with a valid
+// Authorization: Bearer ... entry appended for the given subject.
+// Tests targeting a protected route MUST call this — otherwise
+// IsAuthorized returns 401 and the test sees a misleading
+// failure.
+func WithBearerHeader(t *testing.T, headers map[string]string, subject string) map[string]string {
+	t.Helper()
+	if headers == nil {
+		headers = map[string]string{}
+	}
+	headers[HeaderAuthorization] = "Bearer " + TestBearerToken(t, subject)
+	return headers
 }

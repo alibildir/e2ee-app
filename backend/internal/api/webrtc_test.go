@@ -107,13 +107,13 @@ func newTestAPIWithWebRTC(t *testing.T) (*testAPI, *fakeWebRTC) {
 
 func TestWebRTC_Offer_EmptyBody400(t *testing.T) {
 	ta, _ := newTestAPIWithWebRTC(t)
-	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/offer", withAPIHeaders(nil), "")
+	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/offer", withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestWebRTC_Offer_BadJSON400(t *testing.T) {
 	ta, _ := newTestAPIWithWebRTC(t)
-	h := map[string]string{HeaderAPIVersion: APIVersion, "Content-Type": "application/json"}
+	h := withAPIHeaders(t, nil)
 	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/offer", h, "not json")
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
@@ -121,7 +121,7 @@ func TestWebRTC_Offer_BadJSON400(t *testing.T) {
 func TestWebRTC_Offer_HappyPath(t *testing.T) {
 	ta, fr := newTestAPIWithWebRTC(t)
 	body := `{"peer_hash":"alice-1234567890abcdef","sdp":{"sdp_type":"offer","sdp":"v=0\\r\\no=- 1 2 IN IP4 1.1.1.1\\r\\n"}}`
-	h := withAPIHeaders(nil)
+	h := withAPIHeaders(t, nil)
 	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/offer", h, body)
 	require.Equal(t, http.StatusCreated, w.Code)
 	fr.mu.Lock()
@@ -141,7 +141,7 @@ func TestWebRTC_Offer_ErrorEnvelopeTranslated(t *testing.T) {
 	ta.API = api2
 
 	body := `{"peer_hash":"alice-1234567890abcdef","sdp":{"sdp_type":"offer","sdp":"v=0\\r\\n"}}`
-	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/offer", withAPIHeaders(nil), body)
+	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/offer", withAPIHeaders(t, nil), body)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	var errBody ErrorBody
 	readJSON(t, w.Body, &errBody)
@@ -151,7 +151,7 @@ func TestWebRTC_Offer_ErrorEnvelopeTranslated(t *testing.T) {
 func TestWebRTC_Answer_HappyPath(t *testing.T) {
 	ta, fr := newTestAPIWithWebRTC(t)
 	body := `{"session_id":"ts-1234abcd","peer_hash":"bob-12345678901ab","sdp":{"sdp_type":"answer","sdp":"v=0\\r\\n"}}`
-	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/answer", withAPIHeaders(nil), body)
+	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/answer", withAPIHeaders(t, nil), body)
 	require.Equal(t, http.StatusOK, w.Code)
 	fr.mu.Lock()
 	defer fr.mu.Unlock()
@@ -163,7 +163,7 @@ func TestWebRTC_Answer_HappyPath(t *testing.T) {
 func TestWebRTC_ICE_HappyPath(t *testing.T) {
 	ta, fr := newTestAPIWithWebRTC(t)
 	body := `{"session_id":"ts-1234abcd","peer_hash":"alice-1234567890ab","candidates":[{"candidate":"candidate:1 1 udp 2122260223 192.0.2.1 1000 typ host","sdpMid":"0","sdpMLineIndex":0}]}`
-	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/ice", withAPIHeaders(nil), body)
+	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/ice", withAPIHeaders(t, nil), body)
 	require.Equal(t, http.StatusOK, w.Code)
 	fr.mu.Lock()
 	defer fr.mu.Unlock()
@@ -174,7 +174,7 @@ func TestWebRTC_ICE_HappyPath(t *testing.T) {
 
 func TestWebRTC_Config_HappyPath(t *testing.T) {
 	ta, _ := newTestAPIWithWebRTC(t)
-	w := do(t, ta.Handler(), "GET", "/api/v1/webrtc/config", withAPIHeaders(nil), "")
+	w := do(t, ta.Handler(), "GET", "/api/v1/webrtc/config", withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "stun_urls")
 }
@@ -184,7 +184,7 @@ func TestWebRTC_Offer_NoManager(t *testing.T) {
 	// (internal_error) without panicking.
 	ta := newTestAPI(t)
 	body := `{"peer_hash":"alice-1234567890abcdef","sdp":{"sdp_type":"offer","sdp":"v=0\\r\\n"}}`
-	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/offer", withAPIHeaders(nil), body)
+	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/offer", withAPIHeaders(t, nil), body)
 	require.Equal(t, http.StatusInternalServerError, w.Code)
 	var errBody ErrorBody
 	readJSON(t, w.Body, &errBody)
@@ -193,19 +193,19 @@ func TestWebRTC_Offer_NoManager(t *testing.T) {
 
 func TestWebRTC_Answer_NoManager(t *testing.T) {
 	ta := newTestAPI(t)
-	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/answer", withAPIHeaders(nil), "{}")
+	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/answer", withAPIHeaders(t, nil), "{}")
 	require.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 func TestWebRTC_ICE_NoManager(t *testing.T) {
 	ta := newTestAPI(t)
-	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/ice", withAPIHeaders(nil), "{}")
+	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/ice", withAPIHeaders(t, nil), "{}")
 	require.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 func TestWebRTC_Config_NoManager(t *testing.T) {
 	ta := newTestAPI(t)
-	w := do(t, ta.Handler(), "GET", "/api/v1/webrtc/config", withAPIHeaders(nil), "")
+	w := do(t, ta.Handler(), "GET", "/api/v1/webrtc/config", withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
@@ -220,7 +220,7 @@ func TestWebRTC_Privacy_NoCandidateInErrorBody(t *testing.T) {
 
 	secret := "candidate:999999 1 udp 2113937151 9.9.9.9 666 typ host"
 	body := `{"session_id":"x","peer_hash":"alice-1234567890abcdef","candidates":[{"candidate":"` + secret + `"}]}`
-	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/ice", withAPIHeaders(nil), body)
+	w := do(t, ta.Handler(), "POST", "/api/v1/webrtc/ice", withAPIHeaders(t, nil), body)
 	if strings.Contains(w.Body.String(), "9.9.9.9") || strings.Contains(w.Body.String(), secret) {
 		t.Errorf("candidate leaked: %s", w.Body.String())
 	}

@@ -1,15 +1,70 @@
 _format_version: "3.0"
+
+# ============================================================================
+# Kong Gateway 3.x — DB-less declarative config (Sprint 5 PR-32, ADV-3).
+# ----------------------------------------------------------------------------
+# Single service (`e2ee-backend`). Routes are split by auth posture so
+# the JWT plugin fires ONLY on protected endpoints:
+#
+#   public (no JWT plugin):
+#     - GET  /api/v1/matrix
+#     - GET  /api/v1/operator/lookup
+#     - POST /api/v1/auth            (login endpoint that ISSUES tokens)
+#
+#   protected (JWT plugin):
+#     - POST /api/v1/sessions
+#     - GET  /api/v1/sessions
+#     - GET  /api/v1/sessions/<id>
+#     - POST /api/v1/sessions/<id>/telemetry
+#     - DELETE /api/v1/users/<device_id_hash>     (KVKK right-to-erasure)
+#     - GET  /api/v1/webrtc/config
+#     - POST /api/v1/webrtc/offer
+#     - POST /api/v1/webrtc/answer
+#     - POST /api/v1/webrtc/ice
+#
+# JWT plugin config (per protected route):
+#   - algorithm: HS256 (matches what the Go backend's auth.IssueJWT signs)
+#   - secret_is_base64: false (raw ASCII secret, NOT base64-encoded)
+#   - secret: pulled from JWT_SECRET env var via Kong's env vault
+#             ({vault://env/jwt-secret}) so the secret does NOT appear
+#             in this yaml on disk
+#   - claims_to_verify: [exp] — Kong validates expiry at the gateway.
+#                       The Go backend's IsAuthorized middleware does
+#                       the full HS256 + iss check as defence-in-depth.
+#
+# Path matching:
+#   - Kong's `paths` field accepts plain prefix strings (literal match)
+#     OR strings starting with `~` (PCRE regex match). We use plain
+#     strings wherever the path is exact (`/api/v1/sessions`) and
+#     regex strings for dynamic captures (`/api/v1/sessions/<id>`).
+# ============================================================================
+
+consumers:
+  - username: opene2ee-mobile
+    # JWT credential — matches what the Go backend's auth.IssueJWT
+    # produces. `key` is the `iss` claim (the credential identifier
+    # that the Go backend stamps into every token via auth.Issuer).
+    # `algorithm` is HS256 (symmetric, no public key needed).
+    # `secret` is the shared HS256 secret read from the env-var vault.
+    #
+    # The vault reference {vault://env/<name>} is Kong's standard
+    # way to keep secrets out of the declarative yaml on disk. The
+    # `bundled` vaults setting (Kong 3.x default) ensures the `env`
+    # vault is loaded.
+    jwt_secrets:
+      - key: opene2ee-backend
+        algorithm: HS256
+        secret: "{vault://env/jwt-secret}"
+
 services:
   - name: e2ee-backend
     url: http://backend:8080
-    routes:
-      - name: api-v1
-        paths:
-          - /api/v1
-        methods:
-          - GET
-          - POST
-          - DELETE
+
+    # Service-level plugins — apply to every route on this service.
+    # CORS / bot-detection / rate-limit are posture-level: they don't
+    # care whether the request is authenticated, only that it isn't
+    # abusive. The JWT plugin is route-level (below) so it fires ONLY
+    # on the protected subtree.
     plugins:
       - name: rate-limiting
         config:
@@ -37,3 +92,136 @@ services:
             - "curl"
             - "wget"
             - "OpenE2EE/*"
+
+    routes:
+      # =============================================================
+      # PUBLIC subtree (no JWT plugin)
+      # =============================================================
+
+      - name: api-v1-matrix
+        paths:
+          - /api/v1/matrix
+        methods:
+          - GET
+
+      - name: api-v1-operator-lookup
+        paths:
+          - /api/v1/operator/lookup
+        methods:
+          - GET
+
+      - name: api-v1-auth
+        # Login endpoint — must be reachable WITHOUT a token. The
+        # handler at backend/internal/api/auth.go issues a JWT for
+        # any caller.
+        paths:
+          - /api/v1/auth
+        methods:
+          - POST
+
+      # =============================================================
+      # PROTECTED subtree (JWT plugin per-route)
+      # =============================================================
+
+      - name: api-v1-sessions
+        paths:
+          - /api/v1/sessions
+        methods:
+          - POST
+          - GET
+        plugins:
+          - name: jwt
+            config:
+              secret_is_base64: false
+              claims_to_verify:
+                - exp
+
+      - name: api-v1-sessions-by-id
+        # Regex path — captures /api/v1/sessions/<any-non-slash-id>.
+        # The `strip_path` default (false) means the full path is
+        # forwarded to the backend (the backend chi router handles
+        # the {id} URL param).
+        paths:
+          - "~/api/v1/sessions/[^/]+$"
+        methods:
+          - GET
+        plugins:
+          - name: jwt
+            config:
+              secret_is_base64: false
+              claims_to_verify:
+                - exp
+
+      - name: api-v1-sessions-telemetry
+        paths:
+          - "~/api/v1/sessions/[^/]+/telemetry$"
+        methods:
+          - POST
+        plugins:
+          - name: jwt
+            config:
+              secret_is_base64: false
+              claims_to_verify:
+                - exp
+
+      - name: api-v1-users-by-hash
+        # KVKK right-to-erasure. The device_id_hash is the salted
+        # SHA-256 hex (16-64 chars per backend validation).
+        paths:
+          - "~/api/v1/users/[^/]+$"
+        methods:
+          - DELETE
+        plugins:
+          - name: jwt
+            config:
+              secret_is_base64: false
+              claims_to_verify:
+                - exp
+
+      - name: api-v1-webrtc-config
+        paths:
+          - /api/v1/webrtc/config
+        methods:
+          - GET
+        plugins:
+          - name: jwt
+            config:
+              secret_is_base64: false
+              claims_to_verify:
+                - exp
+
+      - name: api-v1-webrtc-offer
+        paths:
+          - /api/v1/webrtc/offer
+        methods:
+          - POST
+        plugins:
+          - name: jwt
+            config:
+              secret_is_base64: false
+              claims_to_verify:
+                - exp
+
+      - name: api-v1-webrtc-answer
+        paths:
+          - /api/v1/webrtc/answer
+        methods:
+          - POST
+        plugins:
+          - name: jwt
+            config:
+              secret_is_base64: false
+              claims_to_verify:
+                - exp
+
+      - name: api-v1-webrtc-ice
+        paths:
+          - /api/v1/webrtc/ice
+        methods:
+          - POST
+        plugins:
+          - name: jwt
+            config:
+              secret_is_base64: false
+              claims_to_verify:
+                - exp

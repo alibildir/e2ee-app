@@ -17,6 +17,18 @@ package api
 // /healthz sits OUTSIDE the API middleware stack so the load
 // balancer doesn't need to send X-API-Version or a device id
 // to hit the liveness probe.
+//
+// JWT-protected subtree (Sprint 5 PR-32, ADV-3):
+//
+//	RequestID -> DeviceContext -> AccessLog -> CORS -> MaxBytes
+//	  -> APIVersion -> RateLimit -> IsAuthorized -> handler
+//
+// /api/v1/auth is NOT inside the IsAuthorized subtree (a login
+// endpoint that requires a valid token is a chicken-and-egg
+// problem). Everything else under /api/v1 that touches
+// user-specific state IS behind IsAuthorized. The matrix and
+// operator/lookup handlers stay open because they are public
+// transparency / utility endpoints (BRD §7).
 
 import (
 	"net/http"
@@ -86,30 +98,55 @@ func (a *API) buildRouter() http.Handler {
 	})
 
 	// /api/v1 subtree: API-version + rate-limit then handlers.
+	//
+	// ADV-3 (Sprint 5 PR-32): the JWT-protected subtree is a
+	// nested chi.Router so the IsAuthorized middleware applies
+	// to the protected routes WITHOUT applying to /api/v1/auth
+	// (login must be reachable without a bearer token). The
+	// public subtree keeps the original open endpoints
+	// (matrix transparency, operator lookup).
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(APIVersionMiddleware(a.cfg.AcceptedAPIVersions...))
 		r.Use(RateLimitMiddleware(a.cfg.RateLimit))
 
-		// sessions
-		r.Post("/sessions", a.handleCreateSession())
-		r.Get("/sessions", a.handleListSessions())
-		r.Get("/sessions/{id}", a.handleGetSession())
-		r.Post("/sessions/{id}/telemetry", a.handlePostTelemetry())
+		// auth (login) — outside the JWT-protected subtree.
+		// Rate-limit still applies (login is brute-force-prone);
+		// IsAuthorized does NOT (login bootstraps the token).
+		r.Post("/auth", a.handleLogin())
 
-		// matrix
-		r.Get("/matrix", a.handleMatrix())
+		// public subtree — no JWT required.
+		r.Group(func(r chi.Router) {
+			// matrix (transparency)
+			r.Get("/matrix", a.handleMatrix())
 
-		// operator lookup
-		r.Get("/operator/lookup", a.handleOperatorLookup())
+			// operator lookup (utility — public BTK reverse IP + MNP)
+			r.Get("/operator/lookup", a.handleOperatorLookup())
+		})
 
-		// users (KVKK delete)
-		r.Delete("/users/{device_id_hash}", a.handleDeleteUser())
+		// JWT-protected subtree. IsAuthorized verifies the
+		// bearer token on every request and stamps the verified
+		// subject into the request context. Kong's JWT plugin
+		// does the same check at the gateway, so by the time a
+		// request reaches these handlers it has already passed
+		// authentication — the middleware is defence-in-depth.
+		r.Group(func(r chi.Router) {
+			r.Use(a.IsAuthorized())
 
-		// webrtc signalling (Sprint 3 PR-21a)
-		r.Get("/webrtc/config", a.handleWebRTCConfig())
-		r.Post("/webrtc/offer", a.handleWebRTCOffer())
-		r.Post("/webrtc/answer", a.handleWebRTCAnswer())
-		r.Post("/webrtc/ice", a.handleWebRTCICE())
+			// sessions
+			r.Post("/sessions", a.handleCreateSession())
+			r.Get("/sessions", a.handleListSessions())
+			r.Get("/sessions/{id}", a.handleGetSession())
+			r.Post("/sessions/{id}/telemetry", a.handlePostTelemetry())
+
+			// users (KVKK delete)
+			r.Delete("/users/{device_id_hash}", a.handleDeleteUser())
+
+			// webrtc signalling (Sprint 3 PR-21a)
+			r.Get("/webrtc/config", a.handleWebRTCConfig())
+			r.Post("/webrtc/offer", a.handleWebRTCOffer())
+			r.Post("/webrtc/answer", a.handleWebRTCAnswer())
+			r.Post("/webrtc/ice", a.handleWebRTCICE())
+		})
 	})
 
 	return r

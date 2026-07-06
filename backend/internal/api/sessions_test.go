@@ -38,7 +38,7 @@ func validSessionBody() map[string]any {
 func TestSessions_CreateHappyPath(t *testing.T) {
 	ta := newTestAPI(t)
 	body, _ := json.Marshal(validSessionBody())
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(body))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(body))
 	require.Equal(t, http.StatusCreated, w.Code, "body=%s", w.Body.String())
 
 	// Storage has exactly one session.
@@ -62,7 +62,7 @@ func TestSessions_CreateSchemaRejectsMissingMode(t *testing.T) {
 	body := validSessionBody()
 	delete(body, "mode")
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Empty(t, ta.Store.Sessions)
 }
@@ -72,7 +72,7 @@ func TestSessions_CreateSchemaRejectsInvalidMode(t *testing.T) {
 	body := validSessionBody()
 	body["mode"] = "bogus_mode"
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -81,7 +81,7 @@ func TestSessions_CreateSchemaRejectsInvalidTaskType(t *testing.T) {
 	body := validSessionBody()
 	body["task_type"] = "carrier_pigeon"
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -90,7 +90,7 @@ func TestSessions_CreateSchemaRejectsAdditionalFields(t *testing.T) {
 	body := validSessionBody()
 	body["phone_number"] = "+905321234567" // privacy: must reject
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -100,7 +100,7 @@ func TestSessions_CreateWithPublicKeyUpsertsDevice(t *testing.T) {
 	body["public_key"] = []byte("0123456789abcdef0123456789abcdef") // 32-byte key (dummy)
 	body["public_key_fp"] = "abcdef0123456789abcdef0123456789"
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusCreated, w.Code, "body=%s", w.Body.String())
 	require.Contains(t, ta.Store.Devices, "abcdef0123456789abcdef0123456789")
 }
@@ -108,7 +108,7 @@ func TestSessions_CreateWithPublicKeyUpsertsDevice(t *testing.T) {
 func TestSessions_CreateWithoutPublicKeyDoesNotUpsertDevice(t *testing.T) {
 	ta := newTestAPI(t)
 	body, _ := json.Marshal(validSessionBody())
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(body))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(body))
 	require.Equal(t, http.StatusCreated, w.Code)
 	assert.Empty(t, ta.Store.Devices)
 }
@@ -117,13 +117,13 @@ func TestSessions_GetByID(t *testing.T) {
 	ta := newTestAPI(t)
 	// Create a session first.
 	body, _ := json.Marshal(validSessionBody())
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(body))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(body))
 	require.Equal(t, http.StatusCreated, w.Code)
 	var created sessionResponse
 	readJSON(t, w.Body, &created)
 
 	// GET /sessions/{id}
-	w = do(t, ta.Handler(), "GET", fmt.Sprintf("/api/v1/sessions/%s", created.ID.String()), withAPIHeaders(nil), "")
+	w = do(t, ta.Handler(), "GET", fmt.Sprintf("/api/v1/sessions/%s", created.ID.String()), withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusOK, w.Code)
 	var got sessionResponse
 	readJSON(t, w.Body, &got)
@@ -138,13 +138,13 @@ func TestSessions_GetByID(t *testing.T) {
 
 func TestSessions_GetByID_NotFound(t *testing.T) {
 	ta := newTestAPI(t)
-	w := do(t, ta.Handler(), "GET", fmt.Sprintf("/api/v1/sessions/%s", uuid.New().String()), withAPIHeaders(nil), "")
+	w := do(t, ta.Handler(), "GET", fmt.Sprintf("/api/v1/sessions/%s", uuid.New().String()), withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
 func TestSessions_GetByID_InvalidID(t *testing.T) {
 	ta := newTestAPI(t)
-	w := do(t, ta.Handler(), "GET", "/api/v1/sessions/not-a-uuid", withAPIHeaders(nil), "")
+	w := do(t, ta.Handler(), "GET", "/api/v1/sessions/not-a-uuid", withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -152,10 +152,10 @@ func TestSessions_ListReturns(t *testing.T) {
 	ta := newTestAPI(t)
 	for i := 0; i < 3; i++ {
 		body, _ := json.Marshal(validSessionBody())
-		w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(body))
+		w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(body))
 		require.Equal(t, http.StatusCreated, w.Code)
 	}
-	w := do(t, ta.Handler(), "GET", "/api/v1/sessions", withAPIHeaders(nil), "")
+	w := do(t, ta.Handler(), "GET", "/api/v1/sessions", withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusOK, w.Code)
 	var list listSessionsResponse
 	readJSON(t, w.Body, &list)
@@ -167,10 +167,10 @@ func TestSessions_ListLimit(t *testing.T) {
 	ta := newTestAPI(t)
 	for i := 0; i < 5; i++ {
 		body, _ := json.Marshal(validSessionBody())
-		w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(body))
+		w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(body))
 		require.Equal(t, http.StatusCreated, w.Code)
 	}
-	w := do(t, ta.Handler(), "GET", "/api/v1/sessions?limit=2", withAPIHeaders(nil), "")
+	w := do(t, ta.Handler(), "GET", "/api/v1/sessions?limit=2", withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusOK, w.Code)
 	var list listSessionsResponse
 	readJSON(t, w.Body, &list)
@@ -182,7 +182,7 @@ func TestSessions_StorageErrorOnCreateReturns500(t *testing.T) {
 	ta := newTestAPI(t)
 	ta.Store.InsertSessionErr = fmt.Errorf("db down")
 	body, _ := json.Marshal(validSessionBody())
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(body))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(body))
 	require.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
@@ -191,7 +191,7 @@ func TestSessions_PrivacyNoLogOfTestText(t *testing.T) {
 	body := validSessionBody()
 	body["test_text"] = "UNIQUE-MARKER-98765"
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", "/api/v1/sessions", withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusCreated, w.Code)
 
 	for _, e := range ta.Logger.Entries {

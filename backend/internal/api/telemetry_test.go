@@ -49,7 +49,7 @@ func TestTelemetry_HappyPath(t *testing.T) {
 	body, _ := json.Marshal(validTelemetryBody())
 	url := fmt.Sprintf("/api/v1/sessions/%s/telemetry", sessionID.String())
 
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(body))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(body))
 	require.Equal(t, http.StatusAccepted, w.Code, "valid payload must be accepted; body=%s", w.Body.String())
 
 	// Storage must have received exactly one row.
@@ -80,7 +80,7 @@ func TestTelemetry_SchemaRejectsMissingRequired(t *testing.T) {
 	body := validTelemetryBody()
 	delete(body, "device_id_hash")
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 
 	var errBody ErrorBody
@@ -107,7 +107,7 @@ func TestTelemetry_SchemaRejectsAdditionalProperties(t *testing.T) {
 	body["phone_number"] = "+905321234567"
 	body["raw_uuid"] = "00000000-0000-0000-0000-000000000000"
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 	var errBody ErrorBody
 	readJSON(t, w.Body, &errBody)
@@ -125,12 +125,12 @@ func TestTelemetry_SchemaRejectsEntropyOutOfRange(t *testing.T) {
 	body := validTelemetryBody()
 	body["entropy"] = 10.0 // out of [0,8] range per schema
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 
 	body["entropy"] = -1.0
 	raw, _ = json.Marshal(body)
-	w = do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(raw))
+	w = do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -142,7 +142,7 @@ func TestTelemetry_SchemaRejectsInvalidOperator(t *testing.T) {
 	body := validTelemetryBody()
 	body["operator"] = "not_a_real_operator"
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -154,7 +154,7 @@ func TestTelemetry_SchemaRejectsBadDeviceHashShape(t *testing.T) {
 	body := validTelemetryBody()
 	body["device_id_hash"] = "raw-uuid-00000000-0000-0000-0000-000000000000"
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code,
 		"raw UUID-shaped device_id_hash must be rejected (privacy invariant)")
 }
@@ -168,7 +168,7 @@ func TestTelemetry_SessionIDInBodyMustMatchURL(t *testing.T) {
 	body := validTelemetryBody()
 	body["session_id"] = bodySession.String()
 	raw, _ := json.Marshal(body)
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(raw))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(raw))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 
 	// No row persisted.
@@ -179,14 +179,14 @@ func TestTelemetry_RejectsInvalidSessionIDInURL(t *testing.T) {
 	ta := newTestAPI(t)
 	url := "/api/v1/sessions/not-a-uuid/telemetry"
 	body, _ := json.Marshal(validTelemetryBody())
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(body))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(body))
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestTelemetry_RejectsEmptyBody(t *testing.T) {
 	ta := newTestAPI(t)
 	url := fmt.Sprintf("/api/v1/sessions/%s/telemetry", uuid.New().String())
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), "")
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
@@ -196,7 +196,7 @@ func TestTelemetry_StorageErrorReturns500(t *testing.T) {
 	sessionID := uuid.New()
 	url := fmt.Sprintf("/api/v1/sessions/%s/telemetry", sessionID.String())
 	body, _ := json.Marshal(validTelemetryBody())
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(body))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(body))
 	require.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
@@ -205,7 +205,7 @@ func TestTelemetry_DoesNotEchoPayloadInResponse(t *testing.T) {
 	sessionID := uuid.New()
 	url := fmt.Sprintf("/api/v1/sessions/%s/telemetry", sessionID.String())
 	body, _ := json.Marshal(validTelemetryBody())
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(body))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(body))
 	// Response body must NOT echo the request payload.
 	// (The response is telemetryResponse with just id/accepted/session_id.)
 	assert.NotContains(t, w.Body.String(), "turkcell")
@@ -218,7 +218,7 @@ func TestTelemetry_DoesNotLogPayload(t *testing.T) {
 	sessionID := uuid.New()
 	url := fmt.Sprintf("/api/v1/sessions/%s/telemetry", sessionID.String())
 	body, _ := json.Marshal(validTelemetryBody())
-	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(nil), string(body))
+	w := do(t, ta.Handler(), "POST", url, withAPIHeaders(t, nil), string(body))
 	require.Equal(t, http.StatusAccepted, w.Code)
 	// Grep the access log for the payload field values.
 	for _, e := range ta.Logger.Entries {

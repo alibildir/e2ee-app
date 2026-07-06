@@ -135,7 +135,7 @@ func TestRateLimit_429ResponseIncludesRetryAfter(t *testing.T) {
 	// Re-wire the router so the new rate limiter is used.
 	mux := ta.Handler()
 
-	headers := withAPIHeaders(map[string]string{
+	headers := withAPIHeaders(t, map[string]string{
 		HeaderDeviceIDHash: "test-device-hash",
 	})
 	// First request succeeds.

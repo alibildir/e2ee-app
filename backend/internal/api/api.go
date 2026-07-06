@@ -138,13 +138,25 @@ type Config struct {
 	// /api/v1/webrtc/* endpoints (Sprint 3 PR-21a). If nil,
 	// the four endpoints 500 with "internal_error".
 	WebRTC matching.WebRTCManagerIface
+	// JWTSecret is the HS256 shared secret used by /api/v1/auth
+	// to mint bearer tokens AND by IsAuthorized to verify them
+	// (defence-in-depth — the Kong JWT plugin in infra/kong is
+	// the primary gate). The secret MUST match the JWT_SECRET
+	// env var Kong is started with (see infra/docker-compose.yml).
+	//
+	// When empty, /api/v1/auth responds 500 and IsAuthorized
+	// rejects every request. The empty-default is intentional —
+	// a deployed server that forgets to set JWT_SECRET should
+	// fail closed, not open.
+	JWTSecret []byte
 }
 
 // API is the wired handler. Hold a reference in main(), call
 // Handler() to get the http.Handler for chi.Mux...Mount.
 type API struct {
-	cfg    Config
-	deps   *routerDeps
+	cfg       Config
+	deps      *routerDeps
+	jwtSecret []byte
 }
 
 // New validates the config, compiles the embedded JSON-Schemas,
@@ -187,7 +199,7 @@ func New(cfg Config) (*API, error) {
 		Cfg:     cfg,
 		Schemas: schemas,
 	}
-	return &API{cfg: cfg, deps: deps}, nil
+	return &API{cfg: cfg, deps: deps, jwtSecret: cfg.JWTSecret}, nil
 }
 
 // routerDeps bundles the fields every handler closure captures.

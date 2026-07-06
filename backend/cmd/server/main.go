@@ -94,6 +94,13 @@ type Config struct {
 	// server is configured with a non-default salt in production.
 	ServerSalt string
 
+	// JWTSecret is the HS256 shared secret used by POST /api/v1/auth
+	// (auth.IssueJWT) AND by IsAuthorized on protected routes. Must
+	// match the JWT_SECRET env var Kong is started with — see
+	// infra/kong/kong.yml and infra/docker-compose.yml (Sprint 5
+	// PR-32, ADV-3).
+	JWTSecret []byte
+
 	// ShutdownTimeout caps how long srv.Shutdown is allowed to run
 	// before we force-kill the process. Sprint 1 default: 30s
 	// (matches the existing scaffold).
@@ -108,13 +115,14 @@ type Config struct {
 // loadConfig reads env vars and applies defaults. Returns an error
 // only on parse failures (e.g. SERVER_PORT not a valid integer).
 //
-// Env vars (all optional):
+// Env vars (all optional unless :? marked):
 //
 //	SERVER_PORT          (default 8080)
 //	DATABASE_URL         (default postgres://opene2ee:opene2ee@localhost:5432/opene2ee?sslmode=disable)
 //	REDIS_ADDR           (default localhost:6379)
 //	REDIS_PASSWORD       (default "")
 //	SERVER_SALT          (default "opene2ee-v1-salt-dev-only-change-in-prod")
+//	JWT_SECRET           (default "" — required in production; a non-empty dev default keeps `go run ./cmd/server` ergonomic)
 //	SHUTDOWN_TIMEOUT_SEC (default 30)
 //	HEALTHCHECK_TIMEOUT_MS (default 2000)
 func loadConfig() (Config, error) {
@@ -124,8 +132,12 @@ func loadConfig() (Config, error) {
 		RedisAddr:           "localhost:6379",
 		RedisPassword:       "",
 		ServerSalt:          "opene2ee-v1-salt-dev-only-change-in-prod",
-		ShutdownTimeout:     30 * time.Second,
-		HealthcheckTimeout:  2 * time.Second,
+		// Dev default so `go run ./cmd/server` produces valid tokens
+		// without a .env file. In production this is overridden by
+		// docker-compose's `${JWT_SECRET:?...}` (required) expansion.
+		JWTSecret:          []byte("opene2ee-jwt-dev-secret-32-bytes-min!"),
+		ShutdownTimeout:    30 * time.Second,
+		HealthcheckTimeout: 2 * time.Second,
 	}
 
 	if v := strings.TrimSpace(os.Getenv("SERVER_PORT")); v != "" {
@@ -149,6 +161,9 @@ func loadConfig() (Config, error) {
 	}
 	if v := strings.TrimSpace(os.Getenv("SERVER_SALT")); v != "" {
 		c.ServerSalt = v
+	}
+	if v := strings.TrimSpace(os.Getenv("JWT_SECRET")); v != "" {
+		c.JWTSecret = []byte(v)
 	}
 	if v := strings.TrimSpace(os.Getenv("SHUTDOWN_TIMEOUT_SEC")); v != "" {
 		n, err := strconv.Atoi(v)
@@ -365,6 +380,9 @@ func main() {
 		"redis_addr", cfg.RedisAddr,
 		"database_url_host", redactDSN(cfg.DatabaseURL),
 		"server_salt_configured", cfg.ServerSalt != "opene2ee-v1-salt-dev-only-change-in-prod",
+		// We log that the JWT secret is set, NOT its value —
+		// the value is the auth credential.
+		"jwt_secret_configured", len(cfg.JWTSecret) > 0,
 	)
 
 	// Long-lived startup context. Bounded generously — Postgres /
@@ -438,6 +456,11 @@ func main() {
 		Operator:   opSvc,
 		Matrix:     matrix,
 		Devices:    pgStore,
+		// Sprint 5 PR-32 (ADV-3): JWT_SECRET — HS256 shared secret
+		// used by /api/v1/auth (IssueJWT) and the IsAuthorized
+		// middleware. MUST match Kong's JWT_SECRET (see
+		// infra/kong/kong.yml + infra/docker-compose.yml).
+		JWTSecret:  cfg.JWTSecret,
 		// DeleteUserHook intentionally omitted in Sprint 1 — the
 		// Active Pool purge for KVKK deletes will be added once
 		// the matching package exposes a DeleteByHash on its

@@ -36,13 +36,40 @@ func do(t *testing.T, h http.Handler, method, target string, headers map[string]
 }
 
 // withAPIHeaders returns the minimum set of headers that every
-// /api/v1/* request needs (X-API-Version + Content-Type).
-// Optional headers (X-Device-Id-Hash, X-Request-ID) can be
-// merged by the caller.
-func withAPIHeaders(extra map[string]string) map[string]string {
+// /api/v1/* request needs (X-API-Version + Content-Type +
+// a valid JWT bearer for the protected routes).
+//
+// ADV-3 (Sprint 5 PR-32): protected routes sit behind
+// IsAuthorized. Including a valid bearer by default keeps
+// existing tests focused on the handler behaviour (e.g.
+// schema validation) without re-stamping every call site.
+// Tests that explicitly want to verify auth failures should
+// call withoutBearer(...) or set the Authorization header
+// to a known-bad value themselves.
+//
+// Optional headers (X-Device-Id-Hash, X-Request-ID, custom
+// Authorization overrides) can be merged by the caller —
+// entries in `extra` win over the defaults.
+func withAPIHeaders(t *testing.T, extra map[string]string) map[string]string {
+	t.Helper()
 	m := map[string]string{
-		HeaderAPIVersion:   APIVersion,
-		"Content-Type":     "application/json",
+		HeaderAPIVersion: APIVersion,
+		"Content-Type":   "application/json",
+		HeaderAuthorization: "Bearer " + TestBearerToken(t, "test-user-default"),
+	}
+	for k, v := range extra {
+		m[k] = v
+	}
+	return m
+}
+
+// withoutBearer returns headers that intentionally omit the
+// Authorization header so the test can assert an auth-failure
+// response (401 from IsAuthorized).
+func withoutBearer(extra map[string]string) map[string]string {
+	m := map[string]string{
+		HeaderAPIVersion: APIVersion,
+		"Content-Type":   "application/json",
 	}
 	for k, v := range extra {
 		m[k] = v
@@ -86,7 +113,7 @@ func TestRouter_RejectsBadAPIVersion(t *testing.T) {
 
 func TestRouter_AllRoutesMounted(t *testing.T) {
 	ta := newTestAPI(t)
-	headers := withAPIHeaders(nil)
+	headers := withAPIHeaders(t, nil)
 	// Each route should respond with SOMETHING (even 405, 400, 500) — the
 	// point is they are mounted, not 404 from chi's NotFoundHandler.
 	cases := []struct {
@@ -119,14 +146,14 @@ func TestRouter_AllRoutesMounted(t *testing.T) {
 
 func TestRouter_NotFoundReturnsJSON(t *testing.T) {
 	ta := newTestAPI(t)
-	headers := withAPIHeaders(nil)
+	headers := withAPIHeaders(t, nil)
 	w := do(t, ta.Handler(), "GET", "/api/v1/nope", headers, "")
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
 func TestRouter_MethodNotAllowed(t *testing.T) {
 	ta := newTestAPI(t)
-	headers := withAPIHeaders(nil)
+	headers := withAPIHeaders(t, nil)
 	// PATCH is not registered on /api/v1/sessions
 	w := do(t, ta.Handler(), "PATCH", "/api/v1/sessions", headers, "")
 	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
@@ -134,7 +161,7 @@ func TestRouter_MethodNotAllowed(t *testing.T) {
 
 func TestRouter_EmitsRequestID(t *testing.T) {
 	ta := newTestAPI(t)
-	headers := withAPIHeaders(nil)
+	headers := withAPIHeaders(t, nil)
 	// Client-supplied request id should be echoed back.
 	headers[HeaderRequestID] = "client-supplied-1234567890"
 	w := do(t, ta.Handler(), "GET", "/api/v1/sessions", headers, "")
@@ -144,7 +171,7 @@ func TestRouter_EmitsRequestID(t *testing.T) {
 
 func TestRouter_GeneratesRequestIDWhenAbsent(t *testing.T) {
 	ta := newTestAPI(t)
-	headers := withAPIHeaders(nil)
+	headers := withAPIHeaders(t, nil)
 	w := do(t, ta.Handler(), "GET", "/api/v1/sessions", headers, "")
 	require.Equal(t, http.StatusOK, w.Code)
 	got := w.Header().Get(HeaderRequestID)
@@ -153,7 +180,7 @@ func TestRouter_GeneratesRequestIDWhenAbsent(t *testing.T) {
 
 func TestRouter_ClipsClientRequestID(t *testing.T) {
 	ta := newTestAPI(t)
-	headers := withAPIHeaders(nil)
+	headers := withAPIHeaders(t, nil)
 	headers[HeaderRequestID] = strings.Repeat("a", 200) // too long
 	w := do(t, ta.Handler(), "GET", "/api/v1/sessions", headers, "")
 	require.Equal(t, http.StatusOK, w.Code)
@@ -166,7 +193,7 @@ func TestRouter_ClipsClientRequestID(t *testing.T) {
 
 func TestRouter_RejectsControlCharsInRequestID(t *testing.T) {
 	ta := newTestAPI(t)
-	headers := withAPIHeaders(nil)
+	headers := withAPIHeaders(t, nil)
 	// A request id with a newline could pollute log lines.
 	headers[HeaderRequestID] = "abc\x00def"
 	w := do(t, ta.Handler(), "GET", "/api/v1/sessions", headers, "")
@@ -184,6 +211,6 @@ func TestMountOn_AttachesToServeMux(t *testing.T) {
 	w := do(t, mux, "GET", "/healthz", nil, "")
 	require.Equal(t, http.StatusOK, w.Code)
 	// /api/v1/ also accessible
-	w = do(t, mux, "GET", "/api/v1/sessions", withAPIHeaders(nil), "")
+	w = do(t, mux, "GET", "/api/v1/sessions", withAPIHeaders(t, nil), "")
 	require.Equal(t, http.StatusOK, w.Code)
 }
