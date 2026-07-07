@@ -1,0 +1,50 @@
+# Changelog
+
+All notable changes to the opene2ee app are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [Unreleased] — Sprint 7 (in branch `feat/pr-7-integration`, push YAPILMADI)
+
+### Security — cipher, transport, authN, authZ
+
+- **AUTHZ-2** — `infra/kong/kong.yml` + `infra/docker-compose.yml` + `scripts/smoke/healthz-jwt.{sh,ps1}` + `infra/kong/README.md`. The Kong `healthz` route is now JWT-protected under the new `opene2ee-monitoring` consumer, matching the existing `/api/v1/*` posture. The compose-side nginx healthcheck bypasses JWT (internal Docker network), and the bash + pwsh smoke scripts document the 4-scenario contract (no-auth→401, valid→200, expired→401, wrong-iss→401). Hand-off origin: cyber-security review of the Sprint 6 PR-39 mobile-security gap.
+- **SEC-1** — `backend/cmd/server/main.go` + `backend/cmd/server/main_test.go`. The silent dev JWT fallback at `loadConfig` is removed; the new posture gates the fallback behind `OE2EE_ENV=dev` with a structured WARN log (`fallback_dev=true`, `oe2ee_env=dev`). Non-dev + unset JWT_SECRET fails closed (errors out with `main() exits 1`). Defense-in-depth: the compose-side `${JWT_SECRET:?...}` stays as the first layer. Hand-off origin: cyber-security review of the PR-32 JWT-secret posture.
+- **SEC-6/7** — `infra/docker-compose.yml` + `infra/.env.example` + `infra/README.md`. Redis is no longer exposed host-side without auth. Added `--protected-mode yes --requirepass ${REDIS_PASSWORD:?}` to the redis service; removed the `6379:6379` host port; bounded the healthcheck probe to thread `-a $REDIS_PASSWORD` so NOAUTH doesn't silently break the probe. Hand-off origin: cyber-security review of the unauthenticated-cache gap.
+- **STRIDE-6-03** — `backend/internal/matching/pool.go` + `pool_test.go` + `backend/cmd/server/main.go`. The Active Pool (`Pool`) now exposes `DeleteByHash(ctx, hash)`, `SweepIdle(ctx)`, and `RunSweeper(ctx)` for KVKK / GDPR Art. 17 hard-delete SLA (7-day window). The sweeper goroutine runs every `DefaultIdleSweepInterval=60s` (< `DefaultPoolTTL=15m`) so any KVKK DELETE that fails its hook also gets swept on the next tick. Hand-off origin: cyber-security review of the `users.go` KVKK hook chain.
+
+### Compliance — privacy, KVKK, anonymisation
+
+- **STRIDE-3-01** — `tool/ci_grep_privacy_violations.dart` + `.github/workflows/ci.yml`. A new Dart-based CI guard scans `mobile/lib/` and `mobile/test/` for `TelephonyManager`, `getDeviceId`, IMEI, `androidId` after stripping comments + string literals (so the documented RegExp in `mobile/test/shared/device_identity_test.dart:245-249` does not false-positive). The job is `ubuntu-latest` only — Dart-aware stripping is the reason and a matrix would 3x cost for zero value. Hand-off origin: cyber-security review of the F1 anonimlik contract in ADR-0006.
+- **MOB-4** — `.github/workflows/android-release.yml` + `docs/CI-DEBUG-FAILURES.md`. The `android-release-build` job now emits `::error::` + `exit 1` BEFORE the JDK/Flutter/Android-SDK setup if `mobile/android/key.properties` is missing. The companion CI-DEBUG-FAILURES runbook documents the `keytool -genkey` + 4-field `key.properties` recipe so operators can self-serve provisioning (GitHub Actions secret + 1Password CLI pattern). Hand-off origin: cyber-security review of the silent-debug-fail mode in release artifacts.
+- **MOB-5** — `mobile/android/app/build.gradle.kts` + `mobile/android/.../OpenE2eeVpnService.kt` + `mobile/README.md` + `mobile/test/min_sdk_posture_test.dart` + `docs/NATIVE-DEV-SETUP.md`. `minSdk` bumped from 21→23 so `AndroidKeyStore.KeyGenParameterSpec` (the Android 6+ genuine-backed key generation API) is unconditionally available — no more `flutter_secure_storage 9.x` "fall back to plaintext on Android 5/6" silent bypass. Market share of Android 5.0–5.1.1 dropped per Google Play 2026 numbers (&lt;0.5%). Hand-off origin: cyber-security review of the cipher-bypass on legacy Android.
+
+### Mobile (Flutter / Dart)
+
+- **MOB-6** — `mobile/ios/Config/{Local,Production}.xcconfig` + `mobile/ios/Runner.xcodeproj/project.pbxproj` + both `.entitlements` + `docs/SETUP-iOS.md`. `DEVELOPMENT_TEAM` moved from `""` literals to `$(TEAMS_IDENTIFIER)` xcconfig for all 6 XCBuildConfiguration entries (H3-H8 for Debug+Release × Runner+Tunnel+RunnerTests). The `com.apple.developer.team-identifier` entitlement is now bound on both `Runner.entitlements` and `OpenE2eeTunnelProvider.entitlements`. xcconfig does NOT auto-substitute in plist — operator manual `sed` OR a Sprint 8 build-phase script is the substitution mechanism (documented in SETUP-iOS.md §2.2). Hand-off origin: cyber-security review of the iOS keychain-sharing gap.
+- **MOB-8** — `mobile/lib/shared/cert_pinning.dart` + `mobile/test/shared/cert_pinning_test.dart` + `mobile/test/mobile/security/cert_pinning_posture_test.dart` + `mobile/ios/Runner/Info.plist` + `mobile/android/app/src/main/res/xml/network_security_config.xml` + `docs/SPRINT-7-MOB-8-CERT-PINNING.md`. Full cert SHA-256 pinning on both platforms (Android SPKI + iOS NSPinnedDomains), wired into `ApiClient` via `PinnedHttpOverrides`. Placeholder pin strings remain on Android/iOS — operators MUST replace per `docs/SPRINT-7-MOB-8-CERT-PINNING.md` §3 before public launch. Hand-off origin: cyber-security review of the network-trust-anchor gap.
+- **MOB-10** — `mobile/lib/mobile/auth/biometric.dart` + `mobile/test/mobile/auth/biometric_test.dart` + `mobile/test/mobile/security/biometric_posture_test.dart` + `mobile/ios/Runner/Info.plist` + `mobile/android/app/src/main/AndroidManifest.xml` + `mobile/pubspec.{yaml,lock}`. New `BiometricAuthenticator` wrapper with hardened `AuthOptions(biometricOnly=true, stickyAuth=true)` + `BiometricUnavailableError`. Wraps `requireBiometricForKvkkDelete()` + `requireBiometricForKeyExport()`. NSFaceIDUsageDescription + USE_BIOMETRIC pinned in posture test; no `passcode`/`PIN` fallback. Hand-off origin: cyber-security review of the local_auth `passcode` fallback path.
+- **MOB-14** — `mobile/pubspec.{yaml,lock}`. `flutter_webrtc: ^0.10.8 → ^1.5.2`. The 1.x line ships m137→m144 libwebrtc, RTCRtpEncoding priority API, macOS AVAudioEngine improvements, and several back-ported security patches from the upstream WebRTC project. Dart API surface used by `FlutterWebRtcBridge` is stable across the bump (per upstream 1.x changelog).
+
+### Infrastructure — coturn + Kong + compose + tools
+
+- **SCA-19** — `docs/policy/KONG-UPGRADE-POLICY.md` + `infra/kong/smoke-jwt.py` + `Makefile`. Formal Kong upgrade cadence policy (upstream-paced, monthly minor / quarterly major). Amend `aeef6ee` added a Grandfather Clause acknowledging `kong:3.8-alpine` past non-LTS EOL (2024-12-12) and an explicit bump PR SLA within 14 days. Companion `infra/kong/smoke-jwt.py` (PyJWT round-trip helper) + `Makefile` `test-compose` target give operators a 5-step gate (compose config parse + smoke-jwt.py + docker-compose-config + privacy-check + go-build-test). Hand-off origin: cyber-security review of the Kong upgrade cadence.
+- **SCA-22** — `infra/coturn/turnserver.conf` + `infra/coturn/entrypoint.sh` + `infra/docker-compose.yml` + `infra/.env.example` + `docs/SETUP.md` + `scripts/smoke/coturn-tls.{sh,ps1}`. Coturn now supports TLS/DTLS in production (cipher list TLS 1.2+ only, no SSLv3 / TLS 1.0 / TLS 1.1). The new `entrypoint.sh` is fail-closed: it verifies the cert+key+DH files exist before exec'ing `turnserver` with `--tls --dtls`; unset `COTURN_TLS_ENABLED` falls back to dev `--no-tls --no-dtls` (NOT for production). SETUP.md documents cert provisioning + rotation; coturn-tls.{sh,ps1} provides ADR-0008 cross-platform smoke (TLS 1.0/1.1 refused, TLS 1.2 accepted, cert chain verifies). Hand-off origin: cyber-security review of plaintext-credential-on-TURN gap.
+
+### Tooling — CI tools pinning + Windows Docker matrix
+
+- **STRIDE-8-01** — `.github/workflows/ios.yml`. New GHA matrix with `windows-latest + ubuntu-latest` static checks (Podfile + Info.plist + project.pbxproj) and `macos-latest` `xcodebuild ... build test` against the iOS Simulator (no signing). SwiftPM + CocoaPods caching via `actions/cache@v4`. Hand-off origin: cyber-security review of the iOS unit-test gap.
+- **STRIDE-8-02** — `.github/workflows/ci.yml` + `docs/CI-MATRIX.md`. The `docker-compose-config` matrix already skipped Windows; the long-comment is now a 33-line NOTICE block citing the POSIX secret paths (`infra/docker-compose.yml:104-110`), the YAML anchors, and the WSL 2 manual-verify escape hatch. The `backend-build` job (Linux-only) gained a 20-line NOTICE block. CI-MATRIX.md catalogues every runner×step pairing (14-row ci.yml + 1-row ios.yml). Hand-off origin: cyber-security review of the silent-Windows-skip posture.
+- **STRIDE-8-03** — `tools/PINS.toml` + `tools/ci-tools-pin-check.{sh,ps1}` + `tools/install-pinned.{sh,ps1}` + `tools/lib/scanner.py` + `tools/test-ci-tools-pin-check.sh` + `tools/README.md` + `tools/.gitignore` + `tools/bin/.gitkeep` + `docs/CI-TOOLS.md` + `.github/workflows/ci.yml`. A central version-pinning policy for jq, curl, openssl, sha256sum, pyyaml. Both bash and PowerShell validator twins scan 4 roots (scripts/, infra/scripts/, tools/, .github/workflows/) for unpinned 3rd-party invocations and exit 1 if found. `docs/CI-TOOLS.md` documents the policy + 5-step rotation + adversarial compromise recovery. Hand-off origin: cyber-security review of the unpinned-tool supply-chain.
+
+## [Unreleased] — Sprint 6 (PR-39 merge: 1651ae4)
+
+- `merge: Sprint 6 PR-39 mobile security hardening (Android cleartext pin + R8/ProGuard + iOS NE MinOSVersion bump)` (a428d8c).
+- `merge: Sprint 6 PR-38 backend fix #2 (pgx/v5 CVE chain guardrail: CI govulncheck + hermetic pin test)` (730da02).
+- `merge: Sprint 6 PR-37 backend fix #1 (KVKK cross-device JWT sub check)` (67a8c29).
+
+See the per-PR verifier reports under `outputs/pr-sprint6-*/` for the SPRINT 6 deliverables.
+
+---
+
+This changelog is incrementally maintained. Older sprints are intentionally omitted — use `git log` + the per-PR verifier reports for historical context.
