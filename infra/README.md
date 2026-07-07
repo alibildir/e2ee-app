@@ -90,12 +90,80 @@ Tüm env değişkenleri `infra/.env.example`'da dokümante edilmiştir. Üretimd
 **Gerekli (`:?` ile zorunlu kılınır):**
 - `POSTGRES_PASSWORD`
 - `SERVER_SALT` (32+ hex char önerilir)
+- `JWT_SECRET` (Sprint 5 PR-32 — HS256, Kong + backend ortak)
+- `REDIS_PASSWORD` (Sprint 7 PR-43 — SEC-6/7 fail-closed; redis
+  server `--requirepass` + Go client auth ile birebir aynı değer)
 - `COTURN_STATIC_SECRET`
 - `COTURN_PUBLIC_IP` (NAT arkasında zorunlu)
+
+### Gizli Değer Üretme (Secret Generation)
+
+OpenSSL ile 32-byte hex secret üretmek için:
+
+```bash
+# Her secret için ayrı ayrı çalıştır:
+openssl rand -hex 32
+```
+
+Örnek komutlar (Sprint 7 PR-43 prosedürü):
+
+```bash
+# Yeni bir REDIS_PASSWORD üretmek için (mevcut değeri ezmeden önce tüm
+# servisleri restart etmen gerekecek):
+openssl rand -hex 32 > /tmp/new_redis_password.txt
+
+# Aynı kalıp diğer secret'lar için de geçerli:
+openssl rand -hex 32 > /tmp/new_jwt_secret.txt
+openssl rand -hex 32 > /tmp/new_server_salt.txt
+openssl rand -hex 32 > /tmp/new_postgres_password.txt
+openssl rand -hex 32 > /tmp/new_coturn_static_secret.txt
+```
+
+Secret'ları `.env` dosyasına yapıştır (`infra/.env.example` placeholder'larından
+farklı) veya docker secrets (file provider) kullan. Üretim için Vault/sops+age
+önerilir (Sprint 8+ backlog).
+
+### REDIS_PASSWORD Rotation (SEC-6/7, Sprint 7 PR-43)
+
+`REDIS_PASSWORD` Quarterly rotation önerilir (Sprint 5 PR-32 JWT_SECRET
+ile aynı kalıp). Rotation adımları:
+
+1. **Yeni secret üret:**
+   ```bash
+   openssl rand -hex 32
+   ```
+2. **`infra/.env` dosyasında** `REDIS_PASSWORD` satırını yeni değerle değiştir
+   (veya `infra/.secrets/redis_password.txt` dosyasını rotate et).
+3. **Stack'i restart et** — önce redis, sonra backend:
+   ```bash
+   docker compose -f infra/docker-compose.yml restart redis
+   docker compose -f infra/docker-compose.yml restart backend
+   ```
+4. **Smoke test:**
+   ```bash
+   # Backend → redis bağlantısı:
+   curl -fsS http://localhost:8000/api/v1/healthz
+   # Redis'e doğrudan:
+   docker compose -f infra/docker-compose.yml exec redis \
+     redis-cli -a "$REDIS_PASSWORD" ping
+   ```
+5. **Eski secret'ı imha et** (log + secret manager'dan).
+
+**Neden iki restart?** Redis `--requirepass` sadece container başlangıcında
+okunur; runtime'da değiştirilemez. Backend client ise config reload (`SIGHUP`)
+yapmaz (Sprint 7+ takip işi) — restart en güvenli yol.
 
 ### Network İzolasyonu
 
 Dev ortamında DB portları host'a açıktır (psql/redis-cli debug için). Production'da `ports:` satırları kaldırılmalı.
+
+Sprint 7 PR-43 (SEC-6/7) ile redis servisi artık host'a port map etmiyor
+(default), böylece container `internal` docker ağı üzerinden yalnızca backend
+tarafından erişilebilir. Debug için:
+```bash
+docker compose -f infra/docker-compose.yml exec redis \
+  redis-cli -a "$REDIS_PASSWORD" ping
+```
 
 ### Coturn Konfig
 

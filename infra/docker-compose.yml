@@ -167,12 +167,29 @@ services:
   # --------------------------------------------------------------------------
   # AOF (Append-Only File) persistence: every second fsync.
   # Internal-only.
+  #
+  # Sprint 7 PR-43 (SEC-6/7): REDIS_PASSWORD is now REQUIRED (fail-closed)
+  # — `${REDIS_PASSWORD:?...}` expansion. Previously the redis container
+  # started with --protected-mode no and no --requirepass, exposing an
+  # unauthenticated cache on the docker bridge. Now:
+  #   --protected-mode yes  (default; explicit)
+  #   --requirepass X       (X = $REDIS_PASSWORD, same as backend's)
+  # Backend is also updated to consume the same REDIS_PASSWORD env (see
+  # the backend service above). Host port mapping is removed so the
+  # container is internal-only (the only access path is via the `internal`
+  # docker network). To debug from the host with `redis-cli`, prefer the
+  # `docker compose exec redis redis-cli -a "$REDIS_PASSWORD"` pattern.
   # --------------------------------------------------------------------------
   redis:
     <<: *default-restart
     image: redis:7-alpine
     container_name: opene2ee-redis
     hostname: redis
+    # REDIS_PASSWORD is required by both --requirepass below AND the
+    # backend service's REDIS_PASSWORD env. Compose :? expansion fails
+    # the stack at startup if either is unset.
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD gerekli (bkz infra/.env.example — openssl rand -hex 32)}"
     command:
       - "redis-server"
       - "--appendonly"
@@ -187,21 +204,38 @@ services:
       - "900 1"
       - "--save"
       - "300 10"
+      # NB: --bind keeps 0.0.0.0 because backend talks to redis via
+      # the docker bridge NIC (172.30.0.x). True bind 127.0.0.1 would
+      # require network_mode: host for the redis service AND a
+      # topology rewrite — out of scope for SEC-6/7. Equivalent
+      # security: --protected-mode yes + --requirepass + no host
+      # port mapping (below) + internal-only network.
       - "--bind"
       - "0.0.0.0"
       - "--protected-mode"
-      - "no"
-      # Dev ortamı şifresiz; üretimde requirepass eklenmeli.
+      - "yes"
+      # Sprint 7 PR-43 (SEC-6/7): --requirepass is required. Auth is
+      # enforced — clients (backend's Redis client) MUST `AUTH` with
+      # the matching REDIS_PASSWORD before any non-AUTH command.
+      - "--requirepass"
+      - "${REDIS_PASSWORD:?REDIS_PASSWORD gerekli (bkz infra/.env.example — openssl rand -hex 32)}"
     volumes:
       - redis_data:/data
     networks:
       - internal
     expose:
       - "6379"
-    ports:
-      - "${REDIS_HOST_PORT:-6379}:6379"
+    # Sprint 7 PR-43 (SEC-6/7): host port mapping removed by default
+    # (no `ports:` block) so the container is internal-only. To debug
+    # from the host: `docker compose exec redis redis-cli -a "$REDIS_PASSWORD"`.
+    # If a host port mapping is genuinely needed for an external client,
+    # document the justification in infra/README.md and add back the
+    # mapping with a non-default REDIS_HOST_PORT.
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Use `-a` to pass the same REDIS_PASSWORD — required now that
+      # --requirepass is enforced (Sprint 7 PR-43). Without `-a`,
+      # `redis-cli ping` would fail with NOAUTH and crash the healthcheck.
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -229,7 +263,15 @@ services:
       SERVER_PORT: "${SERVER_PORT:-8080}"
       DATABASE_URL: "postgres://${POSTGRES_USER:-opene2ee}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-opene2ee}?sslmode=disable"
       REDIS_ADDR: "redis:6379"
-      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+      # REDIS_PASSWORD — Sprint 7 PR-43 (SEC-6/7). The backend's
+      # REDIS_PASSWORD MUST match the one the redis container is
+      # started with (see the redis service below:
+      # `--requirepass ${REDIS_PASSWORD:?...}`). :? = required;
+      # both the redis server AND the backend's Go client
+      # (redis.Connect in cmd/server/main.go) fail closed when
+      # this is unset. Match the Sprint 5 PR-32 JWT_SECRET
+      # fail-closed posture (ADV-3).
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD gerekli (bkz infra/.env.example — openssl rand -hex 32)}"
       SERVER_SALT: "${SERVER_SALT:?SERVER_SALT gerekli (32+ char önerilir)}"
       # JWT_SECRET — Sprint 5 PR-32 (ADV-3). Shared HS256 secret
       # used by the Go backend's auth.IssueJWT (POST /api/v1/auth)
