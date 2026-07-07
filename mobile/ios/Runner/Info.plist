@@ -72,6 +72,31 @@
     <string>OpenE2EE performs network diagnostics to evaluate encryption quality on your device. No content is read.</string>
 
     <!--
+      Sprint 7 Item 15 / MOB-10 — Biometric prompt (FaceID) usage
+      description.
+
+      REQUIRED by Apple for any app that calls
+      `LAContext.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)`
+      or invokes FaceID via the `LocalAuthentication` framework. Without
+      this key, the FIRST biometric prompt crashes the app with the
+      fatal `NSFaceIDUsageDescription missing` error from
+      `LAContext.canEvaluatePolicy`.
+
+      Privacy contract (enforced by `mobile/test/mobile/security/
+      biometric_posture_test.dart`):
+        * The string is reviewed by cyber-security on every change.
+        * No UUID, hex fingerprint, e-mail, phone number, or PII keyword
+          may appear here — the FaceID overlay shows this string
+          verbatim and a shoulder-surfer / compromised screen-recorder
+          could otherwise capture an identifier.
+        * No mention of passcode / PIN / pattern — that would imply a
+          non-biometric fallback, defeating the MOB-10 hardening.
+        * The wording is generic, future-proof, and ADR-0006 compliant.
+    -->
+    <key>NSFaceIDUsageDescription</key>
+    <string>OpenE2EE uses Face ID to confirm sensitive on-device operations such as erasing the anonymous device identity.</string>
+
+    <!--
       Allow the Personal VPN to stay alive while the host app is in the
       background. The NetworkExtension target's lifecycle drives the
       actual packet loop.

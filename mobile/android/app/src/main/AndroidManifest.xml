@@ -32,6 +32,26 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <!--
+      Sprint 7 Item 15 / MOB-10 — Biometric prompt (fingerprint / face)
+      permission. Required for Android `BiometricPrompt` (API 28+); the
+      deprecated `USE_FINGERPRINT` permission is intentionally NOT
+      requested — `USE_BIOMETRIC` is the canonical API-28+ replacement
+      and is a superset of the legacy fingerprint permission.
+
+      Privacy contract: this permission lets the OS prompt the user for
+      a biometric factor; it does NOT grant the app access to biometric
+      data (which never leaves the Trusted Execution Environment). The
+      prompt is gated by `biometricOnly: true` in
+      `lib/mobile/auth/biometric.dart` so passcode / PIN / pattern
+      cannot be used as a fallback factor — see ADR-0006 §"Veri
+      Minimizasyonu" (passcode IS PII).
+
+      Regression-guarded by `mobile/test/mobile/security/
+      biometric_posture_test.dart`.
+    -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <!--
       Android 13+ (API 33) requires this runtime permission to show the
       foreground-service notification tied to the VPN sampling session.
       Declared with usesPermissionFlags="neverForLocation" because we do
