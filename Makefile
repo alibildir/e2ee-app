@@ -30,19 +30,20 @@ else
 endif
 
 # --- Targets -------------------------------------------------------------
-.PHONY: help setup dev test lint build build-web clean
+.PHONY: help setup dev test test-compose lint build build-web clean
 
 help:
 	@echo "OpenE2EE — Multiplatform build system"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make setup     — verify Go / Flutter / protoc versions, install deps"
-	@echo "  make dev       — start dev stack (docker compose up + flutter run)"
-	@echo "  make test      — run all test suites (go test + flutter test)"
-	@echo "  make lint      — run linters (go vet + flutter analyze)"
-	@echo "  make build     — production build (go static binary + flutter web)"
-	@echo "  make build-web — flutter web only (PR-27 --target=lib/web/main.dart wrapper)"
-	@echo "  make clean     — git clean -fdx  (removes untracked + ignored files)"
+	@echo "  make setup        — verify Go / Flutter / protoc versions, install deps"
+	@echo "  make dev          — start dev stack (docker compose up + flutter run)"
+	@echo "  make test         — run all test suites (go test + flutter test)"
+	@echo "  make test-compose — validate infra/docker-compose.yml syntax (Linux/macOS only — see ADR-0008 runner matrix)"
+	@echo "  make lint         — run linters (go vet + flutter analyze)"
+	@echo "  make build        — production build (go static binary + flutter web)"
+	@echo "  make build-web    — flutter web only (PR-27 --target=lib/web/main.dart wrapper)"
+	@echo "  make clean        — git clean -fdx  (removes untracked + ignored files)"
 	@echo ""
 	@echo "Platform: $(RM_HELP)"
 
@@ -54,6 +55,19 @@ dev:
 
 test:
 	@$(BASH) $(SCRIPTS_DIR)/test.sh
+
+# SCA-19 (Sprint 7 Item 2): Validate docker-compose.yml syntax before
+# any image bump PR lands. Linux + macOS only — Windows contributors rely
+# on CI's `docker-compose-config` job (per docs/ADR-0008-multiplatform-tooling.md).
+# `docker compose config --quiet` exits non-zero on YAML errors + broken
+# `${VAR:?required}` expansions without starting any container.
+test-compose:
+	@if command -v docker >/dev/null 2>&1; then \
+	    docker compose -f infra/docker-compose.yml config --quiet && \
+	    echo "[OK] infra/docker-compose.yml syntax + env-var refs valid"; \
+	else \
+	    echo "[SKIP] docker not on PATH (CI will catch this on Linux/macOS runners)"; \
+	fi
 
 lint:
 	@$(BASH) $(SCRIPTS_DIR)/lint.sh
