@@ -43,6 +43,16 @@ dependencies:
   dio: ^5.7.0                    # REST client with X-API-Version header + 401/429 handling
   uuid: ^4.5.1                   # UUID v7 (time-ordered, 74-bit random suffix)
 
+  # PR-S7-MOB-10: biometric prompt (FaceID / TouchID / fingerprint) for
+  # sensitive operations. Pinned to ^2.3.0 — that is the last 2.x release
+  # with the public API used by `lib/mobile/auth/biometric.dart`
+  # (`LocalAuthentication.authenticate(localizedReason, biometricOnly,
+  # sensitiveTransaction, persistAcrossBackgrounding)`). 3.x removed the
+  # `sensitiveTransaction` flag and renamed it; we intentionally stay on
+  # 2.x for the MOB-10 hardening scope. See cyber-security Sprint 7
+  # review (2026-07-07) finding MOB-10.
+  local_auth: ^2.3.0
+
   # PR-11: web dashboard — fl_chart BarChart + LineChart widgets.
   # Pinned to 0.69.x: that release is the last one where `LineChart`'s
   # `LineChartData` `lineBarsData` and `BarChart`'s `BarChartData`
