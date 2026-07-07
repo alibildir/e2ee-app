@@ -40,16 +40,15 @@ the original "review ihlalleri" this checklist tracks. Verbatim from
 
 | ID   | Status     | Closed by                                                                                       | Commit / PR                                          | Notes |
 |------|------------|-------------------------------------------------------------------------------------------------|------------------------------------------------------|-------|
-| ADV-1 | OPEN — carry-over to **Sprint 9+** | —                                                                                               | —                                                    | Pre-existing in PR-13 (`e582bda`); never the hotfix's scope. Reconciliation PR deferred per `SPRINT-2-HOTFIX-INTEGRATION-GATE.md` §6. |
-| ADV-2 | **CLOSED** | Sprint 7 (`feat/pr-s7-integration`)                                                             | `infra/kong/kong.yml @ 0b669cc` (PR-32 + AUTHZ-2)   | CORS `origins` tightened from `"*"` to the explicit allowlist `https://app.opene2ee.com`, `https://staging.opene2ee.com`, `http://localhost:3000`, `http://localhost:8080` (lines 110–114). Note: dev-mode `localhost` is intentionally retained for `flutter run`. |
-| ADV-3 | **CLOSED** | Sprint 5 PR-32 + Sprint 7 Item 1 AUTHZ-2                                                        | PR-32 `fcfa107` (Sprint 5 JWT plugin) → Sprint 7 `2c09635` (AUTHZ-2 /healthz extension) | `kong.yml` now carries: (a) `jwt` plugin per-route for the protected subtree (lines 167–284), (b) HS256 `jwt_secrets` for `opene2ee-mobile` + `opene2ee-monitoring` consumers (lines 62–91), (c) `/healthz` JWT-protected route (lines 274–284). The remaining gaps from ADV-3 — `request-transformer` and `prometheus` plugins — remain advisory and are tracked in §3. |
-| ADV-4 | OPEN — carry-over to **Sprint 9+** | —                                                                                               | —                                                    | Pre-existing in PR-13 (`e582bda`); out of scope for Sprint 2 hotfix. `nginx.conf` port 80 still proxies directly to `e2ee_backend` without `return 301 https://$host$request_uri;`. |
+| ADV-1 | **CLOSED** | Sprint 3 PR-13 certbot path reconciliation                                                    | `2cbc7b3` (Sprint 3 ADV-1 fix) → `7076376` (merge)   | Docker-compose, nginx.conf, nginx/README.md now consistent on `/etc/letsencrypt/live/<domain>/` (nginx.conf lines 22–27 confirm `certbot_data:/etc/letsencrypt:ro` mount + `opene2ee.local/fullchain.pem` path). |
+| ADV-2 | **CLOSED** | Sprint 3 Kong CORS hardening (separate from PR-32 JWT plugin and AUTHZ-2 /healthz JWT extension) | `51a4f6f` → `588676a` → `11ee73e` (ADV-2 commit chain) | Wildcard `"*"` replaced with explicit allowlist `https://app.opene2ee.com`, `https://staging.opene2ee.com`, `http://localhost:3000`, `http://localhost:8080`. `infra/kong/kong.yml` lines 110–114 still hold the Sprint 3 values on main. Note: dev-mode `localhost` is intentionally retained for `flutter run`. |
+| ADV-3 | **PARTIAL** | JWT half closed across Sprint 5 PR-32 + Sprint 7 AUTHZ-2; `request-transformer` + `prometheus` plugins still missing (S7-OPEN-3 carry-over) | `fcfa107` (Sprint 5 JWT plugin) → `42f22be` (PR-32 merge) → `2c09635` (Sprint 7 AUTHZ-2 healthz fix) → `cd92c37` (AUTHZ-2 merge) | `kong.yml` now carries: (a) `jwt` plugin per-route for the protected subtree (lines 167–284), (b) HS256 `jwt_secrets` for `opene2ee-mobile` + `opene2ee-monitoring` consumers (lines 62–91), (c) `/healthz` JWT-protected route (lines 274–284). The two remaining gaps from the original ADV-3 finding — `request-transformer` and `prometheus` plugins — remain advisory and are tracked as S7-OPEN-3 in §3.2. |
+| ADV-4 | **CLOSED** | Sprint 3 Nginx HTTPS redirect                                                                  | `da796b8` (Sprint 3 ADV-4 fix) → `971e219` (merge)   | Port 80 now serves `return 301 https://$host$request_uri;` (lines 14–18 in nginx.conf) — backend proxy is no longer reachable over plaintext HTTP. |
 
-**Sprint 7 net effect on Sprint 2 hotfix findings:**
-- 2 of 4 closed (ADV-2, ADV-3) — both JWT/CORS findings, primarily via
-  PR-32 Kong JWT plugin and AUTHZ-2 /healthz JWT enforcement.
-- 2 of 4 carry-over (ADV-1 certbot path, ADV-4 nginx HTTP→HTTPS redirect)
-  — pre-existing in PR-13 infra scaffold, never Sprint 2 hotfix scope.
+**Net effect on Sprint 2 hotfix findings (post-Sprint 7):**
+- 3 of 4 fully closed (ADV-1 certbot path, ADV-2 CORS, ADV-4 HTTPS redirect) — all closed in **Sprint 3** (the original remediation Sprint), not Sprint 7.
+- 1 of 4 partially closed (ADV-3 kong.yml plugins) — JWT half closed via Sprint 5 PR-32 + Sprint 7 AUTHZ-2; `request-transformer` + `prometheus` still missing → S7-OPEN-3 carry-over in §3.2.
+- 0 carry-over from Sprint 2 itself (the Sprint 2 hotfix review's own gate already flagged ADV-1..ADV-4 as advisory non-blocking, and Sprint 3 closed all four within its own scope).
 
 ---
 
@@ -60,12 +59,12 @@ the Sprint 9 planner has a concrete starting list rather than re-deriving
 it from `RETROSPECTIVE.md` (which is no longer maintained as a single
 file — see §5 follow-ups).
 
-### 3.1 Sprint 2 carry-over (2 items)
+### 3.1 Sprint 2 carry-over (0 items)
 
-| ID    | Item                                                                                                | Sprint 9+ work                                                            | Severity |
-|-------|-----------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------|----------|
-| ADV-1 | Certbot path reconciliation across `docker-compose.yml`, `nginx.conf`, `nginx/README.md`             | Single PR — pin `certbot` volume mount paths, update nginx config + README | Med      |
-| ADV-4 | nginx port 80 → 443 `return 301 https://$host$request_uri;` redirect                                | Single PR — add redirect server block to `nginx.conf`, update README       | Med      |
+All Sprint 2 hotfix review findings (ADV-1..ADV-4) were closed in **Sprint 3**
+within the original remediation Sprint's own scope. None carry over to
+Sprint 9+ from the Sprint 2 hotfix review itself. (See §2 for closure
+evidence.)
 
 ### 3.2 Sprint 7 verifier §6 carry-over (3 items)
 
@@ -76,7 +75,7 @@ These came out of Sprint 7 verification but were not closed by any Sprint
 |---------------|-----------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|----------|
 | S7-OPEN-1     | Kong 3.8 EOL grandfather clause — bump PR to `kong:3.10-alpine` (LTS) within 14 days of KONG-UPGRADE-POLICY acceptance | `docs/policy/KONG-UPGRADE-POLICY.md` Grandfather Clause §                                | High     |
 | S7-OPEN-2     | Coturn TLS `:!ECDSA` cipher-list consistency — verifier noted inconsistency vs declared TLS 1.2+ minimums in `infra/coturn/turnserver.conf` | Sprint 7 Item 3 SCA-22 verifier minor finding                                            | Low      |
-| S7-OPEN-3     | Kong `request-transformer` + `prometheus` plugins (ADV-3 partial close — JWT closed, these two not) | ADV-3 closure note (§2 above)                                                            | Low      |
+| S7-OPEN-3     | ADV-3 PARTIAL — JWT closed (`fcfa107` / `42f22be` / `2c09635` / `cd92c37`); request-transformer + prometheus plugins still missing | ADV-3 partial close (§2 above)                                                            | Low      |
 
 ### 3.3 Cross-platform CI carry-over (1 item)
 
@@ -90,14 +89,12 @@ These came out of Sprint 7 verification but were not closed by any Sprint
 
 The Sprint 8 scope (`docs/SPRINT-8-SCOPE.md` Items 4–6) is **not** a
 review-checklist follow-up — it is an architectural extension. The
-cross-links below show how the open items above relate to the ADR
+cross-links below show how the open items in §3 relate to the ADR
 extension work, so a verifier reading the Sprint 8 closure can trace
 the dependency chain end-to-end.
 
 | Open item          | ADR extension in Sprint 8                                       | Why the link matters                                                                                              |
 |--------------------|-----------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| ADV-1 (certbot)    | `docs/ADR-0003-vpn-layer.md` extension (Item 5, VPN purge + iOS Keychain access group + Android Keystore) | The VPN layer extensions define the off-device secret storage pattern; certbot paths must use the same vault mechanism to stay consistent. |
-| ADV-4 (HTTPS redirect) | `docs/ADR-0008-multiplatform-tooling.md` extension (Item 6, per-OS matrix update)            | HTTPS termination posture is a per-OS matrix concern (Linux + macOS only per ADR-0008 runner matrix). The redirect PR must update CI matrix annotation. |
 | S7-OPEN-1 (Kong EOL) | `docs/ADR-0003-vpn-layer.md` extension (Item 5)                                              | VPN layer upstream cipher posture (TLS 1.2+ minimum) sets the floor; Kong bump must clear same posture via SCA-22 coturn TLS precedent. |
 | S7-OPEN-3 (Kong plugins) | `docs/ADR-0006-anonimlik.md` extension (Item 4, Anonymized Device Identity + Risk Register A1-G1 + KVKK + MaskIP) | The `prometheus` plugin enables per-`device_id_hash` request-rate metrics without breaking Anonim Cihaz Kimliği privacy contract (hashed only). |
 | MP-CI-OPEN-1 (iOS release matrix) | `docs/ADR-0008-multiplatform-tooling.md` extension (Item 6)            | The per-OS matrix update is the canonical source for "what runs where" — the iOS release-build gap closes in the same PR. |
@@ -109,11 +106,15 @@ the dependency chain end-to-end.
 When Sprint 8 closes, the verifier §6 should update this checklist as
 follows:
 
-1. For each ADV-1/ADV-4 row in §3.1: if a Sprint 8 PR closed it,
-   move to §2 with `Closed by` = the Sprint 8 PR; if not, leave open
-   in §3.1 with a new `Sprint 10+` target.
-2. For each S7-OPEN-* row in §3.2: same logic — close in §2 or
-   carry-over to §3.1 with bumped target.
+1. **Sprint 2 carry-over (§3.1) is empty** — all ADV-1..ADV-4 already
+   closed in Sprint 3 (full closure) or Sprint 5+7 (partial JWT for
+   ADV-3). No §3.1 movement is expected unless Sprint 8 re-opens one
+   of the ADV-* rows.
+2. For each S7-OPEN-* row in §3.2: same logic as before — close in §2
+   with the closing PR, or carry-over to §3.1 (re-tagged as `S8-OPEN-*`)
+   with bumped target. Note S7-OPEN-3 (ADV-3 partial close for
+   `request-transformer` + `prometheus`) is the highest-likelihood
+   carry-over — Kong plugin additions usually need their own sprint.
 3. For MP-CI-OPEN-1 in §3.3: tied to ADR-0008 extension; close in
    the same Sprint 8 PR if Sprint 8 Item 1 PR-MP-CI adds iOS release
    to the matrix, otherwise carry-over.
@@ -138,8 +139,6 @@ documents are **out of scope** for this checklist:
   (ADV-1..ADV-4), non-blocking advisory register.
 * `docs/SPRINT-2-HOTFIX-INFRA-CONFIG.md` — Architect spec for the
   4-file PR-13 follow-up.
-* `docs/SPRINT-7-CLOSURE.md` — Sprint 7 deliverable table (16 PRs,
-  commit SHAs).
 * `docs/SPRINT-7-MAIN-MERGE-XCHECK.md` — Sprint 7 merge cross-check
   (35 commits ahead of Sprint 6 base).
 * `docs/SPRINT-8-SCOPE.md` Item 3 — this checklist's task brief.
