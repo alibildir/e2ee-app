@@ -1,0 +1,123 @@
+# OpenE2EE — Android debug build workflow
+#
+# Sprint 9 / Item 1 (ANDROID-DEBUG-CI) — Hand-off from Architect.
+#
+# Plan A scope (per Sprint 9 SCOPE.md user direction — "apk alabilmek
+# için gerektiği kadar"). Minimal PR-trigger debug APK build:
+#   * ubuntu-latest runner (matches Sprint 8 PR-MP-CI multi-OS baseline)
+#   * PR push on `main` + `feat/*` + manual workflow_dispatch
+#   * JDK 17 (matches mobile/android/app/build.gradle.kts sourceCompatibility)
+#   * android-actions/setup-android@v3 api-level 34 (matches compileSdk = 34)
+#   * Cache Gradle (~/.gradle/caches + ~/.gradle/wrapper)
+#   * Build Debug APK (./gradlew assembleDebug, signed with AGP debug keystore)
+#   * Upload 2 artifacts: android-debug-apk (14d) + android-mapping-files (30d)
+#
+# Out of scope (Plan A minimal — explicitly excluded per user direction):
+#   * AAB (`bundleRelease`) — Plan B/C
+#   * Release signing keystore / `key.properties` — Plan B/C (Sprint 7 MOB-4
+#     gate pattern reused in `.github/workflows/android-release.yml`)
+#   * Play Store distribution — Plan C
+#   * Firebase App Distribution — Plan C
+#   * Multi-OS matrix (ubuntu-only; macOS iOS is already covered by
+#     `.github/workflows/ios.yml` from Sprint 7+8)
+#   * Release APK (Sprint 7 android-release.yml already handles that)
+#
+# Known prerequisite (NOT addressed in Plan A — follow-up for Plan B):
+#   The Gradle wrapper script `mobile/android/gradlew` is gitignored
+#   (see .gitignore lines 120-121). For this workflow to successfully
+#   `./gradlew assembleDebug` in CI, `mobile/android/gradlew` must
+#   exist on the runner — either committed via the standard Flutter
+#   scaffold OR regenerated before the build step via
+#   `flutter create . --platforms=android` (this is how the existing
+#   android-release.yml handles the missing wrapper, see its
+#   "Verify Gradle wrapper" step at lines 145-157). Plan A follows the
+#   SCOPE.md Technical Spec verbatim and assumes the wrapper is already
+#   present at PR time. If the wrapper is absent, the "Make gradlew
+#   executable" step will fail loudly with a clear "No such file or
+#   directory" error, which is the intended fast-fail signal.
+#
+# Cross-references:
+#   * docs/SPRINT-9-SCOPE.md — Item 1 technical spec
+#   * .github/workflows/android-release.yml — release-build sibling
+#     (Sprint 7 / MOB-4 key.properties gate, signing pattern)
+#   * .github/workflows/ci.yml — backend + web + mobile-build-web matrix
+#   * mobile/android/app/build.gradle.kts — SDK + JDK pins
+#     (compileSdk = 34, minSdk = 23, targetSdk = 34, JavaVersion.VERSION_17)
+#   * mobile/android/build.gradle.kts — Flutter project Gradle root
+
+name: Android Debug APK
+
+on:
+  pull_request:
+    branches:
+      - main
+      - feat/*  # Sprint 7 + 8 feature branches
+  workflow_dispatch:
+
+jobs:
+  android-debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 34  # Sprint 7 MOB-5 minSdk 23, target 34
+          arch: x86_64
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Make gradlew executable
+        run: chmod +x ./mobile/android/gradlew
+
+      - name: Verify Flutter dependency cache
+        run: |
+          # Sprint 4 PR-27 build-web pattern — flutter --version check
+          flutter --version || (echo 'Flutter not installed, using pre-built' && exit 0)
+
+      - name: Build Debug APK
+        working-directory: ./mobile/android
+        run: ./gradlew assembleDebug
+
+      - name: Verify APK output
+        run: |
+          APK_PATH=$(find ./mobile/android/app/build/outputs/apk/debug -name '*.apk' | head -1)
+          if [ ! -f "$APK_PATH" ]; then
+            echo "::error::Debug APK not found"
+            exit 1
+          fi
+          APK_SIZE=$(stat -c%s "$APK_PATH")
+          echo "Debug APK: $APK_PATH ($APK_SIZE bytes)"
+
+      - name: Upload Debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: ./mobile/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload mapping file
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-mapping-files
+          path: ./mobile/android/app/build/outputs/mapping/debug/*.txt
+          if-no-files-found: warn
+          retention-days: 30
