@@ -2,10 +2,10 @@
 
 | Field      | Value                                  |
 |------------|----------------------------------------|
-| **Status** | Accepted (Sprint 1) — Stub             |
-| **Date**   | 2026-07-06                             |
+| **Status** | Accepted (Sprint 1) — Sprint 8 extension (HIGH) |
+| **Date**   | 2026-07-06 (stub); 2026-07-07 (Sprint 8 extension) |
 | **Owner**  | Architect (mvs_25a7a987f73243899e35a1485c6ba224) |
-| **Source** | This ADR is a stub extracted from [`docs/ARCHITECTURE_DECISIONS.md`](ARCHITECTURE_DECISIONS.md) §5 ("Regülasyon Uyumu ve Mağaza Politikaları"). Future contributors should expand it with the full Anonim Cihaz Kimliği / Backend'de Saklanan / KVKK DELETE sections referenced from `backend/internal/storage/interfaces.go` and `mobile/lib/shared/device_identity.dart`. |
+| **Source** | Originally a stub extracted from [`docs/ARCHITECTURE_DECISIONS.md`](ARCHITECTURE_DECISIONS.md) §5 ("Regülasyon Uyumu ve Mağaza Politikaları"). Sprint 5 PR-33 expanded the Anonim Cihaz Kimliği + Risk Register A1-G1 sections. Sprint 8 (this PR) tightens the contract to its normative form (UUID v7 device-only, Ed25519 private key device-only, `device_id_hash = SHA-256(uuid||salt)[:16]`, MaskIP /24 v4 /48 v6), codifies the KVKK DELETE cross-device propagation path (PR-37), and adds a Testability section that names the gap (backend grep missing). |
 
 > **Scope notice.** This is a Sprint 4 PR-26 placeholder created to resolve
 > the broken `docs/ADR-0006-anonimlik.md` cross-references flagged by the
@@ -250,9 +250,285 @@ different hash and breaks the contract.
 
 ---
 
-**Cross-references.**
+## Sprint 8 Extension — Contract Pin (HIGH)
+
+Sprint 5 PR-33 expanded the "Anonim Cihaz Kimliği (DeviceIdentity)"
+section above from the Sprint 4 PR-26 stub into the canonical
+form. Sprint 8 tightens the contract by pinning three explicit,
+testable invariants that the stub and Sprint 5 prose state but do
+not surface as normative rules. Verifier §6 will use this section
+as the regression target.
+
+### Anonim Cihaz Kimliği — normative contract
+
+The DeviceIdentity is the *only* identifier the backend ever sees.
+The contract pins three rules; each is enforced by a named test or
+a CI guard.
+
+| # | Invariant (normative) | Source-of-truth (code) | Test / guard pinning it |
+|---|---|---|---|
+| C-1 | **The raw UUID v7 lives ONLY on the device.** It is never serialized to the backend over the wire, never logged, never written to cache, and never echoed in REST responses or URL paths. | `mobile/lib/shared/device_identity.dart` L80-81 (`uuidV7` is non-serializable); `mobile/lib/shared/telemetry_formatter.dart` L135 (`deviceIdHash` is the only device field on `Telemetry`) | `mobile/test/shared/device_identity_test.dart::forbiddenHardwareIdsNeverAppear` (F1 anonimlik); `tool/ci_grep_privacy_violations.dart` (STRIDE-3-01 mobile grep) |
+| C-2 | **The Ed25519 private key lives ONLY on the device**, in the platform secure store (Android Keystore / iOS Keychain via `flutter_secure_storage`). It is not a field on `DeviceIdentity`; the `sign()` method reads it lazily from secure storage and never returns it. | `mobile/lib/shared/device_identity.dart` L73-77 (private key is *not* a class field; comment explicitly calls it a "privacy foot-gun"); L134-150 (`sign()` reads from `_secure` and returns only the 64-byte signature) | Lint rule + `device_identity_test.dart`; Secure Enclave / StrongBox gating lives in `flutter_secure_storage` defaults — see ADR-0003 §B for Keychain access-group story |
+| C-3 | **The wire-format device identifier is `device_id_hash = SHA-256(uuid_v7 \|\| server_salt)[:16]`** — 16 bytes, hex-encoded to 32 lowercase chars. The input order is `uuid` first, then `salt`, and the salt is server-issued (per-tenant, never shared with the device's UUID in plaintext). | `backend/internal/auth/keys.go` L46-58 (`HashDeviceID`); `mobile/lib/shared/device_identity.dart` L100-125 (`deviceIdHash`) | `TestHashDeviceID_KnownAnswer` (pinned vector at keys.go L42-45); `TestPublicKeyFingerprint_KnownAnswer` (pinned at keys.go L64-66); `TestHashDeviceID_SaltRotationChangesHash` (Risk C1 precondition) |
+
+> **Why the order matters (C-3).** SHA-256("uuid || salt") and
+> SHA-256("salt || uuid") produce different digests for the same
+> (uuid, salt) pair. If mobile and backend disagreed on the order,
+> every `device_id_hash` the device sends at registration would
+> silently fail to join the server-side `devices` row — the user
+> would appear as a brand-new device on every telemetry POST, and
+> any KVKK DELETE would target a row that no telemetry row ever
+> pointed to. The cross-language KAT
+> (`TestHashDeviceID_KnownAnswer` on both sides) is the only way to
+> catch this drift — it was caught and fixed by **Sprint 1 PR-15**
+> ("HashDeviceID uuid-first per ADR-0006 §Backend'de Saklanan",
+> commit 353cb2a; promoted via PR-15 merge a8ab7d4). Reversing the
+> order today would be a regression of F1 anonimlik.
+
+> **Why the `[:16]` truncation (C-3).** The full 32-byte SHA-256
+> digest is 64 hex chars; the wire format truncates to 16 bytes / 32
+> hex chars. This is a 64-bit space — collision probability across
+> the full device population of OpenE2EE is negligible for the
+> foreseeable future (see Risk Register **D1** below). The full
+> 32-byte digest is *not* used anywhere on the wire, but the
+> backend keeps `public_key` and `public_key_fp` as separate columns
+> so a future lengthening is a non-breaking change.
+
+---
+
+## Sprint 8 Extension — KVKK DELETE (Cross-Device Propagation)
+
+The KVKK / GDPR right-to-erasure path is the *only* destructive
+endpoint in the system, and it is the path most likely to be
+abused for cross-device deletion if authorization is sloppy. This
+section codifies the propagation chain that Sprint 5/6/7 wired up.
+
+### Endpoint
+
+`DELETE /api/v1/users/{device_id_hash}` — the path parameter is the
+*server-side* `device_id_hash` (the same 32-hex-char value the
+device sends in telemetry), NOT the raw UUID v7. Putting the raw
+UUID in the URL would mean it gets logged at every proxy layer
+(Kong access log, backend request log, time-series ingest) and
+could be correlated across services — exactly the cross-device
+re-identification vector the privacy posture is designed to avoid.
+
+Implementation: `backend/internal/api/users.go` (`handleDeleteUser`).
+
+### Authorization gate (Sprint 6 PR-37 — AUTHZ-1)
+
+The endpoint sits inside the `IsAuthorized` middleware subtree, so
+a bearer JWT is required. PR-37 (commit 91c6102, hand-off from
+cyber-security review of AUTHZ-1 / STRIDE-6-04) added the second
+gate: the JWT `sub` claim MUST equal the `device_id_hash` path
+parameter. The check is implemented at `users.go` L81-98:
+
+```go
+subject := UserIDFromContext(r.Context())
+if subject == ""      { writeUnauthorized(w, ...); return }
+if subject != hash    { writeForbidden(w, ...);    return }
+```
+
+A mismatch returns 403 with a generic message — we deliberately do
+not distinguish "no such device" from "wrong owner" so an attacker
+cannot enumerate `device_id_hash` values by probing the endpoint.
+The mismatch is warn-logged with `sub_matches_path: false` for
+post-hoc audit.
+
+Tests pinning the AUTHZ-1 contract (see `backend/internal/api/users_test.go`):
+
+| Test | Asserts |
+|---|---|
+| `TestDeleteUser_HappyPath_SubMatchesHash` | JWT sub == path hash → `DeleteUser` called exactly once with the path hash |
+| `TestDeleteUser_CrossDeviceAttempt_Forbidden` | JWT sub ≠ path hash → `DeleteUser` NEVER called; response is 403 |
+| `TestDeleteUser_BadHashShape` | non-hex / too-short / too-long path → 400, `DeleteUser` NEVER called |
+| `TestDeleteUser_MissingBearer_Returns401` | no Authorization header → 401, `DeleteUser` NEVER called |
+| `TestDeleteUser_ExpiredToken_Returns401` | expired JWT → 401, `DeleteUser` NEVER called |
+| `TestDeleteUser_StoreError_Returns500` | DB failure → 500, no hook fired |
+| `TestDeleteUser_HookFailure_Still200` | relational delete succeeds, hook fails → 200 returned; user-facing right-to-erasure is not rolled back |
+| `TestDeleteUser_HashBoundary` | exact 16-char and 64-char hashes accepted; one off → 400 |
+| `TestDeleteUser_NoCrossDeviceSideEffects` | cross-device attempt → no Redis-side purge, no telemetry delete, no `sessions.sender_hash`/`receiver_hash` null-out |
+
+### Propagation chain (Sprint 6 PR-37 + Sprint 7 STRIDE-6-03)
+
+On a successful `DeleteUser(ctx, hash)` the handler fires a
+`DeleteUserHook` callback wired in `cmd/server/main.go`:
+
+1. **Relational storage (`storage.PostgresStore.DeleteUser`)** —
+   single transaction: `DELETE FROM telemetry WHERE device_id_hash = $1`,
+   `UPDATE sessions SET sender_hash = NULL WHERE sender_hash = $1`,
+   `UPDATE sessions SET receiver_hash = NULL WHERE receiver_hash = $1`,
+   `DELETE FROM devices WHERE device_id_hash = $1`, then `COMMIT`.
+   See `backend/internal/storage/postgres.go` L267-298.
+2. **Redis Active Pool (`matching.RedisPool.DeleteByHash`)** — fired
+   from `DeleteUserHook` to remove the user's waiting-receiver row
+   immediately rather than waiting for the 15-minute TTL. Wired in
+   Sprint 7 PR-39 (commit ba2fc31, STRIDE-6-03 follow-up). O(N) over
+   the pool; acceptable for steady-state pool sizes (tens).
+3. **Best-effort hook failure** — if step 2 fails (Redis outage,
+   network blip), the response is still 200 and the user-facing
+   right-to-erasure is upheld. The 7-day KVKK SLA is guaranteed by
+   the periodic background sweeper (`RunSweeper` → `SweepIdle`, every
+   60s) and a KVKK delete-audit log table.
+
+### Defence-in-depth notes
+
+* The JWT secret in production is Kong-minted; the dev-fallback JWT
+  secret (SEC-1 follow-up in `cmd/server/main.go`) is logged as a
+  no-go in production environments.
+* `isValidDeviceHash` enforces the 16-64 lowercase-hex shape so a
+  phone-number-shaped injection can't sneak into the path
+  parameter (`users.go` L135-146).
+* When a real `users` table lands (Sprint 6+ follow-up), the same
+  handler must additionally confirm the device row is still active
+  (see Risk Register **E3** below) — the AUTHZ-1 gate alone is
+  necessary but not sufficient long-term.
+
+---
+
+## Sprint 8 Extension — MaskIP (/24 IPv4 /48 IPv6)
+
+The IP-masking helper lives at
+`backend/internal/operator/mask.go` and is the second privacy
+primitive (after `device_id_hash`) that the wire format relies on.
+The contract is **deterministic and one-way**: given an IP, the
+output is a /24 (v4) or /48 (v6) subnet string with the host bits
+zeroed; given the subnet, the original IP cannot be recovered.
+
+### Contract
+
+```text
+MaskIPv4(s) -> "<a>.<b>.<c>.0/24"        (host bits zeroed)
+MaskIPv6(s) -> "<a>:<b>:<c>::/48"       (host bits zeroed)
+MaskIPv4_in_v6("::ffff:1.2.3.4") -> "1.2.3.0/24"  (unmapped first)
+```
+
+The implementation uses Go's `net/netip` package and applies
+`.Masked()` to the prefix so the host bits are zeroed before
+formatting. **This was a critical bug fix in Sprint 1 PR-20**
+(commit 2e4d492, "MaskIP — actually mask via .Masked()"; merged via
+PR-20 → 8fcbeda). Before PR-20, `netip.PrefixFrom(addr, 24).String()`
+returned `"88.240.5.12/24"` — the raw IP with a `/24` suffix
+appended — leaking the original address into cache writes and REST
+responses. The PR-20 fix is now pinned by `TestMaskIP_ActuallyMasks`
+in `backend/internal/operator/mask_test.go`.
+
+### Tests pinning the contract
+
+| Test | Asserts |
+|---|---|
+| `TestMaskIP_ActuallyMasks` (v4 subtest) | `88.240.5.12` → `88.240.5.0/24`; full v4 KAT table |
+| `TestMaskIP_ActuallyMasks` (v6 subtest) | `2a01:5ec0:1234:5678::1` → `2a01:5ec0:1234::/48`; full v6 KAT table |
+| `TestMaskIP_V4In6_UnmapsToV4` | `::ffff:1.2.3.4` → `1.2.3.0/24` (v4-mapped-in-v6 unmap, not `::/24`) |
+| `TestMaskIP_EmptyAndUnparseable` | empty / unparseable → `""` (no panic, no leak) |
+| `TestMaskIP_AlreadyMaskedPassesThrough` | `88.240.5.0/24` is a fixed point; `88.240.5.42/24` re-masks to `88.240.5.0/24` |
+| `TestApplyIPMask_WritesMaskedQueryValue` | `applyIPMask(info, "88.240.5.12")` writes the masked form to `info.QueryValue` (regression pin for PR-20) |
+| `TestApplyIPMask_NilInfoIsNoOp` | defensive nil-check |
+
+### Where MaskIP is called
+
+* `applyIPMask(info, canonical)` — used by MNPTRAdapter / Service-level
+  finalize so the cache and the response always carry the same
+  masked form. See `mask.go` L151-157.
+* Direct callers (search: `grep -rn "operator.MaskIP\|operator.MaskPhone" backend/`):
+  any future operator-resolver call site that previously would have
+  logged the raw IP MUST go through MaskIP first.
+
+### Threat model
+
+| Threat | Defence |
+|---|---|
+| Raw IP leaks into cache (operator resolver) | `applyIPMask` writes the masked form into `info.QueryValue` before cache write |
+| Raw IP leaks into REST response | `MaskIP` is the only entry point for IP → response serialization |
+| v4-in-v6 maps to a meaningless `::/24` | `addr.Unmap()` on `Is4In6()` (mask.go L132-134) |
+| netip API drift (Go 1.22 → 1.26) | `.Masked()` is the documented zeroing primitive; the regression test pins the KAT |
+
+---
+
+## Sprint 8 Extension — Testability (CI guard coverage)
+
+ADR-0006 invariants are only as strong as the tests that pin them.
+This section names every test/guard that currently pins an
+ADR-0006 invariant, and the **gaps** the Sprint 8 audit found that
+need follow-up work.
+
+### Existing guards (pinning ADR-0006 today)
+
+| Guard / test | Path | Pins |
+|---|---|---|
+| `TestHashDeviceID_KnownAnswer` | `backend/internal/auth/keys_test.go` | C-3 (input order `uuid \|\| salt`); pins reference vector at keys.go L42-45 |
+| `TestHashDeviceID_SaltRotationChangesHash` | `backend/internal/auth/keys_test.go` | Risk C1 precondition (salt rotation must change hash) |
+| `TestPublicKeyFingerprint_KnownAnswer` | `backend/internal/auth/keys_test.go` | C-3 (fingerprint algorithm + length) |
+| `TestPublicKeyFingerprint_Distribution` | `backend/internal/auth/keys_test.go` | Risk D1 (collision rate at /16 truncation) |
+| `TestMaskIP_ActuallyMasks` (v4/v6) | `backend/internal/operator/mask_test.go` | MaskIP /24 v4 /48 v6 contract |
+| `TestMaskIP_V4In6_UnmapsToV4` | `backend/internal/operator/mask_test.go` | v4-in-v6 unmapping |
+| `TestApplyIPMask_WritesMaskedQueryValue` | `backend/internal/operator/mask_test.go` | Regression pin for Sprint 1 PR-20 |
+| `TestDeleteUser_HappyPath_SubMatchesHash` | `backend/internal/api/users_test.go` | AUTHZ-1 happy path |
+| `TestDeleteUser_CrossDeviceAttempt_Forbidden` | `backend/internal/api/users_test.go` | AUTHZ-1 cross-device rejection (PR-37 contract) |
+| `TestDeleteUser_NoCrossDeviceSideEffects` | `backend/internal/api/users_test.go` | AUTHZ-1 side-effect isolation |
+| `forbiddenHardwareIdsNeverAppear` | `mobile/test/shared/device_identity_test.dart` L245-249 | C-1 / F1 anonimlik (mobile) |
+| `tool/ci_grep_privacy_violations.dart` | `tool/ci_grep_privacy_violations.dart` | F1 anonimlik — Sprint 7 STRIDE-3-01 mobile grep; scans `mobile/lib` + `mobile/test` for `imei`, `telephonymanager`, `getdeviceid`, `androidid` in code position |
+
+### Known gaps (Sprint 8 audit)
+
+| Gap | Risk | Recommended follow-up |
+|---|---|---|
+| **No backend CI grep for raw-IP leaks.** A new Go commit that writes a raw IP into a cache / response without going through `MaskIP` would not be caught by an automated guard — only by code review. The Sprint 7 mobile grep (`tool/ci_grep_privacy_violations.dart`) is the right shape but covers only Dart / Kotlin / Swift, not Go. | High — the PR-20 leak regressed once (Sprint 1 §6 D/E retry), and the only thing standing between us and a recurrence is reviewer vigilance. | Sprint 8+ follow-up: extend `tool/ci_grep_privacy_violations.dart` (or add a sibling `tool/ci_grep_backend_privacy.go`) to scan `backend/cmd/`, `backend/internal/` for raw IP literals (`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`) outside the masking helpers. The existing Dart script's comment-stripping state machine is portable to Go with minor adjustments. |
+| **No cross-language KAT for `HashDeviceID`.** The Go KAT pins the backend-side reference vector; a Dart equivalent at `mobile/test/shared/device_identity_test.dart` does not pin the same vector (the Dart implementation is tested for shape, not byte-equality with the Go output). | Medium — a future Dart-side change to `_hexLower`, `_uuidToBytes`, or `pc.SHA256Digest` would not be caught until production telemetry mismatches the server's `devices` row. | Sprint 8+ follow-up: add `TestDeviceIdHash_KnownAnswer_MatchesGoBackend` in `mobile/test/shared/device_identity_test.dart` with the same `(uuid, salt) → hash` reference vector as `TestHashDeviceID_KnownAnswer`. |
+| **AUTHZ-1 covers destructive endpoints; the login endpoint stays open per its ADV-3 contract.** Once a real `users` table lands, the AUTHZ-1 gate alone is necessary-but-not-sufficient — the handler must additionally confirm the device row is still active. | Low (Phase 1) → High (when `users` table ships) | Track under Risk E3; the AUTHZ-1 test suite must be extended in the same PR that ships the `users` table. |
+| **No automated test for `server_salt` rotation → all `device_id_hash` change → session join breakage** (Risk C1 mitigation: dual-salt transition window). | Medium — the dual-salt transition code path has not been authored yet; when it is, it needs a regression test that pins "old + new salt both accepted for N days". | Sprint 8+ follow-up when C1 mitigation ships. |
+
+### Testability posture summary
+
+* **Mobile side**: F1 anonimlik is enforced both by a Dart-level
+  test (`forbiddenHardwareIdsNeverAppear`) and a CI guard
+  (`tool/ci_grep_privacy_violations.dart`). This is the gold
+  standard — every Sprint that touches `mobile/lib/` runs both.
+* **Backend side**: ADR-0006 invariants are pinned by named Go
+  tests (KAT for `HashDeviceID`, `PublicKeyFingerprint`, `MaskIP`,
+  AUTHZ-1), but there is **no equivalent of the mobile CI grep**
+  for the backend tree. This is the most visible gap in the
+  current Testability posture and the recommended Sprint 8+
+  follow-up. Until it ships, reviewer vigilance is the only
+  backstop for a regression of the PR-20 MaskIP bug.
+
+---
+
+## Revision History
+
+| Sprint | PR | Change |
+|---|---|---|
+| Sprint 1 | (stub at `docs/ARCHITECTURE_DECISIONS.md` §5) | Privacy contract drafted as 4 principles |
+| Sprint 1 | **PR-15** (`353cb2a` → `a8ab7d4`) | HashDeviceID uuid-first fix — input order `uuid \|\| salt` pinned by KAT. **Closes F1 anonimlik input-order regression.** |
+| Sprint 1 | **PR-20** (`2e4d492` → `8fcbeda`) | MaskIP `.Masked()` fix — host bits now zeroed before format. **Closes Sprint 1 §6 D/E retry; pins /24 v4 /48 v6 KAT.** |
+| Sprint 4 | PR-26 (`eec3c3c`) | Stub ADR files extracted (`ADR-0003`, `ADR-0006`, `ADR-0008`) to resolve Sprint 3 Integration Gate cross-refs |
+| Sprint 5 | PR-33 | Anonim Cihaz Kimliği (DeviceIdentity) + Risk Register A1-G1 expansion; cross-platform implementation table; threat model |
+| Sprint 6 | **PR-37** (`91c6102` → `67a8c29`) | AUTHZ-1 — JWT `sub` MUST equal `device_id_hash` path on KVKK DELETE. **Closes cross-device deletion regression (AUTHZ-1 / STRIDE-6-04).** |
+| Sprint 6 | **PR-38** (`81854d0` → `730da02`) | pgx/v5 CVE chain guardrail: CI `govulncheck` + hermetic pin test. Defense-in-depth for the storage layer that holds the privacy contract. |
+| Sprint 7 | PR-39 / STRIDE-3-01 | `tool/ci_grep_privacy_violations.dart` — mobile CI guard for IMEI / TelephonyManager / getDeviceId / androidId (Sprint 7 Item 12, commit ba2fc31). Closes F1 anonimlik mobile grep gap. |
+| Sprint 7 | PR-39 / STRIDE-6-03 | Active Pool `DeleteByHash` + `SweepIdle` + `RunSweeper` — Redis-side KVKK DELETE propagation wired into `DeleteUserHook` (commit ba2fc31). |
+| Sprint 8 | **This PR** (`feat/pr-s8-adr-0006-ext`) | Normative contract pin (C-1, C-2, C-3); KVKK DELETE cross-device section; MaskIP section; Testability section with named gaps. |
+
+---
+
+## Cross-references
+
 * Source: [`docs/ARCHITECTURE_DECISIONS.md`](ARCHITECTURE_DECISIONS.md) §5
 * VPN layer that enforces the metadata-only invariant on-device:
   [`docs/ADR-0003-vpn-layer.md`](ADR-0003-vpn-layer.md)
 * Mobile device identity: `mobile/lib/shared/device_identity.dart`
 * Backend storage contract: `backend/internal/storage/interfaces.go`
+* Backend hash + fingerprint primitives: `backend/internal/auth/keys.go`
+* Backend IP masking primitives: `backend/internal/operator/mask.go`
+* KVKK DELETE handler (AUTHZ-1 gate): `backend/internal/api/users.go`
+* KVKK DELETE relational store: `backend/internal/storage/postgres.go` (`DeleteUser`)
+* KVKK DELETE Redis hook: `backend/internal/matching/pool.go` (`DeleteByHash`, `SweepIdle`, `RunSweeper`)
+* Mobile telemetry wire format (anonymised fields only):
+  `mobile/lib/shared/telemetry_formatter.dart`
+* Mobile CI grep (F1 anonimlik): `tool/ci_grep_privacy_violations.dart`
+* Sprint 1 PR-15 (HashDeviceID uuid-first): commit `353cb2a` → merge `a8ab7d4`
+* Sprint 1 PR-20 (MaskIP `.Masked()` fix): commit `2e4d492` → merge `8fcbeda`
+* Sprint 6 PR-37 (AUTHZ-1 JWT sub check): commit `91c6102` → merge `67a8c29`
+* Sprint 6 PR-38 (pgx/v5 CVE chain guardrail): commit `81854d0` → merge `730da02`
+* Sprint 7 STRIDE-3-01 (mobile CI grep): commit `ba2fc31` (Sprint 7 Item 12)
+* Sprint 7 STRIDE-6-03 (Active Pool KVKK purge): commit `ba2fc31` (Sprint 7 Item 4)
