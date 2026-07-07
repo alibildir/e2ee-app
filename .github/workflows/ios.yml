@@ -1,31 +1,57 @@
 name: ios-build
 
 # ============================================================================
-# Sprint 7 STRIDE-8-01 (hand-off from cyber-security)
+# Sprint 8 Item 1 — PR-MP-CI (GitHub Actions multi-OS matrix)
 # ----------------------------------------------------------------------------
-# PR-39 (Sprint 6) was static-only validated: Info.plist + AndroidManifest
-# patches, no xcodebuild invocation. The actual iOS build was never
-# exercised in CI before this matrix was added — leaving a gap where a
-# pure-Xcode regression could ship undetected. Closes STRIDE-8-01.
+# Sprint 3 carry-over: bring the iOS workflow to a fully multi-OS matrix
+# with OS-specific caching. The matrix was first wired by Sprint 7 Item 7
+# (STRIDE-8-01) which added the macos-latest xcodebuild leg; this PR
+# formalises the full 3-OS treatment as the Sprint 8 PR-MP-CI deliverable.
 #
-# Per-OS coverage (each runner focused on what it CAN build):
-#   * macos-latest   — full xcodebuild build + xcodebuild test
-#                       (iOS Simulator, Debug config, no signing)
-#   * ubuntu-latest  — static checks (Podfile Ruby syntax + XML plists)
-#   * windows-latest — static checks (Podfile Ruby syntax + XML plists)
+# Per-OS coverage (see docs/CI-MATRIX.md §"Workflow → Runner → Step matrix"
+# for the authoritative runner → step mapping):
 #
-# xcodebuild is Darwin-only. Non-macOS legs fail-fast no-ops the
+#   * ubuntu-latest   — static checks (Podfile Ruby syntax + XML plists
+#                       + project.pbxproj NeXTSTEP anchors); caches the
+#                       Flutter pub-cache and the cross-platform Flutter
+#                       build dir (mobile/build).
+#   * macos-latest    — full xcodebuild build + xcodebuild test (iOS
+#                       Simulator, Debug config, no signing); caches the
+#                       Darwin-only SwiftPM managed cache and CocoaPods
+#                       install output.
+#   * windows-latest  — static checks (Podfile Ruby syntax + XML plists
+#                       + project.pbxproj NeXTSTEP anchors) via
+#                       PowerShell-friendly bash; caches the gradle
+#                       cache (Android-adjacent cross-platform coverage
+#                       for any future Android-graded iOS PR; no docker
+#                       on this leg — see CI-MATRIX.md §4).
+#
+# xcodebuild is Darwin-only. Non-macOS legs fail-fast no-op the
 # xcodebuild steps via `if: matrix.os == 'macos-latest'` and instead
-# run cross-platform static validation. Both surface paths are
+# run cross-platform static validation. All three surface paths are
 # OS-agnostic except where flagged.
 #
-# Caching: macOS restores `~/Library/Caches/org.swift.swiftpm` (managed
-# SwiftPM cache, Darwin-only path) and `mobile/ios/Pods` (CocoaPods
-# install output). Restore uses exact match on Podfile.lock /
-# Package.resolved with a `restore-keys` fallback to the looser prefix
-# match. Hit/miss is logged in a dedicated step.
+# Caching — OS-specific, all per `actions/cache@v4`:
+#   - ubuntu:  ~/.pub-cache + mobile/build  (key on pubspec.lock)
+#   - macos:   ~/Library/Caches/org.swift.swiftpm + mobile/ios/Pods
+#              (key on Podfile.lock + **/Package.resolved, restore-keys
+#              fallback to looser prefix match)
+#   - windows: ~\.gradle\caches             (key on **/build.gradle*)
 #
-# Push YAPILMADI — branch-only hand-off to verifier.
+# fail-fast: false — one OS failing must not block the other two. This
+# is the same posture as the .github/workflows/ci.yml multi-OS matrix
+# (Sprint 3 PR-MP-CI), and matches the canonical guidance in
+# docs/CI-MATRIX.md §6 ("Update protocol — Adding a runner").
+#
+# Cross-references:
+#   - docs/CI-MATRIX.md         (canonical runner → step mapping)
+#   - ADR-0008-multiplatform-tooling.md §"Per-OS Matrix"
+#   - docs/MULTIPLATFORM.md     §"Windows" (manual verify path)
+#   - Sprint 7 Item 7 STRIDE-8-01 (cyber-security hand-off — macOS
+#     xcodebuild leg introduced)
+#
+# Push YAPILMADI — branch-only hand-off to verifier (Sprint 8 §"Push
+# kararı: §8 user/Architect onayı sonrası").
 # ============================================================================
 
 on:
@@ -48,7 +74,7 @@ jobs:
         # real xcodebuild leg; the others run static cross-platform
         # validation in lieu of an actual build. See the per-step
         # `if:` guards below.
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Checkout
@@ -60,16 +86,57 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
 
-      - name: Cache pub
-        # Cross-OS pub-cache (same pattern as the matrix in ci.yml):
-        # ~/.pub-cache is the Flutter package cache, .dart_tool holds
-        # the per-package build artifacts. Runs on all 3 legs.
+      # ---------------------------------------------------------------------
+      # Cross-OS Flutter pub cache — runs on all 3 legs.
+      # ~/.pub-cache is the Flutter package cache, .dart_tool holds the
+      # per-package build artifacts. Sprint 8 PR-MP-CI extension: also
+      # caches `mobile/build` (cross-platform Flutter build output) so
+      # the ubuntu and macos legs share Flutter incremental build state
+      # across runs.
+      # ---------------------------------------------------------------------
+
+      - name: Cache pub + mobile/build (ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            mobile/build
+          key: ${{ runner.os }}-pub-build-${{ hashFiles('mobile/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-build-
+
+      - name: Cache pub (macos)
+        # macOS gets a separate pub-cache step so the cache key prefix
+        # is `Darwin-pub-…` (matches actions/cache namespace convention
+        # where prefix is runner.os). The mobile/build dir is NOT
+        # cached here because on macOS the more valuable caches are
+        # the SwiftPM + Pods caches below — the macOS pod install
+        # rewrites mobile/ios/Flutter/Generated.xcconfig and
+        # `mobile/build` is dominated by xcodebuild intermediates that
+        # are themselves cached by Xcode's derived-data path.
+        if: matrix.os == 'macos-latest'
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('mobile/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
+      - name: Cache pub (windows)
+        if: matrix.os == 'windows-latest'
+        # ~\.pub-cache is the Flutter package cache on Windows runners
+        # (the literal path expansion differs from POSIX runners — the
+        # cache action resolves `~/.pub-cache` per-runner). .dart_tool
+        # is the per-package build artifact dir; cache it too.
         uses: actions/cache@v4
         with:
           path: |
             ~/.pub-cache
             .dart_tool
           key: ${{ runner.os }}-pub-${{ hashFiles('mobile/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
 
       - name: Install Flutter deps
         # `flutter pub get` writes `mobile/ios/Flutter/Generated.xcconfig`
@@ -124,6 +191,51 @@ jobs:
           else
             echo "Pods cache:     MISS — pod install will populate it"
           fi
+          echo "::endgroup::"
+
+      # ---------------------------------------------------------------------
+      # Windows-only caching — Gradle cache.
+      # ~\.gradle\caches is the Gradle dependency + build cache on
+      # Windows runners. Even though ios.yml is iOS-priority, the
+      # Flutter Android target shares the same Gradle daemon —
+      # caching here keeps the Windows static-check leg warm for any
+      # future Android-graded iOS PR. No docker on this leg (see
+      # CI-MATRIX.md §4).
+      # ---------------------------------------------------------------------
+
+      - name: Restore Gradle cache (windows)
+        id: gradle-cache
+        if: matrix.os == 'windows-latest'
+        uses: actions/cache@v4
+        with:
+          path: ~\.gradle\caches
+          # Key on Gradle build files. mobile/android/build.gradle* and
+          # mobile/android/app/build.gradle* (Flutter convention) are
+          # the dependency declaration entry points; mobile/android/
+          # settings.gradle* locks the plugin set.
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/build.gradle*', '**/settings.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Log Gradle cache hit/miss (windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "::group::Windows Gradle cache hit/miss log"
+          echo "Requested key:        ${{ steps.gradle-cache.key }}"
+          echo "Cache primary key:    ${{ steps.gradle-cache.cache-primary-key }}"
+          echo "Cache restored key:   ${{ steps.gradle-cache.cache-restored-key }}"
+          echo "Cache exact hit:      ${{ steps.gradle-cache.cache-hit }}"
+          if (Test-Path "$env:USERPROFILE\.gradle\caches") {
+            $size = (Get-ChildItem "$env:USERPROFILE\.gradle\caches" -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($size) {
+              $sizeMb = [math]::Round($size / 1MB, 1)
+              Write-Host "gradle cache:  HIT  ($sizeMb MB)"
+            } else {
+              Write-Host "gradle cache:  HIT  (empty)"
+            }
+          } else {
+            Write-Host "gradle cache:  MISS — first build will populate it"
+          }
           echo "::endgroup::"
 
       # ---------------------------------------------------------------------
