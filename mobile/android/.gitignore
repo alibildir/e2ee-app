@@ -14,8 +14,10 @@
 # Local machine config — points at the developer's Flutter SDK.
 local.properties
 
-# Gradle wrapper distribution / caches / wrapper jar (not yet committed).
-gradle/wrapper/gradle-wrapper.jar
+# Gradle wrapper jar — Sprint 9.5 hotfix: required for CI (gradle-wrapper.jar
+# is the binary that downloads Gradle distribution; without it, ./gradlew fails).
+# Originally gitignored as "generated artifact"; inverted for CI reproducibility.
+!gradle/wrapper/gradle-wrapper.jar
 .gradle/
 .gradle
 **/build/
