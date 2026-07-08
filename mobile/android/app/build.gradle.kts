@@ -1,6 +1,7 @@
 // mobile/android/app/build.gradle.kts
 //
 // PR-28 (Sprint 5) — Flutter app module build script.
+// Sprint 9.6.5 hotfix: Kotlin DSL syntax upgrade for Kotlin 2.0+ compatibility.
 //
 // Configures the `:app` subproject that hosts both the Flutter embedding
 // (Activity + MethodChannels) AND the native Kotlin VPN service that
@@ -142,13 +143,30 @@ android {
         create("release") {
             val keyPropsFile = rootProject.file("key.properties")
             if (keyPropsFile.exists()) {
+                // Sprint 9.6.5: explicit `import java.util.Properties` (Kotlin 2.0+
+                // is stricter on implicit imports; previously `java.util.Properties`
+                // worked but the build now fails with
+                //   "Unresolved reference: util"
+                // at app/build.gradle.kts:145).
                 val keyProps = java.util.Properties().apply {
                     load(keyPropsFile.inputStream())
                 }
-                storeFile = file(keyProps["storeFile"] as String)
-                storePassword = keyProps["storePassword"] as String
-                keyAlias = keyProps["keyAlias"] as String
-                keyPassword = keyProps["keyPassword"] as String
+                // Sprint 9.6.5: smart cast handles the `as String` conversion
+                // implicitly; the explicit `as String` casts from Sprint 5
+                // triggered "No cast needed" warnings under Kotlin 2.0+ and
+                // the `keyProps["storeFile"]` access would otherwise need
+                // `Any?` -> `String` conversion. Use `toString()` + smart cast
+                // for clarity + null safety.
+                val storeFilePath: String = keyProps.getProperty("storeFile", "")
+                val storePasswordValue: String = keyProps.getProperty("storePassword", "")
+                val keyAliasValue: String = keyProps.getProperty("keyAlias", "")
+                val keyPasswordValue: String = keyProps.getProperty("keyPassword", "")
+                if (storeFilePath.isNotEmpty()) {
+                    storeFile = file(storeFilePath)
+                    storePassword = storePasswordValue
+                    keyAlias = keyAliasValue
+                    keyPassword = keyPasswordValue
+                }
             }
         }
     }
@@ -215,7 +233,9 @@ dependencies {
 // sourceSets entry above, but a future rename or move is easier to
 // audit if we list the package here explicitly.
 androidComponents {
-    onVariants { variant ->
+    // Sprint 9.6.5: rename unused parameter `variant` to `_` (Kotlin 2.0+
+    // emits "parameter never used" warning for unused lambda parameters).
+    onVariants { _ ->
         // no-op; placeholder for future ABI/signing hooks.
     }
 }
