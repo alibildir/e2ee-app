@@ -29,7 +29,7 @@ Verifies:
   9. **Sprint 9.6.5:** build.gradle.kts Kotlin plugin version must be
      >= 2.2 (Flutter 3.44.1 soon-dropped floor).
  10. **Sprint 9.6.6 (v2):** app/build.gradle.kts Kotlin DSL syntax check
-     with 4 sub-checks:
+     with 5 sub-checks (S1-S5):
      S1. real `import java.util.Properties` statement exists at line start
          (NOT substring in a comment — Sprint 9.6.5 had a false-positive
          match on a comment claiming the import was added).
@@ -42,6 +42,21 @@ Verifies:
          block IS present in code (correct Kotlin 2.0+ replacement).
      S5. fully-qualified `java.util.Properties()` usage is NOT present
          in code (must use short form `Properties()` after the import).
+ 11. **Sprint 9.6.7 (v3):** android-debug.yml `flutter pub get` step check
+     (S6):
+     The CI runner resolves `./gradlew assembleDebug` →
+     `:app:compileFlutterBuildDebug` which needs
+     `mobile/.dart_tool/package_config.json`. That file is NEVER
+     produced unless a step runs `flutter pub get` with
+     `working-directory: ./mobile` (the Dart project root, where
+     `pubspec.yaml` lives — NOT `./mobile/android`). S6 verifies:
+     (a) step name matches "Install Flutter dependencies" (case-
+         insensitive substring on parsed `name` field, not raw text),
+     (b) step `run` field contains "flutter pub get",
+     (c) step `working-directory` is EXACTLY "./mobile".
+     Uses PyYAML-parsed step dicts (Sprint 9.6.5 comment-claim
+     lesson reapplies — a comment claiming "we run flutter pub get"
+     must NOT pass this audit).
 """
 import re
 import sys
@@ -473,6 +488,145 @@ def check_app_build_gradle_syntax_v2() -> list[str]:
     return findings
 
 
+def check_android_debug_workflow_v3() -> list[str]:
+    """Sprint 9.6.7 v3: android-debug.yml `flutter pub get` step check.
+
+    A live workflow_dispatch run AFTER Sprint 9.6.6 (PR planned #17,
+    commit e57da24) FAILED at :app:compileFlutterBuildDebug with:
+        "mobile/.dart_tool/package_config.json does not exist.
+         Did you run this command from the same directory as your
+         pubspec.yaml file?"
+    The `flutter --version` step that exists at the end of the
+    workflow is NOT a substitute for `flutter pub get` — it only
+    prints the version, it does not generate the package_config.json
+    file that the Flutter Android Gradle plugin reads at build time.
+
+    The fix: add a new step
+        - name: Install Flutter dependencies
+          working-directory: ./mobile
+          run: flutter pub get
+    between the existing `Verify Flutter dependency cache` step
+    (current step 9) and the existing `Build Debug APK` step
+    (current step 10). `working-directory: ./mobile` is mandatory
+    because `pubspec.yaml` lives in the Dart project root, not the
+    Android Gradle subproject (`./mobile/android`).
+
+    This check verifies all three properties on the SAME step:
+
+      (a) Step name matches `Install Flutter dependencies` (case-
+          insensitive substring match on the `name` field).
+      (b) Step `run` field contains `flutter pub get` (case-
+          insensitive substring).
+      (c) Step `working-directory` is exactly `./mobile` (NOT
+          `./mobile/android`, NOT absent, NOT empty).
+
+    The check uses PyYAML-parsed step dicts (not raw text substring
+    search) — applying the Sprint 9.6.5 lesson that a comment
+    claiming "we run flutter pub get" must NOT pass the audit.
+
+    Failure messages report the actual `working-directory` value
+    seen (if any) so a future false-positive is debuggable.
+    """
+    findings = []
+    android_debug_path = WORKFLOWS_DIR / "android-debug.yml"
+    if not android_debug_path.exists():
+        findings.append(
+            f"{android_debug_path.name}: file missing (Sprint 9.6.7 S6 invariant)"
+        )
+        return findings
+    with android_debug_path.open(encoding="utf-8") as f:
+        docs = list(yaml.safe_load_all(f))
+    if len(docs) != 1 or docs[0] is None:
+        findings.append(
+            f"{android_debug_path.name}: YAML parse failed (S6 needs parsed steps)"
+        )
+        return findings
+    d = docs[0]
+    jobs = d.get("jobs", {})
+
+    # Walk all jobs, all steps, looking for a single step that
+    # satisfies all three S6 conditions.
+    s6_match = None
+    s6_name_found = []
+    for job_name, job_def in jobs.items():
+        if not isinstance(job_def, dict):
+            continue
+        steps = job_def.get("steps", [])
+        if not isinstance(steps, list):
+            continue
+        for s in steps:
+            if not isinstance(s, dict):
+                continue
+            step_name = str(s.get("name", ""))
+            step_run = str(s.get("run", ""))
+            step_wd = s.get("working-directory", None)
+            # (a) name match (case-insensitive substring)
+            if "install flutter dependencies" in step_name.lower():
+                s6_name_found.append(step_name)
+                # (b) run contains flutter pub get (case-insensitive)
+                if "flutter pub get" in step_run.lower():
+                    # (c) working-directory exactly ./mobile
+                    s6_match = {
+                        "job": job_name,
+                        "name": step_name,
+                        "run": step_run,
+                        "working_directory": step_wd,
+                    }
+
+    if s6_match is None:
+        wd_observed = "absent"
+        # Try to find any step with a flutter pub get hint in run
+        # to give a more informative failure message.
+        for job_name, job_def in jobs.items():
+            if not isinstance(job_def, dict):
+                continue
+            for s in job_def.get("steps", []):
+                if not isinstance(s, dict):
+                    continue
+                if "flutter pub get" in str(s.get("run", "")).lower():
+                    wd_observed = f"{s.get('working-directory', 'absent')!r}"
+                    break
+        if not s6_name_found:
+            findings.append(
+                "S6 android-debug.yml: `Install Flutter dependencies` step is "
+                "missing (Sprint 9.6.7 fix — `flutter pub get` never runs; the "
+                "build fails at :app:compileFlutterBuildDebug with 'package_config."
+                "json does not exist'; live workflow_dispatch run after Sprint "
+                "9.6.6 PR #17 push (commit e57da24) failed with this error). "
+                "Add a step:\n"
+                "      - name: Install Flutter dependencies\n"
+                "        working-directory: ./mobile\n"
+                "        run: flutter pub get\n"
+                "between `Verify Flutter dependency cache` (step 9) and `Build "
+                "Debug APK` (step 10)."
+            )
+        else:
+            findings.append(
+                f"S6 android-debug.yml: `Install Flutter dependencies` step is "
+                f"present but misconfigured. working-directory seen: {wd_observed}. "
+                f"Expected: exactly `./mobile` (the Dart project root where "
+                f"pubspec.yaml lives, NOT `./mobile/android` and NOT absent). "
+                f"Live workflow_dispatch run after Sprint 9.6.6 PR #17 push "
+                f"(commit e57da24) failed at :app:compileFlutterBuildDebug with "
+                f"'package_config.json does not exist' because `flutter pub get` "
+                f"never ran from the Dart project root."
+            )
+    else:
+        # Match found — verify working-directory is exactly ./mobile.
+        if s6_match["working_directory"] != "./mobile":
+            findings.append(
+                f"S6 android-debug.yml: `Install Flutter dependencies` step has "
+                f"working-directory = {s6_match['working_directory']!r}, expected "
+                f"exactly `./mobile` (the Dart project root where pubspec.yaml "
+                f"lives, NOT `./mobile/android` and NOT absent). The `Build "
+                f"Debug APK` step uses `./mobile/android` because Gradle runs "
+                f"there; `flutter pub get` MUST run from `./mobile` so it can "
+                f"find pubspec.yaml."
+            )
+
+    return findings
+
+
 def main() -> int:
     all_findings = []
     for fname in TARGETS:
@@ -514,12 +668,19 @@ def main() -> int:
     else:
         print("PASS: app/build.gradle.kts Kotlin DSL syntax v2 (S1-S5: imports + deprecated kotlinOptions absence + new kotlin compilerOptions presence)")
 
+    # Sprint 9.6.7 v3: android-debug.yml `flutter pub get` step check (S6).
+    s6_findings = check_android_debug_workflow_v3()
+    if s6_findings:
+        all_findings.extend(s6_findings)
+    else:
+        print("PASS: android-debug.yml has `Install Flutter dependencies` step with working-directory=./mobile (Sprint 9.6.7 S6)")
+
     if all_findings:
         print("\nFINDINGS:")
         for f in all_findings:
             print(f"  - {f}")
         return 1
-    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 PASS PyYAML AUDIT.")
+    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step PASS PyYAML AUDIT.")
     return 0
 
 

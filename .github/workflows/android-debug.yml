@@ -188,6 +188,48 @@ jobs:
           # Sprint 4 PR-27 build-web pattern — flutter --version check
           flutter --version || (echo 'Flutter not installed, using pre-built' && exit 0)
 
+      # Sprint 9.6.7 hotfix: `flutter --version` is NOT enough — the
+      # Dart package graph must be resolved before the Android build can
+      # compile the Flutter embedding. A live workflow_dispatch run
+      # AFTER Sprint 9.6.6 PR (commit e57da24) push (planned PR #17)
+      # FAILED at :app:compileFlutterBuildDebug with:
+      #
+      #   /home/runner/work/e2ee-app/e2ee-app/mobile/.dart_tool/
+      #     package_config.json does not exist.
+      #   Did you run this command from the same directory as your
+      #     pubspec.yaml file?
+      #   Target dart_build failed: Error:
+      #   Target gen_dart_plugin_registrant failed: Error:
+      #   Process 'command '/opt/hostedtoolcache/flutter/stable-3.44.1-
+      #     x64/flutter/bin/flutter'' finished with non-zero exit value 1
+      #
+      # Root cause: `flutter --version` does NOT generate
+      # `mobile/.dart_tool/package_config.json`. The Flutter Android
+      # Gradle plugin (`:app:compileFlutterBuildDebug`) reads that
+      # file to wire up plugin registrants and Dart-side package
+      # resolution. Without it, the build aborts with the message
+      # above. Sprint 9.6.7 fix: run `flutter pub get` with
+      # `working-directory: ./mobile` (the Dart project root, where
+      # `mobile/pubspec.yaml` lives) BEFORE `./gradlew assembleDebug`.
+      #
+      # Working-directory note: `flutter pub get` MUST run from the
+      # Dart project root, NOT the Android Gradle subproject
+      # (`./mobile/android`). The `Build Debug APK` step uses
+      # `working-directory: ./mobile/android` because `./gradlew` is
+      # Gradle-only; `flutter pub get` reads `pubspec.yaml` which
+      # lives in `./mobile`. The audit S6 check enforces this exact
+      # pattern.
+      #
+      # Cross-references:
+      #   * tools/workflow-yaml-audit.py `check_android_debug_workflow_v3`
+      #     (S6 sub-check — line-anchored, not substring; Sprint 9.6.5
+      #     comment-claim lesson reapplies)
+      #   * tools/audit-self-test.py (4 S6 negative-test cases)
+      #   * docs/SPRINT-9.6.7-SCOPE.md (this sprint's scope)
+      - name: Install Flutter dependencies
+        working-directory: ./mobile
+        run: flutter pub get
+
       - name: Build Debug APK
         working-directory: ./mobile/android
         run: ./gradlew assembleDebug
