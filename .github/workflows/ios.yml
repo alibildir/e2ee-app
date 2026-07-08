@@ -52,13 +52,20 @@ name: ios-build
 #
 # Push YAPILMADI — branch-only hand-off to verifier (Sprint 8 §"Push
 # kararı: §8 user/Architect onayı sonrası").
+#
+# Sprint 9.6.1 hotfix (Fix C): auto-trigger disabled — `on:` is now
+# `workflow_dispatch:` ONLY (no `push:` / `pull_request:`). Per user
+# direction ("actions taki branch commit ve merge için otomatik
+# tetiklemeyi devre dışı bırak testler sırasında elle tetiklerim github
+# saatlerimi harcamak istemiyorum"). Manual `workflow_dispatch` triggers
+# retain the full multi-OS matrix (matrix.os in the ios-build job,
+# unchanged). The `runner` choice input is intentionally omitted here
+# because matrix.os drives OS selection — see
+# `.github/workflows/android-debug.yml` for the single-runner pattern.
 # ============================================================================
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   FLUTTER_VERSION: "3.44.1"
