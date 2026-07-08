@@ -39,11 +39,16 @@
 
 name: android-release
 
+# Sprint 9.6.1 hotfix (Fix D): auto-trigger disabled — `on:` is now
+# `workflow_dispatch:` ONLY (no `pull_request:` / `push:`). Per user
+# direction ("actions taki branch commit ve merge için otomatik
+# tetiklemeyi devre dışı bırak testler sırasında elle tetiklerim github
+# saatlerimi harcamak istemiyorum"). The release-build gate is intentionally
+# `runs-on: ubuntu-latest` (single runner, hardcoded — see Sprint 7
+# comment at lines 28-30) so no `inputs.runner` choice is exposed; users
+# trigger manually with the default `ubuntu-latest` runner.
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   FLUTTER_VERSION: "3.44.1"

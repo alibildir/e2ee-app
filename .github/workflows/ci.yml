@@ -1,10 +1,16 @@
 name: ci
 
+# Sprint 9.6.1 hotfix (Fix B): auto-trigger disabled — `on:` is now
+# `workflow_dispatch:` ONLY (no `push:` / `pull_request:`). Per user
+# direction ("actions taki branch commit ve merge için otomatik
+# tetiklemeyi devre dışı bırak testler sırasında elle tetiklerim github
+# saatlerimi harcamak istemiyorum"). Manual `workflow_dispatch` triggers
+# retain the full multi-OS matrix (matrix.os in each job, unchanged).
+# See `.github/workflows/android-debug.yml` for the single-runner
+# `inputs.runner` pattern; ci.yml's matrix drives OS selection so the
+# `runner` input is intentionally omitted.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   FLUTTER_VERSION: "3.44.1"
