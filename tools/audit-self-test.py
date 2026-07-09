@@ -5,14 +5,18 @@ check_android_xml_comments_v5 (S8),
 check_android_manifest_v6 (S9),
 check_android_res_skeleton_v7 (S10),
 check_flutter_plugins_dependencies_v8 (S11),
-check_flutter_kotlin_embedding_v9 (S12), and
-check_flutter_storage_repo_v10 (S13).
+check_flutter_kotlin_embedding_v9 (S12),
+check_flutter_storage_repo_v10 (S13),
+check_gradle_wrapper_force_include (S17),
+check_fresh_flutter_create_preserved (S18),
+check_fresh_create_metadata_tracked (S19), and
+check_pubspec_baseline_shape (S20).
 
 Per Architect brief (Sprint 9.6.6): "self-checks (negative test:
 revert + audit finds 4 FAIL)". Sprint 9.6.7 extends to S6.
 9.6.8 extends to S7. 9.6.9 extends to S8. 9.6.10 extends to S9.
 9.6.11 extends to S10. 9.6.12 extends to S11. 9.6.13 extends to S12.
-9.6.14 extends to S13.
+9.6.14 extends to S13. 9.7.0 Item 5 extends to S17-S20.
 
 S1-S5 cases: 6 (1 PASS + 5 FAIL, ...).
 S6 cases: 4 (1 PASS + 3 FAIL, ...).
@@ -26,8 +30,12 @@ empty array).
 S12 cases: 3 (1 PASS + 2 FAIL — dependency missing + wrong hash).
 S13 cases: 3 (1 PASS + 2 FAIL — settings block missing +
 Flutter URL missing).
+S17 cases: 2 (1 PASS + 1 FAIL — wrapper not tracked).
+S18 cases: 2 (1 PASS + 1 FAIL — pubspec.lock not tracked).
+S19 cases: 2 (1 PASS + 1 FAIL — .metadata not tracked).
+S20 cases: 2 (1 PASS + 1 FAIL — pubspec.yaml missing name).
 
-Total: 31 cases.
+Total: 39 cases.
 """
 import sys
 from pathlib import Path
@@ -480,6 +488,137 @@ def run_s13_check(settings_gradle_text: str | None, app_gradle_text: str | None)
                 if flutter_url in repo_block_text:
                     return findings  # PASS — found in app/build.gradle.kts
     findings.append("S13 fail")
+    return findings
+
+
+def run_s17_check(gitignore_text, gradlew_tracked, gradlew_bat_tracked, gradle_wrapper_jar_tracked):
+    """Sprint 9.7.0 Item 5 v11: gradle wrapper force-include (S17).
+
+    Mirrors check_gradle_wrapper_force_include (the production audit
+    uses `git ls-files` to probe tracked status; the self-test takes
+    raw booleans since it runs offline).
+
+    All four sub-checks must hold for PASS:
+      (a) gradlew tracked,
+      (b) gradlew.bat tracked,
+      (c) gradle-wrapper.jar tracked,
+      (d) repo-root .gitignore has the three matching `!` re-include
+          patterns.
+    """
+    findings = []
+    if not (gradlew_tracked and gradlew_bat_tracked and gradle_wrapper_jar_tracked):
+        findings.append("S17 fail")
+        return findings
+    required_patterns = (
+        "!**/android/gradlew",
+        "!**/android/gradlew.bat",
+        "!**/android/gradle/wrapper/gradle-wrapper.jar",
+    )
+    if not all(p in gitignore_text for p in required_patterns):
+        findings.append("S17 fail")
+        return findings
+    return findings
+
+
+def run_s18_check(gitignore_text, pubspec_lock_text):
+    """Sprint 9.7.0 Item 5 v11: fresh `flutter create` preservation (S18).
+
+    Mirrors check_fresh_flutter_create_preserved. The production audit
+    uses `git ls-files` + reads pubspec.lock from disk; the self-test
+    takes both raw strings. We model the `git ls-files` check by
+    treating `pubspec_lock_text is None` as "not tracked" (the only
+    way the self-test signals a missing/untracked lockfile without a
+    real git repo).
+
+    All four sub-checks must hold for PASS:
+      (a) pubspec_lock_text is not None (proxy for "tracked"),
+      (b) parses as YAML,
+      (c) packages.flutter.source == "sdk",
+      (d) repo-root .gitignore has the four mobile-specific patterns.
+    """
+    findings = []
+    if pubspec_lock_text is None:
+        findings.append("S18 fail")
+        return findings
+    import yaml
+    try:
+        doc = yaml.safe_load(pubspec_lock_text)
+    except Exception:
+        findings.append("S18 fail")
+        return findings
+    if not isinstance(doc, dict):
+        findings.append("S18 fail")
+        return findings
+    packages = doc.get("packages")
+    if not isinstance(packages, dict):
+        findings.append("S18 fail")
+        return findings
+    flutter_pkg = packages.get("flutter")
+    if not isinstance(flutter_pkg, dict) or flutter_pkg.get("source") != "sdk":
+        findings.append("S18 fail")
+        return findings
+    required_patterns = (
+        "**/android/.gradle/",
+        "**/android/local.properties",
+        "**/.dart_tool/",
+        "**/.flutter-plugins-dependencies",
+    )
+    if not all(p in gitignore_text for p in required_patterns):
+        findings.append("S18 fail")
+        return findings
+    return findings
+
+
+def run_s19_check(metadata_tracked, android_gitignore_tracked):
+    """Sprint 9.7.0 Item 5 v11: fresh `flutter create` metadata tracked (S19).
+
+    Mirrors check_fresh_create_metadata_tracked. Both sub-checks
+    must hold for PASS:
+      (a) mobile/.metadata tracked,
+      (b) mobile/android/.gitignore tracked.
+    """
+    findings = []
+    if not (metadata_tracked and android_gitignore_tracked):
+        findings.append("S19 fail")
+        return findings
+    return findings
+
+
+def run_s20_check(pubspec_text):
+    """Sprint 9.7.0 Item 5 v11: pubspec.yaml baseline shape (S20).
+
+    Mirrors check_pubspec_baseline_shape. The text must parse as YAML
+    and carry all four required keys (name + environment.sdk +
+    dependencies.flutter.sdk + dev_dependencies.flutter_test.sdk).
+    """
+    findings = []
+    if pubspec_text is None:
+        findings.append("S20 fail")
+        return findings
+    import yaml
+    try:
+        doc = yaml.safe_load(pubspec_text)
+    except Exception:
+        findings.append("S20 fail")
+        return findings
+    if not isinstance(doc, dict):
+        findings.append("S20 fail")
+        return findings
+    if not isinstance(doc.get("name"), str) or not doc.get("name"):
+        findings.append("S20 fail")
+        return findings
+    env = doc.get("environment")
+    if not isinstance(env, dict) or not isinstance(env.get("sdk"), str) or not env.get("sdk"):
+        findings.append("S20 fail")
+        return findings
+    deps = doc.get("dependencies")
+    if not isinstance(deps, dict) or not isinstance(deps.get("flutter"), dict) or deps["flutter"].get("sdk") != "flutter":
+        findings.append("S20 fail")
+        return findings
+    dev_deps = doc.get("dev_dependencies")
+    if not isinstance(dev_deps, dict) or not isinstance(dev_deps.get("flutter_test"), dict) or dev_deps["flutter_test"].get("sdk") != "flutter":
+        findings.append("S20 fail")
+        return findings
     return findings
 
 
@@ -1068,6 +1207,94 @@ include(":app")
 """
 case_s13_app_no_url_empty = ""
 
+# ─── S17 test cases (Sprint 9.7.0 Item 5) ─────────────────────────
+
+# Real repo-root .gitignore that the fresh skeleton ships with —
+# includes the three `!**/android/...` re-include patterns Sprint 9.7.0
+# Item 1 added (attempt-2 delta).
+case_s17_gitignore_pass = """
+**/android/.gradle/**
+**/android/gradlew
+**/android/gradlew.bat
+**/android/local.properties
+**/.dart_tool/
+**/.flutter-plugins-dependencies
+!**/android/gradlew
+!**/android/gradlew.bat
+!**/android/gradle/wrapper/gradle-wrapper.jar
+"""
+
+# Case 31 (S17 PASS): wrapper tracked + gitignore has all three `!`
+# re-include patterns. Mirrors the Sprint 9.7.0 Item 1 post-attempt-2
+# state on `feat/pr-9.7.0-port-audit` (commit 8697167).
+# Case 32 (S17 FAIL — wrapper not tracked): gradlew_tracked=False.
+
+# ─── S18 test cases (Sprint 9.7.0 Item 5) ─────────────────────────
+
+# Minimal pubspec.lock fixture with `packages.flutter.source: sdk`.
+case_s18_pubspec_lock_pass = """packages:
+  async:
+    dependency: transitive
+    description:
+      name: async
+      sha256: e2eb0491ba5ddb6177742d2da23904574082139b07c1e33b8503b9f46f3e1a37
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.13.1"
+  flutter:
+    dependency: "direct main"
+    description: flutter
+    source: sdk
+    version: "0.0.0"
+  flutter_test:
+    dependency: "direct dev"
+    description: flutter
+    source: sdk
+    version: "0.0.0"
+"""
+
+# Case 33 (S18 PASS): pubspec.lock tracked + parses as YAML +
+# packages.flutter.source: sdk + gitignore has all four mobile-
+# specific patterns.
+# Case 34 (S18 FAIL — pubspec.lock not tracked): None.
+
+# ─── S19 test cases (Sprint 9.7.0 Item 5) ─────────────────────────
+
+# Case 35 (S19 PASS): both tracked.
+# Case 36 (S19 FAIL — .metadata not tracked): False.
+
+# ─── S20 test cases (Sprint 9.7.0 Item 5) ─────────────────────────
+
+# Minimal pubspec.yaml fixture with all four required keys.
+case_s20_pubspec_pass = """name: opene2ee
+description: OpenE2EE
+version: 1.0.0+1
+environment:
+  sdk: ^3.12.1
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+"""
+
+# Case 37 (S20 PASS): pubspec.yaml parses + all four required keys present.
+# Case 38 (S20 FAIL — pubspec.yaml missing `name:`): empty dict / no name.
+
+case_s20_pubspec_no_name = """description: OpenE2EE
+environment:
+  sdk: ^3.12.1
+dependencies:
+  flutter:
+    sdk: flutter
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+"""
+
 # ─── Run all cases ───────────────────────────────────────────────
 
 cases = [
@@ -1136,6 +1363,26 @@ cases = [
      run_s13_check, (case_s13_settings_no_drm, case_s13_app_no_drm_empty), ["S13 fail"]),
     ("S13 FAIL (DRM block present but Flutter storage URL not declared - missing since PR-28 Sprint 5)",
      run_s13_check, (case_s13_settings_no_url, case_s13_app_no_url_empty), ["S13 fail"]),
+    # S17 cases (Sprint 9.7.0 Item 5 - new)
+    ("S17 PASS (gradle wrapper tracked by git + repo-root .gitignore has matching `!**/android/...` re-include patterns)",
+     run_s17_check, (case_s17_gitignore_pass, True, True, True), []),
+    ("S17 FAIL (gradlew not tracked by git - regression: future `flutter create` re-run dropped force-include)",
+     run_s17_check, (case_s17_gitignore_pass, False, True, True), ["S17 fail"]),
+    # S18 cases (Sprint 9.7.0 Item 5 - new)
+    ("S18 PASS (mobile/pubspec.lock tracked + parses as YAML + packages.flutter source: sdk + repo-root .gitignore has mobile-specific Flutter exclusion patterns)",
+     run_s18_check, (case_s17_gitignore_pass, case_s18_pubspec_lock_pass), []),
+    ("S18 FAIL (mobile/pubspec.lock not tracked - regression: future `flutter create` re-run dropped lockfile from index)",
+     run_s18_check, (case_s17_gitignore_pass, None), ["S18 fail"]),
+    # S19 cases (Sprint 9.7.0 Item 5 - new)
+    ("S19 PASS (mobile/.metadata + mobile/android/.gitignore tracked by git)",
+     run_s19_check, (True, True), []),
+    ("S19 FAIL (mobile/.metadata not tracked - regression: future `flutter create` re-run dropped local metadata)",
+     run_s19_check, (False, True), ["S19 fail"]),
+    # S20 cases (Sprint 9.7.0 Item 5 - new)
+    ("S20 PASS (mobile/pubspec.yaml parses + name + environment.sdk + dependencies.flutter.sdk + dev_dependencies.flutter_test.sdk)",
+     run_s20_check, (case_s20_pubspec_pass,), []),
+    ("S20 FAIL (mobile/pubspec.yaml missing `name:` key - regression: future edit dropped Dart pub project identifier)",
+     run_s20_check, (case_s20_pubspec_no_name,), ["S20 fail"]),
 ]   # noqa: E501
 
 failed = []
