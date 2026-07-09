@@ -2,11 +2,14 @@
 PyYAML audit for 4 GH Actions workflows + Gradle wrapper + AGP + Kotlin
 + app/build.gradle.kts syntax invariants + mobile entry point + Android
 res/ XML comments + AndroidManifest merger-spec + Android res/ skeleton
-+ .flutter-plugins-dependencies regen.
++ .flutter-plugins-dependencies regen + Sprint 9.7.0 fresh-skeleton
+preservation invariants (gradle wrapper force-include, pubspec.lock
++ mobile .gitignore rules, .metadata + android/.gitignore tracked,
+pubspec.yaml baseline shape).
 Per memory rule: PyYAML 1.1 parses `on:` as boolean `True` — use d[True].
 Applies to all workflow files; tracks the Sprint 9.6.2 + 9.6.3 + 9.6.4 +
 9.6.5 + 9.6.6 + 9.6.7 + 9.6.8 + 9.6.9 + 9.6.10 + 9.6.11 + 9.6.12 +
-9.6.13 + 9.6.14 fix invariants (added 2026-07-08 after Sprint 9.6.1
+9.6.13 + 9.6.14 + 9.7.0 fix invariants (added 2026-07-08 after Sprint 9.6.1
 PR #13 push CI FAIL, Sprint 9.6.2 PR #14 push CI FAIL, Sprint 9.6.3
 PR #15 push CI FAIL, Sprint 9.6.4 PR #15 (PUSHED) live build test CI
 FAIL, Sprint 9.6.5 PR #16 (PUSHED) live build test CI FAIL, Sprint
@@ -21,7 +24,12 @@ was missing `io.flutter:flutter_embedding_ktx` in app/build.gradle.kts
 dependencies; Sprint 9.6.14 PR #26 (PUSHED) live build test CI FAIL
 — `checkDebugAarMetadata` could not find the engine JAR because
 Flutter storage Maven repo was not declared in settings.gradle.kts
-`dependencyResolutionManagement`).
+`dependencyResolutionManagement`; Sprint 9.7.0 Item 1 (foundation)
+PR #27 — CLEAN fresh Flutter Android skeleton via
+`flutter create --platforms=android` — required the audit to grow
+fresh-skeleton preservation invariants S17-S20 so future sprints
+that re-touch mobile/ (port VPN service, MethodChannels, screens)
+cannot silently regress the buildable-artifact contract).
 
 Verifies:
   1. All 4 workflows have ONLY workflow_dispatch trigger (no push/pull_request).
@@ -116,19 +124,70 @@ Verifies:
       reference embedding/FlutterActivity/FlutterEngine/
       MethodChannel" errors in MainActivity.kt + OpenE2eeVpnService.kt.
       Missing since PR-3 (the original Android Gradle scaffolding).
- 18. **Sprint 9.6.14 (v10):** Flutter engine Maven repo declared
-      (S13) — `dependencyResolutionManagement { repositories { ...
-      maven { url = uri("https://storage.googleapis.com/download.
-      flutter.io") ... } } }` in `settings.gradle.kts` (or
-      `app/build.gradle.kts` `repositories { }` as fallback).
-      Without this, AGP-managed tasks (e.g.
-      `:app:checkDebugAarMetadata`) cannot resolve
-      `io.flutter:flutter_embedding_ktx` because the Flutter Gradle
-      plugin auto-registers this repo only for the Dart-side
-      `compileFlutterBuildDebug` task — NOT for AGP tasks.
+18. **Sprint 9.6.14 (v10):** Flutter engine Maven repo declared
+       (S13) — `dependencyResolutionManagement { repositories { ...
+       maven { url = uri("https://storage.googleapis.com/download.
+       flutter.io") ... } } }` in `settings.gradle.kts` (or
+       `app/build.gradle.kts` `repositories { }` as fallback).
+       Without this, AGP-managed tasks (e.g.
+       `:app:checkDebugAarMetadata`) cannot resolve
+       `io.flutter:flutter_embedding_ktx` because the Flutter Gradle
+       plugin auto-registers this repo only for the Dart-side
+       `compileFlutterBuildDebug` task — NOT for AGP tasks.
+  19. **Sprint 9.7.0 Item 5 (v11):** Gradle wrapper force-include
+       (S17) — `mobile/android/gradlew` + `mobile/android/gradlew.bat`
+       + `mobile/android/gradle/wrapper/gradle-wrapper.jar` are TRACKED
+       by git (via `git ls-files`, the same data source the audit
+       chain has used since Sprint 9.6.1) AND the repo-root
+       `.gitignore` has matching `!**/android/gradlew`,
+       `!**/android/gradlew.bat`, `!**/android/gradle/wrapper/gradle-wrapper.jar`
+       re-include lines. Sprint 9.7.0 Item 1 wiped `mobile/` and
+       re-scaffolded via `flutter create --platforms=android`; the
+       default `flutter create` template excludes the wrapper as a
+       "generated artifact" — a fresh clone without force-include
+       would have no gradlew and the CI runner's `chmod +x
+       ./mobile/android/gradlew` step would fail with "No such file
+       or directory". This invariant prevents a future
+       `flutter create` re-run from silently regressing the
+       buildable-artifact contract.
+  20. **Sprint 9.7.0 Item 5 (v11):** Fresh `flutter create`
+       preservation (S18) — `mobile/pubspec.lock` is TRACKED by git,
+       parses as YAML (real parser, per the 9.6.x chain rule), has
+       a `packages.flutter` entry with `source: sdk` (Flutter SDK
+       SHA pin), AND the repo-root `.gitignore` retains the
+       mobile-specific Flutter exclusion rules
+       (`**/android/.gradle/`, `**/android/local.properties`,
+       `**/.dart_tool/`, `**/.flutter-plugins-dependencies`). Sprint
+       9.7.0 Item 1 wiped the e2ee-app pubspec.lock and re-generated
+       a fresh one via `flutter create` + `flutter pub get`; if a
+       future sprint strips these rules or un-tracks pubspec.lock,
+       CI reproducibility breaks (lockfile-driven SHA mismatch).
+  21. **Sprint 9.7.0 Item 5 (v11):** Fresh `flutter create`
+       local-level metadata tracked (S19) — `mobile/.metadata` AND
+       `mobile/android/.gitignore` are both TRACKED by git. The
+       `.metadata` file marks the directory as a Flutter project
+       for tooling (IDE detection, `flutter doctor` heuristics); the
+       `android/.gitignore` carries the un-ignore rules + rationale
+       block specific to the Android subdir (see Sprint 9.7.0 Item 1
+       attempt-2 delta). Without both, a `git clone` of the fresh
+       skeleton is not a valid Flutter Android project from the
+       tooling's point of view.
+  22. **Sprint 9.7.0 Item 5 (v11):** pubspec.yaml baseline shape
+       (S20) — `mobile/pubspec.yaml` parses as YAML (real parser)
+       AND has the minimum keys every Flutter Android skeleton must
+       have for `flutter pub get` + `flutter create --platforms=android`
+       to round-trip cleanly: `name:`, `environment.sdk:`,
+       `dependencies.flutter.sdk: flutter`,
+       `dev_dependencies.flutter_test.sdk: flutter`. The fresh
+       skeleton template generated by `flutter create` ships with
+       all four; if a future sprint edits pubspec.yaml in a way that
+       drops one (e.g. removes the `flutter_test` dev-dep), the
+       `widget_test.dart` smoke test breaks and the foundation is
+       compromised.
 """
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -188,6 +247,38 @@ FLUTTER_EMBEDDING_PREFIX = "1.0.0-"  # The Maven coordinate is `1.0.0-<40-char-h
 # or `repositories {}` in app/build.gradle.kts).
 FLUTTER_STORAGE_URL = "https://storage.googleapis.com/download.flutter.io"
 SETTINGS_GRADLE_KTS_PATH = REPO_ROOT / "mobile" / "android" / "settings.gradle.kts"
+
+# Sprint 9.7.0 Item 5 — Fresh-skeleton preservation invariant paths.
+ROOT_GITIGNORE_PATH = REPO_ROOT / ".gitignore"
+PUBSPEC_LOCK_PATH = REPO_ROOT / "mobile" / "pubspec.lock"
+PUBSPEC_YAML_PATH = REPO_ROOT / "mobile" / "pubspec.yaml"
+MOBILE_METADATA_PATH = REPO_ROOT / "mobile" / ".metadata"
+MOBILE_ANDROID_GITIGNORE_PATH = REPO_ROOT / "mobile" / "android" / ".gitignore"
+GRADLE_WRAPPER_JAR_PATH = REPO_ROOT / "mobile" / "android" / "gradle" / "wrapper" / "gradle-wrapper.jar"
+GRADLEW_PATH = REPO_ROOT / "mobile" / "android" / "gradlew"
+GRADLEW_BAT_PATH = REPO_ROOT / "mobile" / "android" / "gradlew.bat"
+
+# Required `!**/...` re-include patterns in the repo-root .gitignore
+# (Sprint 9.7.0 Item 1 attempt-2 added these so the default
+# `flutter create --platforms=android` template's wrapper-exclusion
+# patterns do not silently drop gradlew + gradle-wrapper.jar from
+# a fresh clone).
+GRADLE_WRAPPER_RE_INCLUDE_PATTERNS = (
+    "!**/android/gradlew",
+    "!**/android/gradlew.bat",
+    "!**/android/gradle/wrapper/gradle-wrapper.jar",
+)
+
+# Required mobile-specific Flutter exclusion patterns in the repo-root
+# .gitignore (Sprint 9.7.0 Item 1 preserved these from the pre-9.7.0
+# main branch — they keep build/IDE artifacts out of the index without
+# accidentally un-ignoring the wrapper files).
+MOBILE_FLUTTER_EXCLUDE_PATTERNS = (
+    "**/android/.gradle/",
+    "**/android/local.properties",
+    "**/.dart_tool/",
+    "**/.flutter-plugins-dependencies",
+)
 
 
 def strip_comments(text: str) -> str:
@@ -1830,6 +1921,369 @@ def check_flutter_storage_repo_v10() -> list[str]:
     return findings
 
 
+def _git_ls_files_tracked(rel_path: str) -> bool:
+    """Return True iff `rel_path` (relative to REPO_ROOT) is tracked by git.
+
+    Uses `git ls-files <path>` (NOT `git ls-tree`) — `ls-files` honours
+    .gitignore exclusions, so an accidentally gitignored wrapper file
+    returns an empty stdout (NOT tracked), which is exactly the
+    regression the Sprint 9.7.0 S17 audit is designed to catch.
+
+    Wrapped in a helper so the audit + self-test agree on the same
+    data source. The self-test bypasses this helper and passes
+    raw booleans (since it doesn't have a real git repo to probe),
+    but the helper keeps the production-path logic in one place.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", rel_path],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # git not on PATH or hung — treat as not tracked so the
+        # finding fires (fail-closed). Better to flag a false-
+        # positive than to silently pass an untracked wrapper.
+        return False
+    if result.returncode != 0:
+        return False
+    # `git ls-files <path>` returns one line per tracked file. Empty
+    # stdout means either the path is gitignored OR the path doesn't
+    # exist on disk. Both regressions for S17/S18/S19 — we treat
+    # either as "not tracked".
+    return bool(result.stdout.strip())
+
+
+def check_gradle_wrapper_force_include() -> list[str]:
+    """Sprint 9.7.0 Item 5 v11: Gradle wrapper force-include (S17).
+
+    The default `flutter create --platforms=android` template excludes
+    the gradle wrapper as a "generated artifact". Sprint 9.7.0 Item 1
+    force-included the wrapper (mobile/android/gradlew + gradlew.bat +
+    gradle/wrapper/gradle-wrapper.jar) via repo-root .gitignore `!`
+    re-include patterns + the corresponding android/.gitignore rules,
+    with a rationale block citing the CI contract. If a future sprint
+    re-runs `flutter create` (e.g. while porting VPN service / screen
+    trees into the skeleton) and forgets the force-include, the next
+    `git clone` will have no gradlew + no gradle-wrapper.jar, and the
+    android-debug.yml workflow's `chmod +x ./mobile/android/gradlew`
+    step will fail with "No such file or directory". The whole
+    workflow then halts before reaching `flutter pub get`, so even
+    the post-fix pubspec.lock regen (S18) cannot save it.
+
+    Sub-checks (all must hold for PASS):
+      (a) `mobile/android/gradlew` is tracked by git (`git ls-files`),
+      (b) `mobile/android/gradlew.bat` is tracked,
+      (c) `mobile/android/gradle/wrapper/gradle-wrapper.jar` is tracked,
+      (d) repo-root .gitignore contains the three matching `!` re-
+          include patterns.
+
+    Uses git ls-files (real source-of-truth, same as the audit chain
+    has used since Sprint 9.6.1) — NOT a string-grep on the diff,
+    which would miss a wrapper file that was force-tracked via
+    `git add -f` without changing .gitignore.
+    """
+    findings = []
+    paths_to_check = (
+        ("mobile/android/gradlew", GRADLEW_PATH),
+        ("mobile/android/gradlew.bat", GRADLEW_BAT_PATH),
+        ("mobile/android/gradle/wrapper/gradle-wrapper.jar", GRADLE_WRAPPER_JAR_PATH),
+    )
+    untracked = []
+    for rel, abs_path in paths_to_check:
+        if not _git_ls_files_tracked(rel):
+            untracked.append(rel)
+        elif not abs_path.exists():
+            # Tracked by git but absent on disk — also a regression.
+            untracked.append(rel + " (tracked but missing on disk)")
+
+    # (d) repo-root .gitignore has the matching `!` re-include patterns.
+    missing_re_include = []
+    if ROOT_GITIGNORE_PATH.exists():
+        gitignore_text = ROOT_GITIGNORE_PATH.read_text(encoding="utf-8")
+        for pattern in GRADLE_WRAPPER_RE_INCLUDE_PATTERNS:
+            if pattern not in gitignore_text:
+                missing_re_include.append(pattern)
+    else:
+        missing_re_include = list(GRADLE_WRAPPER_RE_INCLUDE_PATTERNS)
+
+    if untracked or missing_re_include:
+        detail_parts = []
+        if untracked:
+            detail_parts.append(
+                "wrapper files not tracked by git: "
+                + ", ".join(untracked)
+                + " (the default `flutter create --platforms=android` template "
+                "excludes these as 'generated artifacts')"
+            )
+        if missing_re_include:
+            detail_parts.append(
+                "repo-root .gitignore is missing re-include patterns: "
+                + ", ".join(missing_re_include)
+            )
+        findings.append(
+            "S17 " + "; ".join(detail_parts) + ". Sprint 9.7.0 Item 5 "
+            "invariant — a fresh `git clone` without the wrapper committed "
+            "would fail the android-debug.yml workflow's `chmod +x "
+            "./mobile/android/gradlew` step with 'No such file or "
+            "directory' before reaching `flutter pub get`. Item 1 "
+            "(foundation, commit 8697167) added the force-include; "
+            "this audit prevents a future `flutter create` re-run "
+            "from silently dropping it."
+        )
+    return findings
+
+
+def check_fresh_flutter_create_preserved() -> list[str]:
+    """Sprint 9.7.0 Item 5 v11: Fresh `flutter create` preservation (S18).
+
+    Sprint 9.7.0 Item 1 wiped the e2ee-app pubspec.lock + 88 sibling
+    files and re-scaffolded via `flutter create --platforms=android`,
+    then ran `flutter pub get` to regenerate a fresh pubspec.lock with
+    the default template's transitive dependency SHAs pinned. The
+    CI contract is: pubspec.lock is committed, parses as YAML, has
+    `packages.flutter` with `source: sdk` (Flutter SDK SHA pin), AND
+    the repo-root .gitignore retains the mobile-specific Flutter
+    exclusion patterns that prevent IDE/build artifacts from leaking
+    into the index (without accidentally re-ignoring the wrapper
+    files — see S17).
+
+    Sub-checks (all must hold for PASS):
+      (a) `mobile/pubspec.lock` is tracked by git,
+      (b) pubspec.lock parses as YAML via PyYAML (real parser),
+      (c) `packages.flutter` entry exists with `source: sdk`,
+      (d) repo-root .gitignore contains the four required Flutter
+          mobile-specific exclusion patterns.
+
+    A regression on (a)+(b)+(c) breaks CI reproducibility — the
+    Android build would use whatever `flutter pub get` resolves
+    transitively on the runner instead of the committed lockfile,
+    introducing non-determinism. A regression on (d) would either
+    leak build artifacts (`.gradle/`, `local.properties`) or risk
+    accidentally re-ignoring the wrapper.
+    """
+    findings = []
+    # (a) tracked
+    if not _git_ls_files_tracked("mobile/pubspec.lock"):
+        findings.append(
+            "S18 mobile/pubspec.lock: file NOT tracked by git. Sprint 9.7.0 "
+            "Item 5 invariant — the fresh `flutter create --platforms=android` "
+            "template's `flutter pub get` produced a deterministic lockfile "
+            "(Flutter SDK SHA pinned) that must be committed for CI "
+            "reproducibility. Item 1 (foundation, commit 8697167) committed "
+            "this file; this audit prevents a future `flutter create` re-run "
+            "or `echo pubspec.lock >> .gitignore` from silently dropping it."
+        )
+        return findings
+
+    # (b) parses as YAML
+    if not PUBSPEC_LOCK_PATH.exists():
+        findings.append(
+            "S18 mobile/pubspec.lock: tracked by git but missing on disk. "
+            "Sprint 9.7.0 Item 5 invariant."
+        )
+        return findings
+    lock_text = PUBSPEC_LOCK_PATH.read_text(encoding="utf-8")
+    try:
+        lock_doc = yaml.safe_load(lock_text)
+    except yaml.YAMLError as e:
+        findings.append(
+            "S18 mobile/pubspec.lock: YAML parse failed (" + str(e) + "). "
+            "Sprint 9.7.0 Item 5 invariant — lockfile must be valid YAML."
+        )
+        return findings
+    if not isinstance(lock_doc, dict):
+        findings.append(
+            "S18 mobile/pubspec.lock: top-level YAML is not a mapping (got "
+            + type(lock_doc).__name__ + "). Sprint 9.7.0 Item 5 invariant."
+        )
+        return findings
+
+    # (c) packages.flutter entry with source: sdk
+    packages = lock_doc.get("packages")
+    if not isinstance(packages, dict):
+        findings.append(
+            "S18 mobile/pubspec.lock: `packages` mapping missing or not a "
+            "dict. Sprint 9.7.0 Item 5 invariant — Flutter `pub` lockfile "
+            "always emits a top-level `packages:` mapping."
+        )
+        return findings
+    flutter_pkg = packages.get("flutter")
+    if not isinstance(flutter_pkg, dict):
+        findings.append(
+            "S18 mobile/pubspec.lock: `packages.flutter` entry missing. "
+            "Sprint 9.7.0 Item 5 invariant — the Flutter SDK pin is "
+            "REQUIRED in every Flutter project's lockfile (source: sdk)."
+        )
+        return findings
+    if flutter_pkg.get("source") != "sdk":
+        findings.append(
+            "S18 mobile/pubspec.lock: `packages.flutter.source` is "
+            f"{flutter_pkg.get('source')!r}, expected 'sdk'. Sprint 9.7.0 "
+            "Item 5 invariant — the Flutter SDK pin uses `source: sdk` "
+            "(NOT `source: hosted`); without it, the lockfile cannot "
+            "track the Flutter SDK commit."
+        )
+        return findings
+
+    # (d) repo-root .gitignore has the four required patterns.
+    missing_patterns = []
+    if ROOT_GITIGNORE_PATH.exists():
+        gitignore_text = ROOT_GITIGNORE_PATH.read_text(encoding="utf-8")
+        for pattern in MOBILE_FLUTTER_EXCLUDE_PATTERNS:
+            if pattern not in gitignore_text:
+                missing_patterns.append(pattern)
+    else:
+        missing_patterns = list(MOBILE_FLUTTER_EXCLUDE_PATTERNS)
+    if missing_patterns:
+        findings.append(
+            "S18 repo-root .gitignore: missing Flutter mobile-specific "
+            "exclusion patterns: " + ", ".join(missing_patterns) + ". "
+            "Sprint 9.7.0 Item 5 invariant — Item 1 (foundation, commit "
+            "8697167) preserved these from the pre-9.7.0 main branch; "
+            "without them, IDE/build artifacts (`.gradle/`, "
+            "`local.properties`, `.dart_tool/`, `.flutter-plugins-"
+            "dependencies`) leak into the index, or — worse — the "
+            "wrapper force-include (S17) silently re-excludes the wrapper."
+        )
+    return findings
+
+
+def check_fresh_create_metadata_tracked() -> list[str]:
+    """Sprint 9.7.0 Item 5 v11: Fresh `flutter create` metadata tracked (S19).
+
+    The `flutter create --platforms=android` template emits two
+    local-level artifacts that mark the directory as a valid Flutter
+    Android project from the tooling's point of view:
+
+      - `mobile/.metadata` — a YAML file consumed by the Flutter tool
+        (`flutter doctor` heuristics, IDE project-type detection).
+        Removing it does not break the build, but it does break
+        `flutter analyze` / `flutter test` IDE integration and the
+        Dart-language-server project picker.
+
+      - `mobile/android/.gitignore` — the local Android-subdir
+        gitignore that ships with the Flutter template. Sprint 9.7.0
+        Item 1 attempt-2 amended this file with the un-ignore rules
+        + rationale block specific to the Android subdir (matching
+        the repo-root force-include from S17). Removing the local
+        gitignore silently re-ignores the wrapper if a future sprint
+        re-runs `flutter create`.
+
+    Sub-checks (both must hold for PASS):
+      (a) `mobile/.metadata` is tracked by git,
+      (b) `mobile/android/.gitignore` is tracked by git.
+    """
+    findings = []
+    untracked = []
+    if not _git_ls_files_tracked("mobile/.metadata"):
+        untracked.append("mobile/.metadata")
+    if not _git_ls_files_tracked("mobile/android/.gitignore"):
+        untracked.append("mobile/android/.gitignore")
+    if untracked:
+        findings.append(
+            "S19 fresh `flutter create` local-level artifacts not tracked "
+            "by git: " + ", ".join(untracked) + ". Sprint 9.7.0 Item 5 "
+            "invariant — `mobile/.metadata` is required for Flutter tool / "
+            "IDE project detection (Sprint 9.7.0 Item 1 commit 8697167 "
+            "amended this file in); `mobile/android/.gitignore` carries the "
+            "un-ignore rules + rationale block matching the repo-root S17 "
+            "force-include (without it, a future `flutter create` re-run "
+            "silently re-ignores the gradle wrapper)."
+        )
+    return findings
+
+
+def check_pubspec_baseline_shape() -> list[str]:
+    """Sprint 9.7.0 Item 5 v11: pubspec.yaml baseline shape (S20).
+
+    The fresh skeleton template generated by
+    `flutter create --platforms=android` ships with a minimum pubspec.yaml
+    shape that every Flutter Android project needs for
+    `flutter pub get` + the default `widget_test.dart` smoke test to
+    round-trip cleanly:
+
+      - `name:` (required by Dart pub; used as the project identifier)
+      - `environment.sdk:` (Dart SDK constraint; required by pub)
+      - `dependencies.flutter.sdk: flutter` (the Flutter SDK pin —
+        WITHOUT this, the project is just a Dart package, not a Flutter
+        app; `flutter run` would fail)
+      - `dev_dependencies.flutter_test.sdk: flutter` (the `flutter_test`
+        SDK pin — WITHOUT this, the `test/widget_test.dart` smoke test
+        cannot resolve `package:flutter_test/flutter_test.dart`)
+
+    Sub-checks (all must hold for PASS):
+      (a) pubspec.yaml exists and parses as YAML via PyYAML (real parser),
+      (b) all four required keys are present and well-typed.
+
+    A regression on (b) breaks the foundation contract: the Item 1
+    fresh skeleton shipped with these four keys; if a future sprint
+    edits pubspec.yaml in a way that drops one (e.g. removes the
+    `flutter_test` dev-dep while porting business logic), the
+    widget_test.dart default counter test breaks before any custom
+    test code is written.
+    """
+    findings = []
+    if not PUBSPEC_YAML_PATH.exists():
+        findings.append(
+            "S20 mobile/pubspec.yaml: file missing. Sprint 9.7.0 Item 5 "
+            "invariant — the fresh `flutter create` template always emits "
+            "this file at the Dart project root."
+        )
+        return findings
+    text = PUBSPEC_YAML_PATH.read_text(encoding="utf-8")
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        findings.append(
+            "S20 mobile/pubspec.yaml: YAML parse failed (" + str(e) + "). "
+            "Sprint 9.7.0 Item 5 invariant."
+        )
+        return findings
+    if not isinstance(doc, dict):
+        findings.append(
+            "S20 mobile/pubspec.yaml: top-level YAML is not a mapping (got "
+            + type(doc).__name__ + "). Sprint 9.7.0 Item 5 invariant."
+        )
+        return findings
+
+    missing = []
+    if not isinstance(doc.get("name"), str) or not doc.get("name"):
+        missing.append("name (non-empty string)")
+    env = doc.get("environment")
+    if not isinstance(env, dict) or not isinstance(env.get("sdk"), str) or not env.get("sdk"):
+        missing.append("environment.sdk (non-empty string)")
+    deps = doc.get("dependencies")
+    flutter_dep_sdk = None
+    if isinstance(deps, dict):
+        flutter_dep = deps.get("flutter")
+        if isinstance(flutter_dep, dict):
+            flutter_dep_sdk = flutter_dep.get("sdk")
+    if flutter_dep_sdk != "flutter":
+        missing.append("dependencies.flutter.sdk == 'flutter' (got " + repr(flutter_dep_sdk) + ")")
+    dev_deps = doc.get("dev_dependencies")
+    flutter_test_sdk = None
+    if isinstance(dev_deps, dict):
+        flutter_test_dep = dev_deps.get("flutter_test")
+        if isinstance(flutter_test_dep, dict):
+            flutter_test_sdk = flutter_test_dep.get("sdk")
+    if flutter_test_sdk != "flutter":
+        missing.append("dev_dependencies.flutter_test.sdk == 'flutter' (got " + repr(flutter_test_sdk) + ")")
+
+    if missing:
+        findings.append(
+            "S20 mobile/pubspec.yaml: baseline shape incomplete — missing "
+            "or wrong-type: " + ", ".join(missing) + ". Sprint 9.7.0 "
+            "Item 5 invariant — the fresh `flutter create --platforms=android` "
+            "template always emits all four keys; without them, the project "
+            "is not a valid Flutter Android app from the tool's POV."
+        )
+    return findings
+
+
 def main() -> int:
     all_findings = []
     for fname in TARGETS:
@@ -1927,12 +2381,40 @@ def main() -> int:
     else:
         print(f"PASS: Flutter engine Maven repo `https://storage.googleapis.com/download.flutter.io` declared in settings.gradle.kts dependencyResolutionManagement (or app/build.gradle.kts repositories) — Sprint 9.6.14 S13")
 
+    # Sprint 9.7.0 Item 5 v11: gradle wrapper force-include (S17).
+    s17_findings = check_gradle_wrapper_force_include()
+    if s17_findings:
+        all_findings.extend(s17_findings)
+    else:
+        print("PASS: gradle wrapper (gradlew + gradlew.bat + gradle-wrapper.jar) tracked by git + repo-root .gitignore has matching `!**/android/...` re-include patterns — Sprint 9.7.0 Item 5 S17")
+
+    # Sprint 9.7.0 Item 5 v11: fresh `flutter create` preservation (S18).
+    s18_findings = check_fresh_flutter_create_preserved()
+    if s18_findings:
+        all_findings.extend(s18_findings)
+    else:
+        print("PASS: mobile/pubspec.lock tracked + parses as YAML + packages.flutter source: sdk + repo-root .gitignore has mobile-specific Flutter exclusion patterns — Sprint 9.7.0 Item 5 S18")
+
+    # Sprint 9.7.0 Item 5 v11: fresh `flutter create` local-level metadata tracked (S19).
+    s19_findings = check_fresh_create_metadata_tracked()
+    if s19_findings:
+        all_findings.extend(s19_findings)
+    else:
+        print("PASS: mobile/.metadata + mobile/android/.gitignore tracked by git (fresh flutter create local-level artifacts) — Sprint 9.7.0 Item 5 S19")
+
+    # Sprint 9.7.0 Item 5 v11: pubspec.yaml baseline shape (S20).
+    s20_findings = check_pubspec_baseline_shape()
+    if s20_findings:
+        all_findings.extend(s20_findings)
+    else:
+        print("PASS: mobile/pubspec.yaml baseline shape (name + environment.sdk + dependencies.flutter.sdk + dev_dependencies.flutter_test.sdk) — Sprint 9.7.0 Item 5 S20")
+
     if all_findings:
         print("\nFINDINGS:")
         for f in all_findings:
             print(f"  - {f}")
         return 1
-    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts PASS PyYAML AUDIT.")
+    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape PASS PyYAML AUDIT.")
     return 0
 
 
