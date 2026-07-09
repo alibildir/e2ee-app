@@ -145,35 +145,49 @@ void main() {
     );
 
     test(
-      'MOB-1: AndroidManifest <application> declares tools:remove '
+      'MOB-1: AndroidManifest <application> declares tools:replace '
       'for usesCleartextTraffic (defence against library merge)',
       () {
         final manifest = _readFile(
           'android/app/src/main/AndroidManifest.xml',
         );
-        // tools:remove strips any value a transitive library tries
-        // to merge in. Required: xmlns:tools namespace + the
-        // `tools:remove` attribute on `<application>`.
+        // Sprint 9.6.10: AGP 8.11.1 + the manifest merger refuse
+        // the pre-9.6.10 `tools:remove` directive when paired
+        // with an explicit `android:usesCleartextTraffic="false"`
+        // value ("tools:remove specified at line:63 for attribute
+        // android:usesCleartextTraffic, but attribute also declared
+        // at line:68, do you want to use tools:replace instead?").
+        // The canonical MOB-1 cyber-security finding answer —
+        // confirmed in Sprint 7 PR-39 follow-up — is to use
+        // `tools:replace` instead of `tools:remove` so the merger
+        // accepts the directive and our value wins on library
+        // merge. Required: xmlns:tools namespace + the
+        // `tools:replace` attribute on `<application>`.
         expect(
           manifest.contains('xmlns:tools'),
           isTrue,
           reason:
               'xmlns:tools must be declared on <manifest> so '
-              'tools:remove can be used on <application>.',
+              'tools:replace can be used on <application>.',
         );
         expect(
           _attributePresent(
             manifest,
             'application',
-            'tools:remove',
+            'tools:replace',
             'android:usesCleartextTraffic',
           ),
           isTrue,
           reason:
-              'Cyber-security MOB-1: <application> must declare '
-              'tools:remove="android:usesCleartextTraffic" so '
+              'Cyber-security MOB-1 (Sprint 9.6.10 update): '
+              '<application> must declare '
+              'tools:replace="android:usesCleartextTraffic" so '
               'transitive libraries cannot silently re-enable '
-              'cleartext.',
+              'cleartext. The pre-9.6.10 tools:remove form was '
+              'rejected by AGP 8.11.1\'s manifest merger when '
+              'paired with an explicit value; tools:replace is the '
+              'canonical correct directive for "our value wins on '
+              'library merge".',
         );
       },
     );

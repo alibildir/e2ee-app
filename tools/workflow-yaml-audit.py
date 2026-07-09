@@ -81,6 +81,19 @@ TARGETS = ["android-debug.yml", "ci.yml", "ios.yml", "android-release.yml"]
 ANDROID_RES_XML_DIR = (
     REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "res" / "xml"
 )
+# Sprint 9.6.10 — paths for the AndroidManifest S9 cross-check.
+ANDROID_MANIFEST_PATH = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+ANDROID_GRADLE_KTS_PATH = REPO_ROOT / "mobile" / "android" / "app" / "build.gradle.kts"
+# The Android namespace + manifest merger identifier for the
+# app. PR-22a introduced this namespace; Sprint 9.6.10 drops the
+# redundant `package="..."` attribute from AndroidManifest.xml in
+# favour of the gradle namespace. Keep this single-source-of-truth
+# in one place so audit + tests + docs agree.
+ANDROID_APP_NAMESPACE = "com.opene2ee.opene2ee"
+# XML namespace URIs — see
+# https://developer.android.com/guide/topics/manifest/manifest-intro.
+ANDROID_NS = "http://schemas.android.com/apk/res/android"
+ANDROID_TOOLS_NS = "http://schemas.android.com/tools"
 
 # Flutter 3.44.1 minimum version pins (env.FLUTTER_VERSION in all 4
 # workflows; cross-cycle consistency).
@@ -853,6 +866,178 @@ def check_android_xml_comments_v5() -> list[str]:
     return findings
 
 
+def check_android_manifest_v6() -> list[str]:
+    """Sprint 9.6.10 v6: AndroidManifest.xml well-formedness + merger-spec check (S9).
+
+    The 9.6.9 live build (commit c469959 on main, fast-forward
+    merged by Owner) advanced past `mergeDebugResources` and
+    `parseDebugLocalResources` (XML comments fixed). The next
+    task, `:app:processDebugMainManifest`, failed because:
+
+      (a) `mobile/android/app/src/main/AndroidManifest.xml`
+          declared `package="com.opene2ee.opene2ee"` on the
+          root `<manifest>` element. AGP 8.11.1 rejects this in
+          favour of the `namespace` declared in
+          `build.gradle.kts` ("Setting the namespace via the
+          package attribute in the source AndroidManifest.xml is
+          no longer supported"). The `namespace` is already at
+          `mobile/android/app/build.gradle.kts:136`.
+
+      (b) The same `<application>` tag carries
+          `android:usesCleartextTraffic="false"` AND
+          `tools:remove="android:usesCleartextTraffic"`. The
+          merger refuses the redundant/conflicting pair
+          ("tools:remove specified at line:63 for attribute
+          android:usesCleartextTraffic, but attribute also
+          declared at line:68, do you want to use
+          tools:replace instead?"). The MOB-1 cyber-security
+          finding's intent is "library merge cannot silently
+          re-enable plaintext" — the correct directive is
+          `tools:replace`.
+
+    This check enforces all of:
+
+      (1) `AndroidManifest.xml` parses as well-formed XML
+          (via `xml.etree.ElementTree` — same XML 1.0 parser
+          rule aapt2 uses).
+      (2) The root `<manifest>` element does NOT carry a
+          `package` attribute. AGP 8.x ignores it; AGP 9 will
+          reject it outright.
+      (3) The root `<manifest>` element DOES declare
+          `xmlns:tools="http://schemas.android.com/tools"`
+          (required for any `tools:replace` /
+          `tools:remove` directive to be recognized).
+      (4) Any `<application>` tag that carries
+          `android:usesCleartextTraffic` does NOT also carry
+          `tools:remove="android:usesCleartextTraffic"`.
+          The pair is forbidden; either drop the value and
+          keep `tools:remove`, or keep the value and switch to
+          `tools:replace`.
+      (5) `build.gradle.kts` declares
+          `namespace = "com.opene2ee.opene2ee"`. This is the
+          cross-check — removing the manifest's `package=`
+          is only safe when the gradle namespace is present
+          (otherwise the build will fail with "no package
+          specified").
+
+    Implementation notes: use `ET.parse` for parse validity,
+    iterate via `tree.iter` for the namespace-qualified
+    attributes. The `build.gradle.kts` namespace check is a
+    substring match (the only place a regex would suffice,
+    and it's not security-sensitive — it's a single literal
+    string match for the namespace declaration).
+    """
+    findings = []
+    if ET is None:
+        findings.append(
+            "S9 AndroidManifest: Python's xml.etree.ElementTree is unavailable; "
+            "cannot run the S9 check (Sprint 9.6.10 invariant — Python 3 ships "
+            "ET in the stdlib; this finding means ET was monkey-patched away)"
+        )
+        return findings
+
+    # (1) parse validity
+    if not ANDROID_MANIFEST_PATH.exists():
+        findings.append(
+            f"S9 {ANDROID_MANIFEST_PATH.relative_to(REPO_ROOT)}: file missing"
+        )
+        return findings
+    try:
+        tree = ET.parse(ANDROID_MANIFEST_PATH)
+    except ET.ParseError as e:
+        findings.append(
+            f"S9 {ANDROID_MANIFEST_PATH.relative_to(REPO_ROOT)}: XML parse "
+            f"failed ({e.msg} at line {e.position[0]} col {e.position[1]}) — "
+            f"aapt2 will refuse this file"
+        )
+        return findings
+    root = tree.getroot()
+    # Read raw text for the xmlns declarations — Python's
+    # xml.etree.ElementTree strips namespace declarations from
+    # `attrib` (they live in the parser's internal table during
+    # parse and are not re-exposed on the Element). For the
+    # `xmlns:tools` check we use a substring scan on the raw text
+    # before line ~5 (manifest root opening tag). This is the
+    # one place where raw text is the source of truth — the
+    # audit does NOT regex-grep for content rules (S8 lesson).
+    manifest_text = ANDROID_MANIFEST_PATH.read_text(encoding="utf-8")
+
+    # (2) root <manifest> must NOT carry package=
+    if root.get("package") is not None:
+        findings.append(
+            f"S9 {ANDROID_MANIFEST_PATH.relative_to(REPO_ROOT)}: root "
+            f"<manifest> carries `package=\"{root.get('package')}\"` — AGP "
+            f"8.11.1 already ignores this and AGP 9 will reject it outright. "
+            f"Remove the attribute and rely on the `namespace` in "
+            f"`mobile/android/app/build.gradle.kts`. Sprint 9.6.10 fix."
+        )
+
+    # (3) root <manifest> must declare xmlns:tools.
+    # Note: we read the raw text for this because ET strips
+    # namespace declarations from attrib. This is the one
+    # exception to "no raw-text checks" — the audit uses real
+    # XML parse for content rules (S8 / S9 sub-checks 1, 2, 4,
+    # 5) and uses raw text only for the xmlns declaration
+    # presence check, which ET cannot expose.
+    xmlns_tools_pattern = f'xmlns:tools="{ANDROID_TOOLS_NS}"'
+    if xmlns_tools_pattern not in manifest_text:
+        findings.append(
+            f"S9 {ANDROID_MANIFEST_PATH.relative_to(REPO_ROOT)}: root "
+            f"<manifest> is missing `{xmlns_tools_pattern}` — required for "
+            f"the `tools:replace` / `tools:remove` merger directives to be "
+            f"recognized by aapt2. Sprint 9.6.10 invariant."
+        )
+
+    # (4) <application> with android:usesCleartextTraffic must NOT
+    # ALSO carry tools:remove="android:usesCleartextTraffic".
+    # Note on iter(): Python's xml.etree.ElementTree uses bare
+    # tag names (`root.iter("application")`), not Clark notation.
+    # Lxml users would need `{NS}application`. We standardise on
+    # bare tag names (one less surprise for future maintainers).
+    uses_cleartext_attr = f"{{{ANDROID_NS}}}usesCleartextTraffic"
+    tools_remove_attr = f"{{{ANDROID_TOOLS_NS}}}remove"
+    for application in root.iter("application"):
+        has_cleartext = application.get(uses_cleartext_attr) is not None
+        tools_remove_value = application.get(tools_remove_attr)
+        if has_cleartext and tools_remove_value is not None:
+            # The forbidden pair — could be either:
+            #   tools:remove="android:usesCleartextTraffic"
+            #   tools:remove="android:foo,android:usesCleartextTraffic"
+            if "usesCleartextTraffic" in tools_remove_value:
+                findings.append(
+                    f"S9 {ANDROID_MANIFEST_PATH.relative_to(REPO_ROOT)}: "
+                    f"<application> carries BOTH `android:usesCleartextTraffic` "
+                    f"(explicit value) AND `tools:remove` listing "
+                    f"`android:usesCleartextTraffic`. The merger refuses this "
+                    f"pair with 'tools:remove specified at line:63 for attribute "
+                    f"android:usesCleartextTraffic, but attribute also declared "
+                    f"at line:68, do you want to use tools:replace instead?'. "
+                    f"Sprint 9.6.10 fix: switch `tools:remove` to `tools:replace` "
+                    f"(canonical MOB-1 cyber-security finding answer)."
+                )
+
+    # (5) build.gradle.kts namespace cross-check
+    if not ANDROID_GRADLE_KTS_PATH.exists():
+        findings.append(
+            f"S9 {ANDROID_GRADLE_KTS_PATH.relative_to(REPO_ROOT)}: file missing"
+        )
+        return findings
+    gradle_text = ANDROID_GRADLE_KTS_PATH.read_text(encoding="utf-8")
+    namespace_line = (
+        f'namespace = "{ANDROID_APP_NAMESPACE}"'
+    )
+    if namespace_line not in gradle_text:
+        findings.append(
+            f"S9 {ANDROID_GRADLE_KTS_PATH.relative_to(REPO_ROOT)}: `"
+            f"{namespace_line}` declaration not found. Sprint 9.6.10 cross-"
+            f"check — removing the AndroidManifest.xml `package=` attribute "
+            f"is only safe when the gradle namespace is present (otherwise "
+            f"the build will fail with 'no package specified')."
+        )
+
+    return findings
+
+
 def main() -> int:
     all_findings = []
     for fname in TARGETS:
@@ -915,12 +1100,19 @@ def main() -> int:
     else:
         print("PASS: Android res/xml comments well-formed (no `--` inside `<!-- -->`) — Sprint 9.6.9 S8")
 
+    # Sprint 9.6.10 v6: AndroidManifest.xml merger-spec check (S9).
+    s9_findings = check_android_manifest_v6()
+    if s9_findings:
+        all_findings.extend(s9_findings)
+    else:
+        print("PASS: AndroidManifest.xml merger-spec (no `package=` attr + tools:replace not tools:remove + gradle namespace present) — Sprint 9.6.10 S9")
+
     if all_findings:
         print("\nFINDINGS:")
         for f in all_findings:
             print(f"  - {f}")
         return 1
-    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments PASS PyYAML AUDIT.")
+    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec PASS PyYAML AUDIT.")
     return 0
 
 

@@ -23,8 +23,7 @@
   identifiers are forbidden.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-          xmlns:tools="http://schemas.android.com/tools"
-          package="com.opene2ee.opene2ee">
+          xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -60,13 +59,24 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"
         android:usesPermissionFlags="neverForLocation" />
 
+    <!--
+      Sprint 9.6.10 — `tools:replace` (was `tools:remove`) per Sprint 6
+      cyber-security review MOB-1 + Sprint 7 PR-39 follow-up. The
+      Android manifest merger refuses `tools:remove` co-existing
+      with an explicit `android:usesCleartextTraffic` declaration
+      ("tools:remove specified at line:63 for attribute
+      android:usesCleartextTraffic, but attribute also declared at
+      line:68"). The correct directive for "our value wins on
+      library merge" is `tools:replace`. AGP 8.11.1 enforces this at
+      processDebugMainManifest time.
+    -->
     <application
         android:label="OpenE2EE"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:enableOnBackInvokedCallback="true"
         android:usesCleartextTraffic="false"
-        tools:remove="android:usesCleartextTraffic"
+        tools:replace="android:usesCleartextTraffic"
         android:networkSecurityConfig="@xml/network_security_config">
 
         <!--

@@ -1,13 +1,16 @@
 """Self-test for check_app_build_gradle_syntax_v2 (S1-S5),
 check_android_debug_workflow_v3 (S6),
-check_mobile_entry_point_v4 (S7), and
-check_android_xml_comments_v5 (S8).
+check_mobile_entry_point_v4 (S7),
+check_android_xml_comments_v5 (S8), and
+check_android_manifest_v6 (S9).
 
 Per Architect brief (Sprint 9.6.6): "self-checks (negative test:
 revert + audit finds 4 FAIL)". Sprint 9.6.7 extends the self-test
 to cover S6 (4 new cases: 1 PASS, 3 FAIL). Sprint 9.6.8 extends
 further to cover S7 (4 new cases: 1 PASS, 3 FAIL). Sprint 9.6.9
 extends further to cover S8 (2 new cases: 1 PASS, 1 FAIL).
+Sprint 9.6.10 extends further to cover S9 (3 new cases: 1
+PASS, 2 FAIL).
 
 S1-S5 cases: 6 (1 PASS + 5 FAIL, each violating exactly one of the
 S1-S5 sub-checks for app/build.gradle.kts).
@@ -20,8 +23,10 @@ ProviderScope, pubspec has flutter_riverpod:, pubspec has
 go_router:).
 S8 cases: 2 (1 PASS + 1 FAIL — XML well-formed + no `--` inside
 `<!-- -->`).
+S9 cases: 3 (1 PASS + 2 FAIL — manifest well-formed + no package
+attr + no tools:remove clash + gradle namespace present).
 
-Total: 16 cases.
+Total: 19 cases.
 """
 import sys
 from pathlib import Path
@@ -205,6 +210,56 @@ def run_s8_check(xml_text: str | None) -> list[str]:
         if "--" in match.group(1):
             findings.append("S8 fail")
             return findings
+    return findings
+
+
+def run_s9_check(manifest_text: str | None, gradle_text: str | None) -> list[str]:
+    """Replicate check_android_manifest_v6 logic on raw text inputs.
+
+    Mirrors the audit's five-part S9 check:
+    (1) AndroidManifest.xml parses via xml.etree.ElementTree.
+    (2) root <manifest> carries NO `package=` attribute.
+    (3) root <manifest> declares `xmlns:tools="..."` (raw text
+        check — ET strips namespace declarations from attrib).
+    (4) <application> with android:usesCleartextTraffic does NOT
+        also carry tools:remove="...usesCleartextTraffic" (the
+        forbidden pair — must be tools:replace instead).
+    (5) build.gradle.kts contains `namespace = "<our_ns>"`.
+    """
+    findings = []
+    if manifest_text is None or gradle_text is None:
+        findings.append("S9 fail")
+        return findings
+    import xml.etree.ElementTree as ET
+    try:
+        # The audit uses ET.parse (reads from a file path), but
+        # the self-test is given raw strings, so use fromstring
+        # (the in-memory equivalent). Same parser; same rules.
+        root = ET.fromstring(manifest_text)
+    except Exception:
+        findings.append("S9 fail")
+        return findings
+    # (2) package absent
+    if root.get("package") is not None:
+        findings.append("S9 fail")
+        return findings
+    # (3) xmlns:tools present
+    if 'xmlns:tools="http://schemas.android.com/tools"' not in manifest_text:
+        findings.append("S9 fail")
+        return findings
+    # (4) no forbidden tools:remove + android:usesCleartextTraffic pair
+    ANDROID_NS = "http://schemas.android.com/apk/res/android"
+    ANDROID_TOOLS_NS = "http://schemas.android.com/tools"
+    for application in root.iter("application"):
+        has_cleartext = application.get(f"{{{ANDROID_NS}}}usesCleartextTraffic") is not None
+        tools_remove_value = application.get(f"{{{ANDROID_TOOLS_NS}}}remove")
+        if has_cleartext and tools_remove_value and "usesCleartextTraffic" in tools_remove_value:
+            findings.append("S9 fail")
+            return findings
+    # (5) gradle namespace present
+    if 'namespace = "com.opene2ee.opene2ee"' not in gradle_text:
+        findings.append("S9 fail")
+        return findings
     return findings
 
 
@@ -552,6 +607,58 @@ case_s8_xml_bad = """<?xml version="1.0" encoding="utf-8"?>
 </network-security-config>
 """
 
+# ─── S9 test cases (Sprint 9.6.10) ───────────────────────────────
+
+# Case 16 (S9 PASS): post-fix AndroidManifest.xml (no package attr, tools:replace, xmlns:tools) + gradle namespace.
+case_s9_manifest_pass = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
+    <application
+        android:label="OpenE2EE"
+        android:usesCleartextTraffic="false"
+        tools:replace="android:usesCleartextTraffic"
+        android:networkSecurityConfig="@xml/network_security_config">
+    </application>
+</manifest>
+"""
+case_s9_gradle_pass = """
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("dev.flutter.flutter-gradle-plugin")
+}
+
+android {
+    namespace = "com.opene2ee.opene2ee"
+    compileSdk = 34
+}
+"""
+
+# Case 17 (S9 FAIL — package attribute re-introduced): the broken state 9.6.10 fixed.
+case_s9_manifest_package = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools"
+          package="com.opene2ee.opene2ee">
+    <application
+        android:label="OpenE2EE"
+        android:usesCleartextTraffic="false"
+        tools:replace="android:usesCleartextTraffic">
+    </application>
+</manifest>
+"""
+
+# Case 18 (S9 FAIL — tools:remove co-exists with android:usesCleartextTraffic): the broken state.
+case_s9_manifest_tools_remove = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
+    <application
+        android:label="OpenE2EE"
+        android:usesCleartextTraffic="false"
+        tools:remove="android:usesCleartextTraffic">
+    </application>
+</manifest>
+"""
+
 # ─── Run all cases ───────────────────────────────────────────────
 
 cases = [
@@ -585,6 +692,13 @@ cases = [
      run_s8_check, (case_s8_xml_pass,), []),
     ("S8 FAIL (comment contains `--` run — Sprint 9.6.9 broken state)",
      run_s8_check, (case_s8_xml_bad,), ["S8 fail"]),
+    # S9 cases (Sprint 9.6.10 — new)
+    ("S9 PASS (manifest well-formed, no package attr, tools:replace, gradle namespace present)",
+     run_s9_check, (case_s9_manifest_pass, case_s9_gradle_pass), []),
+    ("S9 FAIL (manifest has package= attribute — Sprint 9.6.10 broken state)",
+     run_s9_check, (case_s9_manifest_package, case_s9_gradle_pass), ["S9 fail"]),
+    ("S9 FAIL (tools:remove co-exists with android:usesCleartextTraffic — MOB-1 broken state)",
+     run_s9_check, (case_s9_manifest_tools_remove, case_s9_gradle_pass), ["S9 fail"]),
 ]
 
 failed = []
