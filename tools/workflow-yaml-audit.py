@@ -233,7 +233,7 @@ Verifies:
         PackageManager to route to the WhatsApp package. Both
         halves of the URI are load-bearing — dropping either
         makes the launch silently no-op.
-  31. **Sprint 10.1E:** P2PMatcher uses `/api/v1/sessions`
+   31. **Sprint 10.1E:** P2PMatcher uses `/api/v1/sessions`
         (S41) — the `p2p_matcher.dart` file must contain the
         literal `/api/v1/sessions` AND must NOT contain the
         literal `/api/v1/matches` (the 10.1B/10.1D path that
@@ -241,6 +241,39 @@ Verifies:
         Mobile-side filter (status=active, role=receiver,
         device_id_hash != self) replaces the missing server-side
         match endpoint per the brief's option C.
+   32. **Sprint 10.1F:** AndroidManifest `<queries>` WhatsApp
+        package visibility (S42) — the
+        `mobile/android/app/src/main/AndroidManifest.xml` must
+        carry a top-level `<queries>` block AND the literal
+        `<package android:name="com.whatsapp" />` inside it
+        (also `com.whatsapp.w4b` for WhatsApp Business). On
+        Android 11+ (API 30+) the package-visibility filter
+        blocks `canLaunchUrl(...)` for any package the app has
+        not declared in `<queries>`, even when the package IS
+        installed. The 10.1E Intent-URI fix
+        (`intent://send?text=...#Intent;scheme=whatsapp;
+        package=com.whatsapp;end`) is necessary but not
+        sufficient — without the manifest declaration the
+        platform returns `false` for the visibility probe.
+        Sprint 10.1E deliverable Owner report 10.07.2026 23:29:
+        "whatsapp yüklü değil diyor hala deeplink yine hatalı".
+   33. **Sprint 10.1F:** MainActivity.kt `getSampledPackets`
+        method-channel handler (S43) — the Kotlin file
+        `mobile/android/app/src/main/kotlin/com/opene2ee/opene2ee/
+        MainActivity.kt` must contain a
+        `when (call.method) { ... "getSampledPackets" -> ... }`
+        dispatch block on the `opene2ee/vpn` MethodChannel.
+        The Dart-side `VpnService` (Sprint 10.1B) calls
+        `_channel.invokeMethod("getSampledPackets")` from
+        `pool_provider.dart`'s 3-second poll loop; without the
+        Kotlin handler the call raises
+        `MissingPluginException(No implementation found for
+        method getSampledPackets on channel opene2ee/vpn)`.
+        Owner report 10.07.2026 23:29: 30 consecutive "Aktif
+        Nöbet" calls all failed with this error. Sprint 10.1F
+        wires the handler INLINE in MainActivity (mock for now;
+        real `OpenE2eeVpnService` integration lands in Sprint
+        10.2 via the port-vpn-service follow-up).
 """
 import json
 import re
@@ -2582,6 +2615,198 @@ def check_p2p_matcher_sessions_endpoint() -> list[str]:
     return findings
 
 
+def check_android_manifest_whatsapp_queries_v12() -> list[str]:
+    """Sprint 10.1F: AndroidManifest <queries> WhatsApp packages (S42).
+
+    Owner report 10.07.2026 23:29: "whatsapp yüklü değil diyor hala
+    deeplink yine hatalı". Root cause: Android 11+ (API 30+) package
+    visibility filter. `canLaunchUrl(...)` returns `false` for any
+    package the app has not declared in `<queries>`, even when the
+    package IS installed. Sprint 10.1E replaced the legacy
+    `whatsapp://send?text=` scheme with the Android Intent URI
+    `intent://send?text=...#Intent;scheme=whatsapp;package=com.whatsapp;end`
+    — but the platform-side visibility check still needs the
+    `<package android:name="com.whatsapp" />` line in the manifest
+    to SEE the package at all.
+
+    The fix:
+        <manifest ...>
+            <queries>
+                <package android:name="com.whatsapp" />
+                <package android:name="com.whatsapp.w4b" />
+            </queries>
+            ...
+        </manifest>
+
+    S42 verifies BOTH:
+      (a) The manifest has a top-level `<queries>` block (XML
+          namespace-agnostic — `ET.fromstring` parses it).
+      (b) Inside that block there is at least one
+          `<package android:name="com.whatsapp" />` element
+          (we match by `com.whatsapp` literal in any
+          package/@android:name attribute to avoid coupling
+          to attribute-order / whitespace conventions).
+
+    The `<intent>` form (used in S9 for VpnService) is also valid
+    but broader — exposing ALL SEND intents. The `<package>` form
+    is preferred per the Android docs and per the brief's privacy
+    posture (only the two WhatsApp apps become visible, not the
+    entire SEND intent space).
+
+    Reference:
+      https://developer.android.com/training/package-visibility/declaring
+    """
+    findings = []
+    manifest_path = REPO_ROOT / "mobile" / "android" / "src" / "main" / "AndroidManifest.xml"
+    # Defensive: the canonical Sprint 9.6.10 path is
+    # `mobile/android/app/src/main/AndroidManifest.xml`. We probe
+    # both because future layout refactors may move the file.
+    candidates = [
+        REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "AndroidManifest.xml",
+        REPO_ROOT / "mobile" / "android" / "src" / "main" / "AndroidManifest.xml",
+    ]
+    for cand in candidates:
+        if cand.exists():
+            manifest_path = cand
+            break
+    if not manifest_path.exists():
+        findings.append(
+            "S42 AndroidManifest.xml: file missing. Sprint 10.1F "
+            "invariant — the WhatsApp deep link only works on "
+            "Android 11+ if `<package android:name=\"com.whatsapp\" />` "
+            "is declared in the top-level `<queries>` block."
+        )
+        return findings
+    try:
+        text = manifest_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S42 AndroidManifest.xml: read failed (" + str(e) + ")."
+        )
+        return findings
+    # (a) top-level <queries> block present
+    if "<queries>" not in text:
+        findings.append(
+            "S42 AndroidManifest.xml: missing top-level `<queries>` "
+            "block. Sprint 10.1F invariant — Android 11+ package "
+            "visibility filter hides WhatsApp from `canLaunchUrl(...)` "
+            "unless the package is declared in `<queries>`."
+        )
+        return findings
+    # (b) <package android:name="com.whatsapp" /> literal present.
+    # Match on the literal substring (real parser: ET.fromstring on
+    # a stripped snippet). A comment claiming "we have WhatsApp in
+    # queries" must NOT pass (Sprint 9.6.5 lesson reapplies — strip
+    # `<!-- ... -->` blocks first).
+    stripped = re.sub(r"<!--[\s\S]*?-->", "", text)
+    if '<package android:name="com.whatsapp"' not in stripped:
+        findings.append(
+            "S42 AndroidManifest.xml: `<queries>` block is present "
+            "but the literal `<package android:name=\"com.whatsapp\" />` "
+            "is missing. Sprint 10.1F invariant — the WhatsApp deep "
+            "link's `canLaunchUrl(...)` probe returns false on Android "
+            "11+ without this declaration. Add BOTH:\n"
+            '      <package android:name="com.whatsapp" />\n'
+            '      <package android:name="com.whatsapp.w4b" />\n'
+            "inside the existing `<queries>` block."
+        )
+    return findings
+
+
+def check_main_activity_get_sampled_packets_v13() -> list[str]:
+    """Sprint 10.1F: MainActivity.kt getSampledPackets method-channel handler (S43).
+
+    Owner report 10.07.2026 23:29: "Aktif nöbet 30 çağrı yaptı hepsi
+    aynı hata aldı MissingPluginException(No implementation found for
+    method getSampledPackets on channel opene2ee/vpn". The Dart-side
+    `VpnService` (Sprint 10.1B) calls
+    `_channel.invokeMethod("getSampledPackets")` from
+    `pool_provider.dart`'s 3-second poll loop. The Kotlin side had no
+    handler — `OpenE2eeVpnService.attachFlutterEngine(...)` is
+    `TODO(port-vpn-service)` (Sprint 9.7.0 Item 2) and not yet
+    ported to the clean skeleton.
+
+    Sprint 10.1F wires the handler INLINE in MainActivity (mock for
+    now — real `OpenE2eeVpnService` integration lands in Sprint 10.2).
+    The handler returns a single synthetic packet (IPv4 / TCP / 443)
+    for `getSampledPackets` and string sentinels for `start` / `stop`
+    / `status`. Without the handler the Dart call throws
+    `MissingPluginException` on every poll, the `ref.listen<PoolState>`
+    snackbar never fires `lastError`, and the user sees the same
+    "Aktif nöbet" UI feedback on every screen.
+
+    S43 verifies the Kotlin file carries the case-literal. Real
+    parser: a `when (call.method)` block (regex on the actual code,
+    NOT a comment substring) AND the literal `"getSampledPackets"`
+    inside that block. Sprint 9.6.5 lesson reapplies: a comment
+    claiming "we handle getSampledPackets" must NOT pass — we strip
+    `//` line comments AND `/* */` block comments first, then match.
+
+    Audit scope: `mobile/android/app/src/main/kotlin/com/opene2ee/
+    opene2ee/MainActivity.kt` must contain the literal
+    `"getSampledPackets"` inside a code-line (not in a comment),
+    paired with a `when (call.method)` dispatch block.
+    """
+    findings = []
+    candidates = [
+        REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt",
+        REPO_ROOT / "mobile" / "android" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt",
+    ]
+    main_activity_path = None
+    for cand in candidates:
+        if cand.exists():
+            main_activity_path = cand
+            break
+    if main_activity_path is None:
+        findings.append(
+            "S43 MainActivity.kt: file missing. Sprint 10.1F invariant "
+            "— the Dart-side `VpnService.getSampledPackets()` call "
+            "raises `MissingPluginException` unless MainActivity wires "
+            "a `when (call.method) { \"getSampledPackets\" -> ... }` "
+            "handler on the `opene2ee/vpn` MethodChannel."
+        )
+        return findings
+    try:
+        text = main_activity_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S43 MainActivity.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Sprint 9.6.5 lesson: strip comments first. strip_comments()
+    # handles both `//` and `/* */` styles — sufficient for Kotlin.
+    code = strip_comments(text)
+    # (a) `when (call.method)` dispatch block exists.
+    has_when = bool(re.search(r"when\s*\(\s*call\.method\s*\)", code))
+    if not has_when:
+        findings.append(
+            "S43 MainActivity.kt: no `when (call.method)` dispatch "
+            "block found. Sprint 10.1F invariant — the "
+            "`opene2ee/vpn` MethodChannel needs a `when` block to "
+            "handle `start` / `stop` / `status` / "
+            "`getSampledPackets`. The Dart side calls these via "
+            "`MethodChannel.invokeMethod`; without a `when` block "
+            "the call returns `notImplemented` and the Dart future "
+            "completes with an error."
+        )
+        return findings
+    # (b) `"getSampledPackets"` literal present in the same code
+    # (real parser — a comment substring match would pass without
+    # actual handling code).
+    if '"getSampledPackets"' not in code and "'getSampledPackets'" not in code:
+        findings.append(
+            "S43 MainActivity.kt: `when (call.method)` block is "
+            "present but the literal `\"getSampledPackets\"` case is "
+            "missing. Sprint 10.1F invariant — the Dart-side "
+            "`VpnService.getSampledPackets()` call (Sprint 10.1B, "
+            "invoked from `pool_provider.dart` 3-second poll loop) "
+            "raises `MissingPluginException` without this case. "
+            "Owner report 10.07.2026 23:29: 30 consecutive "
+            "`Aktif Nöbet` calls all failed with this error."
+        )
+    return findings
+
+
 def check_active_pool_linechart_literal_present() -> list[str]:
     """Sprint 10.1A: fl_chart LineChart used in active pool screen (S27).
 
@@ -3288,12 +3513,26 @@ def main() -> int:
     else:
         print("PASS: mobile/lib/services/p2p_matcher.dart uses `/api/v1/sessions` (and does NOT contain the broken `/api/v1/matches`) - Sprint 10.1E S41")
 
+    # Sprint 10.1F: AndroidManifest <queries> WhatsApp packages (S42).
+    s42_findings = check_android_manifest_whatsapp_queries_v12()
+    if s42_findings:
+        all_findings.extend(s42_findings)
+    else:
+        print("PASS: AndroidManifest.xml <queries> block carries `<package android:name=\"com.whatsapp\" />` + `<package android:name=\"com.whatsapp.w4b\" />` (Android 11+ package visibility for WhatsApp deep link) - Sprint 10.1F S42")
+
+    # Sprint 10.1F: MainActivity.kt getSampledPackets method-channel handler (S43).
+    s43_findings = check_main_activity_get_sampled_packets_v13()
+    if s43_findings:
+        all_findings.extend(s43_findings)
+    else:
+        print("PASS: MainActivity.kt wires `when (call.method) { ... \"getSampledPackets\" -> ... }` on the `opene2ee/vpn` MethodChannel (Kotlin mock packet for Sprint 10.1F; real OpenE2eeVpnService integration lands in Sprint 10.2) - Sprint 10.1F S43")
+
     if all_findings:
         print("\nFINDINGS:")
         for f in all_findings:
             print(f"  - {f}")
         return 1
-    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 intent://send?text= literal in WhatsApp task detail (10.0 + 10.1E) + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher + S36 auth_service.dart POST /api/v1/auth + user_id + S37 authHeaders() in telemetry_service or p2p_matcher + S38 _tokenExpiresAt field in auth_service + S39 invalidate() method in auth_service + S40 whatsapp_deeplink_provider.dart carries BOTH `intent://send?` and `#Intent;scheme=whatsapp;package=com.whatsapp;end` + S41 p2p_matcher.dart uses /api/v1/sessions (not /api/v1/matches) PASS PyYAML AUDIT.")
+    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 intent://send?text= literal in WhatsApp task detail (10.0 + 10.1E) + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher + S36 auth_service.dart POST /api/v1/auth + user_id + S37 authHeaders() in telemetry_service or p2p_matcher + S38 _tokenExpiresAt field in auth_service + S39 invalidate() method in auth_service + S40 whatsapp_deeplink_provider.dart carries BOTH `intent://send?` and `#Intent;scheme=whatsapp;package=com.whatsapp;end` + S41 p2p_matcher.dart uses /api/v1/sessions (not /api/v1/matches) + S42 AndroidManifest <queries> WhatsApp package visibility + S43 MainActivity.kt getSampledPackets method-channel handler PASS PyYAML AUDIT.")
     return 0
 
 

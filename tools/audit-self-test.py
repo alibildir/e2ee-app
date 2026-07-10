@@ -23,8 +23,10 @@ check_auth_service_exists (S36),
 check_service_uses_auth_headers (S37),
 check_auth_token_expiry_field (S38), and
 check_auth_invalidate_method (S39),
-check_whatsapp_deeplink_intent_format (S40), and
-check_p2p_matcher_sessions_endpoint (S41).
+check_whatsapp_deeplink_intent_format (S40),
+check_p2p_matcher_sessions_endpoint (S41),
+check_android_manifest_whatsapp_queries_v12 (S42), and
+check_main_activity_get_sampled_packets_v13 (S43).
 
 Per Architect brief (Sprint 9.6.6): "self-checks (negative test:
 revert + audit finds 4 FAIL)". Sprint 9.6.7 extends to S6.
@@ -37,6 +39,7 @@ Sprint 10.1C extends to S33-S35.
 Sprint 10.1D extends to S36-S39.
 Sprint 10.1E extends to S40-S41 (and updates S26 from
 `whatsapp://send?text=` to `intent://send?text=`).
+Sprint 10.1F extends to S42-S43.
 
 S1-S5 cases: 6 (1 PASS + 5 FAIL, ...).
 S6 cases: 4 (1 PASS + 3 FAIL, ...).
@@ -68,9 +71,10 @@ S38 cases: 2 (1 PASS + 1 FAIL — _tokenExpiresAt field missing in auth_service)
 S39 cases: 2 (1 PASS + 1 FAIL — invalidate() method missing in auth_service).
 S40 cases: 2 (1 PASS + 1 FAIL — `intent://send?` + `#Intent;scheme=whatsapp;package=com.whatsapp;end` literals missing in whatsapp_deeplink_provider).
 S41 cases: 2 (1 PASS + 1 FAIL — /api/v1/sessions literal missing OR forbidden /api/v1/matches still present in p2p_matcher).
-S41 cases: 2 (1 PASS + 1 FAIL — /api/v1/sessions literal missing OR forbidden /api/v1/matches still present in p2p_matcher).
+S42 cases: 2 (1 PASS + 1 FAIL — `<queries>` + `<package android:name="com.whatsapp"` missing in AndroidManifest).
+S43 cases: 2 (1 PASS + 1 FAIL — `when (call.method)` + `"getSampledPackets"` case missing in MainActivity.kt).
 
-Total: 67 cases.
+Total: 71 cases.
 """
 import sys
 from pathlib import Path
@@ -924,6 +928,79 @@ def run_s41_check(p2p_matcher_text):
     return findings
 
 
+def run_s42_check(manifest_text):
+    """Sprint 10.1F: AndroidManifest <queries> WhatsApp packages (S42).
+
+    Mirrors check_android_manifest_whatsapp_queries_v12. The manifest
+    must contain BOTH the literal `<queries>` (top-level block) AND
+    the literal `<package android:name="com.whatsapp"` inside that
+    block. The audit strips `<!-- ... -->` comments before matching
+    to keep the comment-claim lesson (Sprint 9.6.5) from
+    re-introducing false positives.
+
+    The self-test takes the raw manifest text (None signals
+    "file missing" — the 10.1F broken state).
+    """
+    import re
+    findings = []
+    if manifest_text is None:
+        findings.append("S42 fail (manifest missing)")
+        return findings
+    if "<queries>" not in manifest_text:
+        findings.append("S42 fail (<queries> block missing)")
+        return findings
+    stripped = re.sub(r"<!--[\s\S]*?-->", "", manifest_text)
+    if '<package android:name="com.whatsapp"' not in stripped:
+        findings.append("S42 fail (<package android:name=\"com.whatsapp\" /> missing)")
+    return findings
+
+
+def run_s43_check(main_activity_text):
+    """Sprint 10.1F: MainActivity.kt getSampledPackets method-channel handler (S43).
+
+    Mirrors check_main_activity_get_sampled_packets_v13. The Kotlin
+    file must contain BOTH the `when (call.method)` dispatch block
+    AND the literal `"getSampledPackets"` (or single-quoted variant)
+    case branch. Comments are stripped first per the Sprint 9.6.5
+    lesson so a comment claiming "we handle getSampledPackets" does
+    NOT pass without actual code.
+    """
+    import re
+    findings = []
+    if main_activity_text is None:
+        findings.append("S43 fail (MainActivity.kt missing)")
+        return findings
+    # Comment-stripping is best-effort; sufficient for Kotlin.
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", main_activity_text)
+    lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            lines.append(ln[:cut_at])
+        else:
+            lines.append(ln)
+    code = "\n".join(lines)
+    has_when = bool(re.search(r"when\s*\(\s*call\.method\s*\)", code))
+    if not has_when:
+        findings.append("S43 fail (when (call.method) block missing)")
+        return findings
+    if '"getSampledPackets"' not in code and "'getSampledPackets'" not in code:
+        findings.append("S43 fail (\"getSampledPackets\" case missing)")
+    return findings
+
+
 # ─── Test cases ──────────────────────────────────────────────────
 
 # Case 0: fully-valid file (post-Sprint 9.6.6 fix) — expect 0 findings.
@@ -1597,6 +1674,126 @@ dev_dependencies:
     sdk: flutter
 """
 
+# ─── S42 test cases (Sprint 10.1F) ───────────────────────────────
+
+# Case 21 (S42 PASS): post-Sprint 10.1F AndroidManifest.xml with the
+# WhatsApp packages declared in `<queries>`. Mirrors the real
+# post-fix state on main.
+case_s42_manifest_pass = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:label="OpenE2EE"
+        android:usesCleartextTraffic="false"
+        tools:replace="android:usesCleartextTraffic">
+        <activity android:name=".MainActivity" />
+    </application>
+
+    <queries>
+        <intent>
+            <action android:name="android.net.VpnService" />
+        </intent>
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
+    </queries>
+</manifest>
+"""
+
+# Case 22 (S42 FAIL — package declaration missing). Mirrors the
+# 10.1E deliverable state (Intent URI present, but no <queries>
+# entry) — Owner report 10.07.2026 23:29: "whatsapp yüklü değil
+# diyor hala deeplink yine hatalı".
+case_s42_manifest_no_package = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+          xmlns:tools="http://schemas.android.com/tools">
+
+    <application android:label="OpenE2EE" />
+
+    <queries>
+        <intent>
+            <action android:name="android.net.VpnService" />
+        </intent>
+        <!--
+          Sprint 10.1E: we handle WhatsApp via the intent://send?
+          scheme. No need to declare the package in <queries>
+          (will revisit).
+        -->
+    </queries>
+</manifest>
+"""
+
+# ─── S43 test cases (Sprint 10.1F) ───────────────────────────────
+
+# Case 23 (S43 PASS): post-Sprint 10.1F MainActivity.kt with the
+# inline `opene2ee/vpn` MethodChannel handler and the
+# `getSampledPackets` case. Mirrors the real post-fix state.
+case_s43_main_activity_pass = """package com.opene2ee.opene2ee
+
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+
+class MainActivity : FlutterActivity() {
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "opene2ee/vpn")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "start" -> result.success("started")
+                    "stop" -> result.success("stopped")
+                    "status" -> result.success("idle")
+                    "getSampledPackets" -> {
+                        val mockPackets = listOf(
+                            mapOf("version" to 4, "protocol" to 6)
+                        )
+                        result.success(mockPackets)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+    }
+}
+"""
+
+# Case 24 (S43 FAIL — getSampledPackets case missing). Mirrors the
+# Sprint 10.1B/10.1E broken state where MainActivity had only the
+# `opene2ee/vpn_permissions` channel and the `opene2ee/vpn` channel
+# was supposed to be wired to `OpenE2eeVpnService` (still
+# TODO(port-vpn-service)).
+case_s43_main_activity_no_handler = """package com.opene2ee.opene2ee
+
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodCall
+import io.flutter.plugin.common.MethodChannel
+
+class MainActivity : FlutterActivity() {
+    // TODO(port-vpn-service): OpenE2eeVpnService.attachFlutterEngine
+    // will be uncommented in Sprint 10.2 — it will own the
+    // `opene2ee/vpn` channel. For now we only have the
+    // `opene2ee/vpn_permissions` channel wired in this activity.
+    //
+    // The `getSampledPackets` handler is the responsibility of
+    // the (not-yet-ported) OpenE2eeVpnService class.
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "opene2ee/vpn_permissions")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "requestVpnPermission" -> result.success(true)
+                    "isVpnPrepared" -> result.success(false)
+                    else -> result.notImplemented()
+                }
+            }
+    }
+}
+"""
+
 # ─── Run all cases ───────────────────────────────────────────────
 
 cases = [
@@ -1767,6 +1964,18 @@ cases = [
          "// reverted to the 10.1B path that 404'd\n"
          "final uri = Uri.parse('\${AppConfig.apiBase}/api/v1/matches?sessionId=...');\n",),
      ["S41 fail (missing /api/v1/sessions)", "S41 fail (forbidden /api/v1/matches still present)"]),
+    # S42 cases (Sprint 10.1F - new)
+    ("S42 PASS (AndroidManifest.xml <queries> block carries <package android:name=\"com.whatsapp\" /> + com.whatsapp.w4b — Android 11+ package visibility)",
+     run_s42_check, (case_s42_manifest_pass,), []),
+    ("S42 FAIL (AndroidManifest.xml <queries> block present but <package android:name=\"com.whatsapp\" /> missing — Owner report 10.07.2026 23:29: 'whatsapp yüklü değil diyor hala deeplink yine hatalı')",
+     run_s42_check, (case_s42_manifest_no_package,),
+     ["S42 fail (<package android:name=\"com.whatsapp\" /> missing)"]),
+    # S43 cases (Sprint 10.1F - new)
+    ("S43 PASS (MainActivity.kt wires `when (call.method)` dispatch with `\"getSampledPackets\"` case on the `opene2ee/vpn` MethodChannel — Kotlin mock packet for 10.1F; real OpenE2eeVpnService integration lands in Sprint 10.2)",
+     run_s43_check, (case_s43_main_activity_pass,), []),
+    ("S43 FAIL (MainActivity.kt has a `when (call.method)` block on `opene2ee/vpn_permissions` but the `\"getSampledPackets\"` case is missing on the `opene2ee/vpn` channel — Owner report 10.07.2026 23:29: 30 consecutive 'Aktif Nöbet' calls all failed with MissingPluginException)",
+     run_s43_check, (case_s43_main_activity_no_handler,),
+     ["S43 fail (\"getSampledPackets\" case missing)"]),
 ]   # noqa: E501
 
 failed = []

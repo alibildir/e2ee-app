@@ -139,10 +139,28 @@
       Flutter's VpnService.prepare() intent — emitted by MainActivity when
       the user opts in. We declare the queries so Android 11+ package
       visibility rules let us call startActivity with the prepare intent.
+
+      Sprint 10.1F — extended with the WhatsApp packages so the Dart-side
+      `canLaunchUrl(...)` (in `whatsapp_deeplink_provider.dart`) can SEE
+      WhatsApp / WhatsApp Business on Android 11+ (API 30+). Without
+      these `<package>` declarations the platform returns `false` for
+      `canLaunchUrl("intent://send?...")` even when WhatsApp IS installed,
+      because the package-visibility filter blocks cross-app lookups by
+      default. The `<package>` form is the privacy-friendly shape — only
+      these two packages are exposed, not the entire SEND intent space.
+
+      Reference: https://developer.android.com/training/package-visibility
+      "If your app targets Android 11 (API level 30) or higher, you can
+       access a list of installed apps only if those apps are visible to
+       your app. To make other apps visible, declare them in your
+       manifest using the <queries> element."
     -->
     <queries>
         <intent>
             <action android:name="android.net.VpnService" />
         </intent>
+        <!-- Sprint 10.1F: WhatsApp + WhatsApp Business package visibility. -->
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
     </queries>
 </manifest>
