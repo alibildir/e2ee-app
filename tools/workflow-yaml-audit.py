@@ -2284,6 +2284,104 @@ def check_pubspec_baseline_shape() -> list[str]:
     return findings
 
 
+def check_no_vpn_string_in_sprint10_ui() -> list[str]:
+    """Sprint 10.0: no "VPN" string in mobile UI source (S25).
+
+    Sprint 10.0 removed the VPN framing from the user-facing product.
+    The "Ağ Güvenliği Aracı" hero + "Aktif Nöbet" framing replace the
+    previous "VPN" wording for App Store / Play Store policy
+    compliance (VPN usage disclosure in either store requires a
+    full VPN permission declaration + a privacy-policy URL; the
+    product positioning for Sprint 10.0 explicitly avoids that path).
+
+    Audit scope: every Dart file under `mobile/lib/main.dart` and
+    `mobile/lib/screens/`. We check for the substring "vpn" (case
+    insensitive) — this catches `VPN`, `Vpn`, `vpn`, `vpn_` etc. in
+    user-visible strings or identifiers, but does NOT touch the
+    Android-side VpnService plumbing under
+    `mobile/android/app/src/main/kotlin/.../vpn/`.
+
+    A regression here (any future sprint re-introducing "vpn" in
+    the UI layer) is a policy red flag — the audit should fail.
+    """
+    findings = []
+    targets = [
+        REPO_ROOT / "mobile" / "lib" / "main.dart",
+        REPO_ROOT / "mobile" / "lib" / "screens",
+    ]
+    needle = "vpn"
+    for t in targets:
+        if t.is_file():
+            files = [t]
+        elif t.is_dir():
+            files = list(t.rglob("*.dart"))
+        else:
+            continue
+        for f in files:
+            try:
+                text = f.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            # Compute relative path under mobile/lib for the message.
+            try:
+                rel = f.relative_to(REPO_ROOT / "mobile" / "lib").as_posix()
+            except ValueError:
+                rel = str(f)
+            if needle in text.lower():
+                findings.append(
+                    "S25 mobile/lib/" + rel + ": contains the literal `vpn` "
+                    "(case-insensitive). Sprint 10.0 invariant — the UI "
+                    "must not mention VPN; the Ağ Güvenliği Aracı framing "
+                    "replaces it. See docs/SPRINT-10-SCOPE.md."
+                )
+    return findings
+
+
+def check_whatsapp_deeplink_literal_present() -> list[str]:
+    """Sprint 10.0: whatsapp deep link literal in WhatsApp task detail (S26).
+
+    The WhatsApp task detail screen must invoke WhatsApp via the
+    `whatsapp://send?text=` deep link so the prepared message is
+    pre-filled in the user's WhatsApp composer. Replacing this with
+    a different scheme (e.g. a custom intent or a server-side
+    out-of-band delivery) is a Sprint 10.x product decision and
+    should require an explicit scope change.
+
+    Audit scope: `mobile/lib/screens/whatsapp_task_detail_screen.dart`
+    must contain the substring `whatsapp://send?text=`. The audit
+    also accepts the substring inside a comment because the
+    intent is to enforce *visibility* of the scheme choice, not
+    to enforce a particular Dart API surface.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "whatsapp_task_detail_screen.dart"
+    needle = "whatsapp://send?text="
+    if not target.exists():
+        findings.append(
+            "S26 mobile/lib/screens/whatsapp_task_detail_screen.dart: "
+            "file missing. Sprint 10.0 invariant — the WhatsApp task "
+            "detail screen is the entry point for the whatsapp://send?text= "
+            "deep link."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S26 mobile/lib/screens/whatsapp_task_detail_screen.dart: "
+            "read failed (" + str(e) + ")."
+        )
+        return findings
+    if needle not in text:
+        findings.append(
+            "S26 mobile/lib/screens/whatsapp_task_detail_screen.dart: "
+            "missing the literal `whatsapp://send?text=`. Sprint 10.0 "
+            "invariant — the deep link scheme is the contract for the "
+            "WhatsApp task."
+        )
+    return findings
+
+
 def main() -> int:
     all_findings = []
     for fname in TARGETS:
@@ -2409,12 +2507,26 @@ def main() -> int:
     else:
         print("PASS: mobile/pubspec.yaml baseline shape (name + environment.sdk + dependencies.flutter.sdk + dev_dependencies.flutter_test.sdk) — Sprint 9.7.0 Item 5 S20")
 
+    # Sprint 10.0: no "VPN" string in mobile UI source (S25).
+    s25_findings = check_no_vpn_string_in_sprint10_ui()
+    if s25_findings:
+        all_findings.extend(s25_findings)
+    else:
+        print("PASS: mobile/lib/main.dart + mobile/lib/screens/*.dart contain no `vpn` substring (case-insensitive) — Sprint 10.0 S25")
+
+    # Sprint 10.0: whatsapp deep link literal in WhatsApp task detail (S26).
+    s26_findings = check_whatsapp_deeplink_literal_present()
+    if s26_findings:
+        all_findings.extend(s26_findings)
+    else:
+        print("PASS: mobile/lib/screens/whatsapp_task_detail_screen.dart contains the literal `whatsapp://send?text=` — Sprint 10.0 S26")
+
     if all_findings:
         print("\nFINDINGS:")
         for f in all_findings:
             print(f"  - {f}")
         return 1
-    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape PASS PyYAML AUDIT.")
+    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 whatsapp://send?text= literal in WhatsApp task detail PASS PyYAML AUDIT.")
     return 0
 
 

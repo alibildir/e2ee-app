@@ -9,14 +9,17 @@ check_flutter_kotlin_embedding_v9 (S12),
 check_flutter_storage_repo_v10 (S13),
 check_gradle_wrapper_force_include (S17),
 check_fresh_flutter_create_preserved (S18),
-check_fresh_create_metadata_tracked (S19), and
-check_pubspec_baseline_shape (S20).
+check_fresh_create_metadata_tracked (S19),
+check_pubspec_baseline_shape (S20),
+check_no_vpn_string_in_sprint10_ui (S25), and
+check_whatsapp_deeplink_literal_present (S26).
 
 Per Architect brief (Sprint 9.6.6): "self-checks (negative test:
 revert + audit finds 4 FAIL)". Sprint 9.6.7 extends to S6.
 9.6.8 extends to S7. 9.6.9 extends to S8. 9.6.10 extends to S9.
 9.6.11 extends to S10. 9.6.12 extends to S11. 9.6.13 extends to S12.
 9.6.14 extends to S13. 9.7.0 Item 5 extends to S17-S20.
+Sprint 10.0 extends to S25-S26.
 
 S1-S5 cases: 6 (1 PASS + 5 FAIL, ...).
 S6 cases: 4 (1 PASS + 3 FAIL, ...).
@@ -34,8 +37,10 @@ S17 cases: 2 (1 PASS + 1 FAIL — wrapper not tracked).
 S18 cases: 2 (1 PASS + 1 FAIL — pubspec.lock not tracked).
 S19 cases: 2 (1 PASS + 1 FAIL — .metadata not tracked).
 S20 cases: 2 (1 PASS + 1 FAIL — pubspec.yaml missing name).
+S25 cases: 2 (1 PASS + 1 FAIL — `vpn` substring in main.dart).
+S26 cases: 2 (1 PASS + 1 FAIL — `whatsapp://send?text=` missing).
 
-Total: 39 cases.
+Total: 43 cases.
 """
 import sys
 from pathlib import Path
@@ -619,6 +624,44 @@ def run_s20_check(pubspec_text):
     if not isinstance(dev_deps, dict) or not isinstance(dev_deps.get("flutter_test"), dict) or dev_deps["flutter_test"].get("sdk") != "flutter":
         findings.append("S20 fail")
         return findings
+    return findings
+
+
+def run_s25_check(main_text, screens_text):
+    """Sprint 10.0: no `vpn` substring in main.dart + screens (S25).
+
+    Mirrors check_no_vpn_string_in_sprint10_ui. The audit scans both
+    `mobile/lib/main.dart` and every `mobile/lib/screens/*.dart` file
+    for the substring `vpn` (case-insensitive). The self-test
+    consolidates the screens check into a single string joined with
+    newlines (sufficient for a unit test of the substring rule).
+    """
+    findings = []
+    needle = "vpn"
+    for label, text in (("main", main_text), ("screens", screens_text)):
+        if text is None:
+            # Missing file is not asserted by S25 directly (S25 assumes
+            # the Sprint 9.6.8 main.dart + Sprint 10.0 screens are
+            # present; the file-missing case is covered by S7 / S20).
+            continue
+        if needle in text.lower():
+            findings.append("S25 fail (" + label + ")")
+    return findings
+
+
+def run_s26_check(whatsapp_screen_text):
+    """Sprint 10.0: whatsapp deep link literal in WhatsApp task detail (S26).
+
+    Mirrors check_whatsapp_deeplink_literal_present. The file
+    `mobile/lib/screens/whatsapp_task_detail_screen.dart` must
+    contain the literal `whatsapp://send?text=`.
+    """
+    findings = []
+    if whatsapp_screen_text is None:
+        findings.append("S26 fail (file missing)")
+        return findings
+    if "whatsapp://send?text=" not in whatsapp_screen_text:
+        findings.append("S26 fail (literal missing)")
     return findings
 
 
@@ -1383,6 +1426,17 @@ cases = [
      run_s20_check, (case_s20_pubspec_pass,), []),
     ("S20 FAIL (mobile/pubspec.yaml missing `name:` key - regression: future edit dropped Dart pub project identifier)",
      run_s20_check, (case_s20_pubspec_no_name,), ["S20 fail"]),
+    # S25 cases (Sprint 10.0 - new)
+    ("S25 PASS (main.dart + screens/*.dart contain no `vpn` substring)",
+     run_s25_check, ("void main() => runApp(const OpenE2EEApp());\n// Ağ Güvenliği Aracı\n",
+                     "import 'package:flutter/material.dart';\nclass HomeScreen extends StatelessWidget {}\n"), []),
+    ("S25 FAIL (main.dart contains the literal `vpn` - regression: future sprint re-introduces VPN framing)",
+     run_s25_check, ("void main() { connectVpn(); }\n", "// clean\n"), ["S25 fail (main)"]),
+    # S26 cases (Sprint 10.0 - new)
+    ("S26 PASS (whatsapp_task_detail_screen.dart contains the literal `whatsapp://send?text=`)",
+     run_s26_check, ("final uri = 'whatsapp://send?text=hello';\n",), []),
+    ("S26 FAIL (whatsapp_task_detail_screen.dart missing the literal `whatsapp://send?text=`)",
+     run_s26_check, ("// replaced with custom intent later\n",), ["S26 fail (literal missing)"]),
 ]   # noqa: E501
 
 failed = []
