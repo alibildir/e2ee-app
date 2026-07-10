@@ -17,8 +17,12 @@ check_active_pool_linechart_literal_present (S27),
 check_pool_provider_timer_periodic_literal_present (S28),
 check_active_pool_haptic_feedback_literal_present (S29),
 check_pool_provider_debug_state_fields (S33),
-check_active_pool_scaffold_messenger_snackbar (S34), and
-check_service_api_key_from_environment (S35).
+check_active_pool_scaffold_messenger_snackbar (S34),
+check_service_api_key_from_environment (S35),
+check_auth_service_exists (S36),
+check_service_uses_auth_headers (S37),
+check_auth_token_expiry_field (S38), and
+check_auth_invalidate_method (S39).
 
 Per Architect brief (Sprint 9.6.6): "self-checks (negative test:
 revert + audit finds 4 FAIL)". Sprint 9.6.7 extends to S6.
@@ -28,6 +32,7 @@ revert + audit finds 4 FAIL)". Sprint 9.6.7 extends to S6.
 Sprint 10.0 extends to S25-S26.
 Sprint 10.1A extends to S27-S29.
 Sprint 10.1C extends to S33-S35.
+Sprint 10.1D extends to S36-S39.
 
 S1-S5 cases: 6 (1 PASS + 5 FAIL, ...).
 S6 cases: 4 (1 PASS + 3 FAIL, ...).
@@ -53,8 +58,12 @@ S29 cases: 2 (1 PASS + 1 FAIL — `HapticFeedback`/`SystemSound` literal missing
 S33 cases: 2 (1 PASS + 1 FAIL — lastError/lastSuccess literal missing in pool provider).
 S34 cases: 2 (1 PASS + 1 FAIL — ScaffoldMessenger.of(context).showSnackBar literal missing in active pool screen).
 S35 cases: 2 (1 PASS + 1 FAIL — String.fromEnvironment('API_KEY' literal missing in telemetry/p2p services).
+S36 cases: 2 (1 PASS + 1 FAIL — POST /api/v1/auth user_id literals missing in auth_service).
+S37 cases: 2 (1 PASS + 1 FAIL — authHeaders() call missing in telemetry/p2p services).
+S38 cases: 2 (1 PASS + 1 FAIL — _tokenExpiresAt field missing in auth_service).
+S39 cases: 2 (1 PASS + 1 FAIL — invalidate() method missing in auth_service).
 
-Total: 55 cases.
+Total: 63 cases.
 """
 import sys
 from pathlib import Path
@@ -787,6 +796,78 @@ def run_s35_check(telemetry_text, p2p_matcher_text):
             break
     if not hit:
         findings.append("S35 fail (literal missing in both services)")
+    return findings
+
+
+def run_s36_check(auth_service_text):
+    """Sprint 10.1D: auth_service.dart POST /api/v1/auth user_id (S36).
+
+    Mirrors check_auth_service_exists. The file
+    `mobile/lib/services/auth_service.dart` must contain all
+    three foundational literals: `http.post`, `/api/v1/auth`,
+    `user_id`.
+    """
+    findings = []
+    if auth_service_text is None:
+        findings.append("S36 fail (file missing)")
+        return findings
+    needles = ("http.post", "/api/v1/auth", "user_id")
+    missing = [n for n in needles if n not in auth_service_text]
+    if missing:
+        findings.append("S36 fail (missing: " + ",".join(missing) + ")")
+    return findings
+
+
+def run_s37_check(telemetry_text, p2p_matcher_text):
+    """Sprint 10.1D: telemetry_service / p2p_matcher use authHeaders (S37).
+
+    Mirrors check_service_uses_auth_headers. At least one of
+    the two service files must contain the literal
+    `authHeaders()` call.
+    """
+    findings = []
+    needle = "authHeaders()"
+    hit = False
+    for label, text in (("telemetry", telemetry_text), ("p2p_matcher", p2p_matcher_text)):
+        if text is None:
+            continue
+        if needle in text:
+            hit = True
+            break
+    if not hit:
+        findings.append("S37 fail (authHeaders() call missing in both services)")
+    return findings
+
+
+def run_s38_check(auth_service_text):
+    """Sprint 10.1D: auth_service.dart `_tokenExpiresAt` field (S38).
+
+    Mirrors check_auth_token_expiry_field. The file must
+    contain the literal `_tokenExpiresAt` (the JWT token-cache
+    state).
+    """
+    findings = []
+    if auth_service_text is None:
+        findings.append("S38 fail (file missing)")
+        return findings
+    if "_tokenExpiresAt" not in auth_service_text:
+        findings.append("S38 fail (_tokenExpiresAt field missing)")
+    return findings
+
+
+def run_s39_check(auth_service_text):
+    """Sprint 10.1D: auth_service.dart `invalidate()` method (S39).
+
+    Mirrors check_auth_invalidate_method. The file must
+    contain the literal `invalidate()` (the 401-retry
+    contract).
+    """
+    findings = []
+    if auth_service_text is None:
+        findings.append("S39 fail (file missing)")
+        return findings
+    if "invalidate()" not in auth_service_text:
+        findings.append("S39 fail (invalidate() method missing)")
     return findings
 
 
@@ -1592,6 +1673,26 @@ cases = [
      run_s35_check, ("const String _kApiKey = String.fromEnvironment('API_KEY', defaultValue: 'test_key_placeholder');\n", None), []),
     ("S35 FAIL (neither telemetry_service.dart nor p2p_matcher.dart contains the literal - regression: --dart-define API_KEY=... silently ignored)",
      run_s35_check, ("// literal removed in 10.1C rebase; using constructor param instead\n", "// p2p uses constructor param too\n"), ["S35 fail (literal missing in both services)"]),
+    # S36 cases (Sprint 10.1D - new)
+    ("S36 PASS (auth_service.dart contains http.post + /api/v1/auth + user_id literals for JWT auth flow)",
+     run_s36_check, ("final resp = await http.post(\n  Uri.parse('${AppConfig.apiBase}/api/v1/auth'),\n  body: jsonEncode({'user_id': AppConfig.deviceId}),\n);\n",), []),
+    ("S36 FAIL (auth_service.dart missing one of http.post + /api/v1/auth + user_id - regression: JWT flow silently broken)",
+     run_s36_check, ("// switched to header-based auth, no POST body\nfinal headers = {'Authorization': 'Bearer token'};\n",), ["S36 fail (missing: http.post,/api/v1/auth,user_id)"]),
+    # S37 cases (Sprint 10.1D - new)
+    ("S37 PASS (telemetry_service.dart contains `authHeaders()` call for JWT-protected POST)",
+     run_s37_check, ("final headers = await _auth.authHeaders();\nheaders['Content-Type'] = 'application/json';\n", None), []),
+    ("S37 FAIL (neither telemetry_service.dart nor p2p_matcher.dart contains `authHeaders()` - regression: static Bearer key returns)",
+     run_s37_check, ("// auth integration removed, using static key\nheaders: {'Authorization': 'Bearer $_apiKey'},\n", "// p2p also reverted to static key\n"), ["S37 fail (authHeaders() call missing in both services)"]),
+    # S38 cases (Sprint 10.1D - new)
+    ("S38 PASS (auth_service.dart contains `_tokenExpiresAt` field for JWT token cache + 5min pre-expiry refresh)",
+     run_s38_check, ("DateTime? _tokenExpiresAt;\nbool get hasValidToken => _tokenExpiresAt != null;\n",), []),
+    ("S38 FAIL (auth_service.dart missing `_tokenExpiresAt` - regression: every protected call re-auths)",
+     run_s38_check, ("// expiry tracking field removed; using one-shot token\nString? _cachedToken;\n",), ["S38 fail (_tokenExpiresAt field missing)"]),
+    # S39 cases (Sprint 10.1D - new)
+    ("S39 PASS (auth_service.dart contains `invalidate()` method for 401 retry contract)",
+     run_s39_check, ("void invalidate() {\n  _cachedToken = null;\n  _tokenExpiresAt = null;\n}\n",), []),
+    ("S39 FAIL (auth_service.dart missing `invalidate()` - regression: 401 leaves stale cached JWT)",
+     run_s39_check, ("// flush-on-401 method removed; cached JWT stays until 1h expiry\n",), ["S39 fail (invalidate() method missing)"]),
 ]   # noqa: E501
 
 failed = []

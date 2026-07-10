@@ -64,6 +64,7 @@ import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../config.dart';
+import '../services/auth_service.dart';
 import '../services/p2p_matcher.dart';
 import '../services/packet_parser.dart';
 import '../services/telemetry_service.dart';
@@ -199,7 +200,9 @@ class PoolNotifier extends StateNotifier<PoolState> {
     P2PMatcher? matcher,
     VpnService? vpnService,
     TelemetryService? telemetry,
-  })  : _matcher = matcher ?? P2PMatcher(apiKey: kApiKey),
+    AuthService? auth,
+  })  : _matcher = matcher ??
+            P2PMatcher(apiKey: kApiKey, auth: auth),
         _vpn = vpnService ?? VpnService(),
         // Sprint 10.1C — use the build-time DEVICE_ID as the
         // session id so the backend BFF correlates every
@@ -207,10 +210,16 @@ class PoolNotifier extends StateNotifier<PoolState> {
         // record. Falls back to TelemetryService's per-process
         // random id when DEVICE_ID is empty (defensive — should
         // never happen given config.dart's default).
+        //
+        // Sprint 10.1D — pass the SHARED `auth` instance so
+        // the matcher + telemetry use the same cached JWT.
+        // Otherwise each service would mint its own JWT on
+        // first call (3 round-trips per tick instead of 1).
         _telemetry = telemetry ??
             TelemetryService(
               apiKey: kApiKey,
               sessionId: kDeviceId.isNotEmpty ? kDeviceId : null,
+              auth: auth,
             ),
         super(PoolState.initial()) {
     _sessionId = kDeviceId.isNotEmpty ? kDeviceId : _telemetry.sessionId;
@@ -364,5 +373,12 @@ ParsedPacket? _mapToParsedPacket(Map<String, Object?> m) {
 }
 
 final poolProvider = StateNotifierProvider<PoolNotifier, PoolState>(
-  (ref) => PoolNotifier(),
+  (ref) {
+    // Sprint 10.1D — read the shared `authProvider` so the
+    // matcher + telemetry share ONE cached JWT (5-min
+    // pre-expiry refresh window). Without this wiring,
+    // each service would mint its own JWT on first call.
+    final auth = ref.watch(authProvider);
+    return PoolNotifier(auth: auth);
+  },
 );

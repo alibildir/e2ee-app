@@ -206,6 +206,22 @@ Verifies:
         call, the `--dart-define API_KEY=<key>` build flag is
         silently ignored and the hardcoded placeholder reaches
         the wire (Owner directive 10.07.2026 22:25).
+  26. **Sprint 10.1D:** auth_service.dart exists with POST +
+        /api/v1/auth + user_id literals (S36) — the JWT auth
+        flow files. The endpoint + body shape is the contract
+        with the backend BFF aggregator.
+  27. **Sprint 10.1D:** authHeaders() in telemetry_service or
+        p2p_matcher (S37) — the protected endpoints must call
+        `_auth.authHeaders()` (Future<Map<String, String>>),
+        NOT send a static `Authorization: Bearer <key>` line.
+  28. **Sprint 10.1D:** _tokenExpiresAt field in
+        auth_service.dart (S38) — the JWT token-cache state.
+        `getToken()` uses it for the 5-min pre-expiry refresh
+        window (Owner directive 10.07.2026 22:33).
+  29. **Sprint 10.1D:** invalidate() method in
+        auth_service.dart (S39) — the 401-retry contract.
+        Downstream services call `_auth.invalidate()` when the
+        backend rejects the JWT; the next call re-auths.
 """
 import json
 import re
@@ -2698,6 +2714,195 @@ def check_service_api_key_from_environment() -> list[str]:
     return findings
 
 
+def check_auth_service_exists() -> list[str]:
+    """Sprint 10.1D: auth_service.dart + POST /api/v1/auth (S36).
+
+    The Owner directive (10.07.2026 22:33) replaced the 10.1B
+    static `Authorization: Bearer <api_key>` literal with a real
+    `POST /api/v1/auth` JWT exchange. The new
+    `mobile/lib/services/auth_service.dart` is the canonical
+    home for that flow. S36 verifies all three foundational
+    literals exist on the file:
+      (a) the `http.post` call (the Dart method `post(`),
+      (b) the `/api/v1/auth` path literal (the endpoint),
+      (c) the `user_id` JSON field literal (the body key).
+
+    A regression that drops any one of these silently breaks
+    the auth flow — the BFF aggregator rejects the request
+    and the pool provider's `lastError` lights up red.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "auth_service.dart"
+    if not target.exists():
+        findings.append(
+            "S36 mobile/lib/services/auth_service.dart: file missing. "
+            "Sprint 10.1D invariant — the JWT auth flow lives in "
+            "this file (POST /api/v1/auth with body {user_id: DEVICE_ID})."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S36 mobile/lib/services/auth_service.dart: read failed ("
+            + str(e) + ")."
+        )
+        return findings
+    needles = ("post(", "/api/v1/auth", "user_id")
+    missing = [n for n in needles if n not in text]
+    if missing:
+        findings.append(
+            "S36 mobile/lib/services/auth_service.dart: missing required "
+            f"literal(s): {', '.join(missing)}. Sprint 10.1D invariant — "
+            "the auth flow is `http.post(${AppConfig.apiBase}/api/v1/auth)` "
+            "with JSON body `{\"user_id\": AppConfig.deviceId}`. Dropping "
+            "any one of these literals breaks the JWT exchange."
+        )
+    return findings
+
+
+def check_service_uses_auth_headers() -> list[str]:
+    """Sprint 10.1D: telemetry_service / p2p_matcher use authHeaders (S37).
+
+    The 10.1B Bearer token was a static literal in
+    `telemetry_service.dart` + `p2p_matcher.dart`. 10.1D replaces
+    that with `_auth.authHeaders()` (a Future<Map<String, String>>
+    that returns the JWT-derived headers) and drops the static
+    `Authorization: Bearer <key>` line.
+
+    S37 verifies the new auth flow is wired by checking the
+    LITERAL `authHeaders()` call appears in EITHER
+    `telemetry_service.dart` OR `p2p_matcher.dart`. (Both files
+    should have it; the audit accepts either as the
+    regression-guard signal — if both drop the call, the
+    `findMatch` / `send` paths fall back to a static key.)
+
+    Audit scope: at least one of the two service files
+    contains the literal `authHeaders()`.
+    """
+    findings = []
+    targets = [
+        REPO_ROOT / "mobile" / "lib" / "services" / "telemetry_service.dart",
+        REPO_ROOT / "mobile" / "lib" / "services" / "p2p_matcher.dart",
+    ]
+    needle = "authHeaders()"
+    hit = None
+    for t in targets:
+        if not t.exists():
+            continue
+        try:
+            text = t.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if needle in text:
+            hit = str(t.relative_to(REPO_ROOT))
+            break
+    if hit is None:
+        locs = ", ".join(
+            str(t.relative_to(REPO_ROOT)) for t in targets
+        )
+        findings.append(
+            "S37 services (one of: " + locs + "): missing the literal "
+            "`authHeaders()`. Sprint 10.1D invariant — the protected "
+            "endpoints (`/api/v1/telemetry`, `/api/v1/matches`) must "
+            "call `_auth.authHeaders()` (Future<Map<String, String>>) "
+            "to pull the JWT, NOT send a static "
+            "`Authorization: Bearer <key>` line. Without the call, "
+            "the 10.1B static-key literal reaches the wire and the "
+            "backend BFF rejects the request as malformed auth."
+        )
+    return findings
+
+
+def check_auth_token_expiry_field() -> list[str]:
+    """Sprint 10.1D: auth_service.dart `_tokenExpiresAt` field (S38).
+
+    The Owner directive (10.07.2026 22:33): "Token cached in
+    memory 5min before expiry". The token cache is implemented
+    via the `_tokenExpiresAt` DateTime field — `getToken()`
+    returns the cached token iff `now < expiry - 5min`, else
+    re-auths. S38 verifies the LITERAL field name is present
+    in `auth_service.dart` (substring match).
+
+    Audit scope: `mobile/lib/services/auth_service.dart` must
+    contain the literal `_tokenExpiresAt`.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "auth_service.dart"
+    needle = "_tokenExpiresAt"
+    if not target.exists():
+        findings.append(
+            "S38 mobile/lib/services/auth_service.dart: file missing. "
+            "Sprint 10.1D invariant — the JWT token-cache state "
+            "(`_tokenExpiresAt` field) lives in this file."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S38 mobile/lib/services/auth_service.dart: read failed ("
+            + str(e) + ")."
+        )
+        return findings
+    if needle not in text:
+        findings.append(
+            "S38 mobile/lib/services/auth_service.dart: missing the "
+            "literal `_tokenExpiresAt`. Sprint 10.1D invariant — the "
+            "JWT token cache lives in this field; `getToken()` uses "
+            "it for the 5-min pre-expiry refresh window. Without "
+            "the field, every call re-auths (1 extra round-trip "
+            "per protected request)."
+        )
+    return findings
+
+
+def check_auth_invalidate_method() -> list[str]:
+    """Sprint 10.1D: auth_service.dart `invalidate()` method (S39).
+
+    The Owner directive (10.07.2026 22:33): "401 invalidates
+    token and retries". The 401-handling contract is: the
+    downstream service (telemetry / matcher) sees a 401,
+    calls `_auth.invalidate()` to flush the cached token,
+    and returns. The NEXT call to `getToken()` then re-auths.
+
+    S39 verifies the LITERAL `invalidate()` method definition
+    is present in `auth_service.dart` (substring match — any
+    spelling other than `invalidate` is a real regression).
+
+    Audit scope: `mobile/lib/services/auth_service.dart` must
+    contain the literal `invalidate()`.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "auth_service.dart"
+    needle = "invalidate()"
+    if not target.exists():
+        findings.append(
+            "S39 mobile/lib/services/auth_service.dart: file missing. "
+            "Sprint 10.1D invariant — the 401-retry contract "
+            "(`invalidate()` method) lives in this file."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S39 mobile/lib/services/auth_service.dart: read failed ("
+            + str(e) + ")."
+        )
+        return findings
+    if needle not in text:
+        findings.append(
+            "S39 mobile/lib/services/auth_service.dart: missing the "
+            "literal `invalidate()`. Sprint 10.1D invariant — the "
+            "401-retry contract requires downstream services to call "
+            "`_auth.invalidate()` when the backend rejects the JWT; "
+            "without the method, a 401 leaves the cached token in "
+            "place and the next request fails with the same 401."
+        )
+    return findings
+
+
 def main() -> int:
     all_findings = []
     for fname in TARGETS:
@@ -2879,12 +3084,40 @@ def main() -> int:
     else:
         print("PASS: mobile/lib/services/telemetry_service.dart or p2p_matcher.dart contains `String.fromEnvironment('API_KEY'` - Sprint 10.1C S35")
 
+    # Sprint 10.1D: auth_service.dart POST /api/v1/auth + user_id (S36).
+    s36_findings = check_auth_service_exists()
+    if s36_findings:
+        all_findings.extend(s36_findings)
+    else:
+        print("PASS: mobile/lib/services/auth_service.dart contains POST + /api/v1/auth + user_id literals - Sprint 10.1D S36")
+
+    # Sprint 10.1D: telemetry_service / p2p_matcher use authHeaders() (S37).
+    s37_findings = check_service_uses_auth_headers()
+    if s37_findings:
+        all_findings.extend(s37_findings)
+    else:
+        print("PASS: mobile/lib/services/telemetry_service.dart or p2p_matcher.dart contains `authHeaders()` call - Sprint 10.1D S37")
+
+    # Sprint 10.1D: auth_service.dart `_tokenExpiresAt` field (S38).
+    s38_findings = check_auth_token_expiry_field()
+    if s38_findings:
+        all_findings.extend(s38_findings)
+    else:
+        print("PASS: mobile/lib/services/auth_service.dart contains `_tokenExpiresAt` token-cache field - Sprint 10.1D S38")
+
+    # Sprint 10.1D: auth_service.dart `invalidate()` method (S39).
+    s39_findings = check_auth_invalidate_method()
+    if s39_findings:
+        all_findings.extend(s39_findings)
+    else:
+        print("PASS: mobile/lib/services/auth_service.dart contains `invalidate()` method - Sprint 10.1D S39")
+
     if all_findings:
         print("\nFINDINGS:")
         for f in all_findings:
             print(f"  - {f}")
         return 1
-    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 whatsapp://send?text= literal in WhatsApp task detail + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher PASS PyYAML AUDIT.")
+    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 whatsapp://send?text= literal in WhatsApp task detail + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher + S36 auth_service.dart POST /api/v1/auth + user_id + S37 authHeaders() in telemetry_service or p2p_matcher + S38 _tokenExpiresAt field in auth_service + S39 invalidate() method in auth_service PASS PyYAML AUDIT.")
     return 0
 
 

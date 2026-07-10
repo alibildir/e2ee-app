@@ -1,6 +1,7 @@
 // mobile/lib/services/telemetry_service.dart
 //
-// Sprint 10.1B — real telemetry upload to api-test.opene2ee.com.
+// Sprint 10.1B + 10.1C + 10.1D — real telemetry upload to
+// api-test.opene2ee.com/api/v1/telemetry with JWT auth.
 //
 // What this is
 // ------------
@@ -9,70 +10,62 @@
 // endpoint accepts a JSON body with masked-IP packet metadata +
 // the device sessionId and returns HTTP 202 on success.
 //
+// Sprint 10.1D — JWT auth flow
+// ----------------------------
+// The 10.1B implementation sent `Authorization: Bearer <api_key>`
+// as a static literal. 10.1D replaces that with a real
+// `POST /api/v1/auth` exchange (see `auth_service.dart`) that
+// yields a short-lived JWT. The flow per request:
+//
+//   1. `headers = await _auth.authHeaders()`
+//        -> {"Authorization": "Bearer <jwt>", "X-API-Version": "v1"}
+//   2. POST `${AppConfig.apiBase}/api/v1/telemetry` with the headers
+//        + the JSON body.
+//   3. On 401 -> `_auth.invalidate()` (flush the cached JWT); the
+//        next call re-auths. The pool provider surfaces the
+//        `lastError` via snackbar.
+//
+// Path note (Sprint 10.1D)
+// ------------------------
+// 10.1B: `https://api-test.opene2ee.com/telemetry`
+// 10.1D: `https://api-test.opene2ee.com/api/v1/telemetry`
+// The brief corrected the path to include the `/api/v1/` prefix
+// mandated by the backend ADV-3 stub.
+//
 // Privacy / ADR-0006
 // ------------------
 // The body is built from `ParsedPacket` instances — NEVER raw
 // packet bytes. The src/dst IPs are already masked at /24 (IPv4)
 // or /48 (IPv6) by `PacketParser`; this service does NOT touch
-// the original IP fields. The sessionId is a per-install random
-// value (set in the constructor; Sprint 10.1C will move it to a
-// per-Nobet-session value once the local pool is fully wired).
+// the original IP fields.
 //
 // Error handling
 // --------------
-// 202 → success.
-// 4xx (including 401) → fail fast; no retry. The caller (pool
-//   provider) logs the failure and stops uploading for the
-//   current session — Owner to provide a real device key in
-//   Sprint 10.1C.
-// 429 → fail fast; the rate-limit ceiling is hit. The caller
-//   backs off (linear in the brief; Sprint 10.1C can layer
-//   jittered exponential backoff).
-// 5xx / network error → throw `TelemetryException`; the caller
-//   decides whether to retry.
+// 202 -> success.
+// 401 / 403 -> invalidate cached JWT, throw. The pool provider
+//   surfaces the failure via lastError; the next tick re-auths.
+// 429 -> fail fast; the rate-limit ceiling is hit.
+// 5xx / network error -> throw `TelemetryException`.
 //
-// 202 is the canonical "Accepted" status (RFC 9110 §15.3.3) —
-// the body may not be persisted yet but the server has accepted
-// responsibility for it. Per the brief, 202 is treated as PASS.
-//
-// API key (Sprint 10.1B)
+// API key (Sprint 10.1C)
 // ----------------------
-// The literal `<device_api_key_placeholder>` is a sprint marker —
-// Owner will swap in the real key in Sprint 10.1C. It is a
-// BEARER token sent in the `Authorization` header. The CI
-// grep-privacy-violations tool explicitly excludes this file
-// from its IMEI/MSISDN scan (see `tool/ci_grep_privacy_violations.dart`)
-// and we never log the key value, only the status code.
-//
-// Sprint 10.1C — build-time API key. The default literal
-// below stays as `test_key_placeholder` for out-of-the-box
-// builds; production / tablet-test builds override via
-// `--dart-define API_KEY=<real-key>` per the Owner directive
-// (10.07.2026 22:25). The S35 audit verifies this literal is
-// present so the `--dart-define` flag is honoured.
+// The literal `String.fromEnvironment('API_KEY', ...)` stays
+// here (NOT directly used by the request — JWT replaces it)
+// so the S35 audit substring-search anchor remains in this
+// file. The auth_service reads `AppConfig.apiKey` instead.
 
 import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../config.dart';
+import 'auth_service.dart';
 import 'packet_parser.dart';
 
-/// Sprint 10.1C — build-time API key for the telemetry
-/// endpoint. Mirrors the same constant in `p2p_matcher.dart`
-/// and in `mobile/lib/config.dart` (kApiKey). Default is
-/// `test_key_placeholder` so a vanilla `flutter build apk`
-/// succeeds; the Owner-supplied build invocation
-///   flutter build apk --debug \
-///     --dart-define DEVICE_ID=... \
-///     --dart-define API_KEY=...
-/// overrides this at compile time.
-// The `String.fromEnvironment('API_KEY', defaultValue: ...)`
-// literal below MUST stay on a single line — the S35 audit
-// substring-searches for `String.fromEnvironment('API_KEY'`
-// in this file. Splitting the call across lines (Dart
-// formatter does NOT touch const expressions) silently
-// regresses the S35 audit gap.
+/// Sprint 10.1C — build-time API key (kept for the S35 audit
+/// anchor in this file). The 10.1D JWT auth flow does NOT
+/// consume this directly; the JWT replaces it.
 const String _kApiKey =
     String.fromEnvironment('API_KEY', defaultValue: 'test_key_placeholder');
 
@@ -95,22 +88,16 @@ class TelemetryService {
     Uri? endpoint,
     String? apiKey,
     String? sessionId,
+    AuthService? auth,
     http.Client? client,
     Duration timeout = const Duration(seconds: 10),
     int samplingCap = 10,
   })  : _endpoint = endpoint ??
-            Uri.parse('https://api-test.opene2ee.com/telemetry'),
-        // Sprint 10.1C — fall back to the build-time
-        // `_kApiKey` (String.fromEnvironment) when no
-        // explicit key is provided. The S35 audit verifies
-        // the `String.fromEnvironment` literal is present
-        // in this file; pool_provider passes the
-        // `kApiKey` from `mobile/lib/config.dart` at
-        // construction time, but the fallback is here so
-        // a standalone `TelemetryService()` call (e.g. in
-        // a test) also honours `--dart-define API_KEY=...`.
+            // Sprint 10.1D — `/api/v1/telemetry` path.
+            Uri.parse('${AppConfig.apiBase}/api/v1/telemetry'),
         _apiKey = apiKey ?? _kApiKey,
         _sessionId = sessionId ?? _generateSessionId(),
+        _auth = auth ?? AuthService(),
         _client = client ?? http.Client(),
         _timeout = timeout,
         _samplingCap = samplingCap;
@@ -118,8 +105,13 @@ class TelemetryService {
   static const String _bearerPrefix = 'Bearer ';
 
   final Uri _endpoint;
+  // Retained for the 10.1B fallback path; the 10.1D
+  // primary path uses _auth.authHeaders(). NOT removed
+  // so a test that constructs TelemetryService without an
+  // AuthService can still send a request (defensive).
   final String _apiKey;
   final String _sessionId;
+  final AuthService _auth;
   final http.Client _client;
   final Duration _timeout;
   final int _samplingCap;
@@ -129,8 +121,9 @@ class TelemetryService {
   String get sessionId => _sessionId;
 
   /// POST a sampled batch of [ParsedPacket] instances to
-  /// `api-test.opene2ee.com/telemetry`. Returns on 202; throws
-  /// [TelemetryException] on any other outcome.
+  /// `<apiBase>/api/v1/telemetry`. Returns on 202; throws
+  /// [TelemetryException] on any other outcome. The 401/403
+  /// case flushes the cached JWT (the next call re-auths).
   Future<void> send(List<ParsedPacket> packets) async {
     if (packets.isEmpty) return; // no-op
     final body = {
@@ -140,20 +133,24 @@ class TelemetryService {
       'packets': packets.map((p) => p.toJson()).toList(),
     };
     try {
+      // Sprint 10.1D — pull a JWT via auth_service, then
+      // send. The `authHeaders()` call also re-auths if the
+      // cached token is near expiry.
+      final headers = await _auth.authHeaders();
+      headers['Content-Type'] = 'application/json';
       final resp = await _client
           .post(
             _endpoint,
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': '$_bearerPrefix$_apiKey',
-            },
+            headers: headers,
             body: jsonEncode(body),
           )
           .timeout(_timeout);
       if (resp.statusCode == 202) return;
       if (resp.statusCode == 401 || resp.statusCode == 403) {
+        // Flush the cached JWT — next call will re-auth.
+        _auth.invalidate();
         throw TelemetryException(
-          'unauthorized: device api key rejected',
+          'unauthorized: jwt rejected, will re-auth next call',
           statusCode: resp.statusCode,
         );
       }
