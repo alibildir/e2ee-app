@@ -231,12 +231,12 @@ jobs:
         run: flutter pub get
 
       - name: Build Debug APK
-        working-directory: ./mobile/android
-        run: ./gradlew assembleDebug
+        working-directory: ./mobile
+        run: flutter build apk --debug
 
       - name: Verify APK output
         run: |
-          APK_PATH=$(find ./mobile/android/app/build/outputs/apk/debug -name '*.apk' | head -1)
+          APK_PATH=$(find ./mobile/build/app/outputs/flutter-apk -name '*.apk' | head -1)
           if [ ! -f "$APK_PATH" ]; then
             echo "::error::Debug APK not found"
             exit 1
@@ -248,7 +248,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: android-debug-apk
-          path: ./mobile/android/app/build/outputs/apk/debug/*.apk
+          path: ./mobile/build/app/outputs/flutter-apk/*.apk
           if-no-files-found: error
           retention-days: 14
 
@@ -256,6 +256,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: android-mapping-files
-          path: ./mobile/android/app/build/outputs/mapping/debug/*.txt
+          path: ./mobile/build/app/outputs/mapping/debug/*.txt
           if-no-files-found: warn
           retention-days: 30
