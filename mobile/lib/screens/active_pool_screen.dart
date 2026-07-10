@@ -9,7 +9,9 @@ import 'package:go_router/go_router.dart';
 
 import '../config.dart';
 import '../services/packet_parser.dart';
+import '../services/session_orchestrator.dart';
 import '../services/vpn_service.dart';
+import '../services/webrtc_service.dart';
 import '../state/pool_provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/stat_pill.dart';
@@ -48,9 +50,12 @@ class _ActivePoolScreenState extends ConsumerState<ActivePoolScreen>
     with SingleTickerProviderStateMixin {
   late final AnimationController _pulseController;
   late final VpnService _vpn;
+  late final SessionOrchestrator _orchestrator;
   StreamSubscription<List<SampledPacket>>? _packetSub;
   StreamSubscription<VpnLifecycleState>? _stateSub;
+  StreamSubscription<WebRTCState>? _webrtcStateSub;
   VpnLifecycleState _vpnState = VpnLifecycleState.idle;
+  WebRTCState _webrtcState = WebRTCState.idle;
   int _toplamPaket = 0;
   int _toplamTelemetri = 0;
   bool _eslesmeZamanlayiciAktif = false;
@@ -63,6 +68,13 @@ class _ActivePoolScreenState extends ConsumerState<ActivePoolScreen>
       duration: const Duration(milliseconds: 1200),
     )..repeat(reverse: true);
     _vpn = VpnService();
+    // Sprint 11.0B — the orchestrator + the WebRTC service share
+    // the lifecycle of the screen. S60 invariant: the status
+    // pill mirrors `webrtcService.stateStream`; the orchestrator
+    // drives the `negotiate()` call when the user opens the
+    // "P2P bağlantısı başlat" surface in a future sprint (M2
+    // demo wires the offerer side only).
+    _orchestrator = SessionOrchestrator();
     // Sprint 11.0A — subscribe to the live packet + state streams.
     // The Kotlin `PacketDrain` pushes a `List<SampledPacket>` every
     // 5 seconds; the screen appends to the cumulative count and
@@ -74,12 +86,19 @@ class _ActivePoolScreenState extends ConsumerState<ActivePoolScreen>
         setState(() => _vpnState = s);
       }
     });
+    _webrtcStateSub = _orchestrator.webrtc.stateStream.listen((s) {
+      if (mounted) {
+        setState(() => _webrtcState = s);
+      }
+    });
   }
 
   @override
   void dispose() {
     _packetSub?.cancel();
     _stateSub?.cancel();
+    _webrtcStateSub?.cancel();
+    _orchestrator.close();
     _vpn.dispose();
     _pulseController.dispose();
     super.dispose();
@@ -328,6 +347,31 @@ class _ActivePoolScreenState extends ConsumerState<ActivePoolScreen>
                     color: AppTheme.muted,
                   ),
                 ),
+                // Sprint 11.0B — WebRTC status indicator (S60
+                // invariant). The orchestrator streams the
+                // `WebRTCState` via `webrtcService.stateStream`;
+                // we mirror it on-screen so the user has
+                // visible feedback that the P2P negotiation
+                // is in flight (Negotiating → Connected) or
+                // failed. The label is Turkish to match the
+                // existing UI copy.
+                const SizedBox(width: 8),
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: _webrtcStateColor(_webrtcState),
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  'P2P: ${_webrtcStateLabel(_webrtcState)}',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: AppTheme.muted,
+                  ),
+                ),
                 const Spacer(),
                 Text(
                   'toplam $_toplamPaket paket · $_toplamTelemetri telemetry',
@@ -522,6 +566,38 @@ class _ActivePoolScreenState extends ConsumerState<ActivePoolScreen>
         return 'beklemede';
       case VpnLifecycleState.stopped:
         return 'durduruldu';
+    }
+  }
+
+  // Sprint 11.0B — WebRTC state color/label helpers (S60).
+  // Same color palette as the VPN state pill for visual
+  // consistency; the dot precedes the label in the status row.
+  static Color _webrtcStateColor(WebRTCState s) {
+    switch (s) {
+      case WebRTCState.connected:
+        return const Color(0xFF22C55E); // green-500
+      case WebRTCState.negotiating:
+        return const Color(0xFFF59E0B); // amber-500
+      case WebRTCState.failed:
+        return const Color(0xFFEF4444); // red-500
+      case WebRTCState.closed:
+      case WebRTCState.idle:
+        return const Color(0xFF9CA3AF); // gray-400
+    }
+  }
+
+  static String _webrtcStateLabel(WebRTCState s) {
+    switch (s) {
+      case WebRTCState.connected:
+        return 'bağlandı';
+      case WebRTCState.negotiating:
+        return 'müzakere';
+      case WebRTCState.failed:
+        return 'hata';
+      case WebRTCState.closed:
+        return 'kapalı';
+      case WebRTCState.idle:
+        return 'beklemede';
     }
   }
 }

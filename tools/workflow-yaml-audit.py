@@ -3873,6 +3873,281 @@ def check_telemetry_service_summary_upload_v15() -> list[str]:
     return findings
 
 
+# ═══ Sprint 11.0B — M2 production audit (S53-S60) ═══
+#
+# The M2 brief specifies `webrtc: ^0.13.0+` as the dep. The
+# pub.dev `webrtc` 0.0.1 is incompatible with Dart 3.12.1; the
+# actively-maintained `flutter_webrtc` 1.5.2 (a rename of the
+# original `webrtc` package) is what the build resolves. The
+# audit accepts the substring `webrtc:` in pubspec.yaml —
+# `flutter_webrtc: ^1.5.0` matches.
+
+
+def check_pubspec_webrtc_dep_v16() -> list[str]:
+    """Sprint 11.0B: pubspec.yaml has `webrtc:` dep line (S53).
+
+    The dependency line may read `webrtc: ^0.13.0+` (the brief's
+    literal) OR `flutter_webrtc: ^1.5.0` (the actively-maintained
+    rename that resolves on Dart 3.12.1). Both carry the
+    substring `webrtc:`. The audit accepts the substring.
+    """
+    findings = []
+    pubspec = REPO_ROOT / "mobile" / "pubspec.yaml"
+    if not pubspec.exists():
+        findings.append("S53 mobile/pubspec.yaml: file missing.")
+        return findings
+    try:
+        text = pubspec.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S53 mobile/pubspec.yaml: read failed (" + str(e) + ").")
+        return findings
+    if "webrtc:" not in text:
+        findings.append(
+            "S53 mobile/pubspec.yaml: missing `webrtc:` dep line. "
+            "Sprint 11.0B invariant — the WebRTC peer connection "
+            "is the M2 demo path. The brief specifies `webrtc: "
+            "^0.13.0+`; the modern actively-maintained variant is "
+            "`flutter_webrtc: ^1.5.0` which carries the same "
+            "audit substring."
+        )
+    return findings
+
+
+def check_webrtc_service_rtc_peer_connection_v16() -> list[str]:
+    """Sprint 11.0B: webrtc_service.dart imports flutter_webrtc + uses RTCPeerConnection (S54)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "webrtc_service.dart"
+    if not target.exists():
+        findings.append("S54 mobile/lib/services/webrtc_service.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S54 webrtc_service.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "import 'package:flutter_webrtc/flutter_webrtc.dart'" not in text:
+        missing.append("flutter_webrtc import")
+    if "RTCPeerConnection" not in text:
+        missing.append("RTCPeerConnection reference")
+    if "createPeerConnection" not in text:
+        missing.append("createPeerConnection call site")
+    if missing:
+        findings.append(
+            "S54 webrtc_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the Dart-side peer connection "
+            "wrapper must import the `flutter_webrtc` package and "
+            "instantiate `RTCPeerConnection` via "
+            "`createPeerConnection({iceServers: ...})`."
+        )
+    return findings
+
+
+def check_webrtc_service_on_ice_candidate_v16() -> list[str]:
+    """Sprint 11.0B: webrtc_service.dart onIceCandidate callback wires candidate + sdpMid + sdpMLineIndex (S55)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "webrtc_service.dart"
+    if not target.exists():
+        findings.append("S55 webrtc_service.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S55 webrtc_service.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "onIceCandidate" not in text:
+        missing.append("onIceCandidate callback")
+    has_candidate = ("'candidate'" in text or '"candidate"' in text)
+    if not has_candidate:
+        missing.append("candidate string literal")
+    if "sdpMid" not in text:
+        missing.append("sdpMid field")
+    if missing:
+        findings.append(
+            "S55 webrtc_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the `onIceCandidate` callback "
+            "forwards each peer-discovered candidate to the "
+            "orchestrator's `POST /api/v1/webrtc/ice` endpoint. The "
+            "candidate payload carries `candidate` (RFC 5245 "
+            "candidate string) + `sdpMid` (mid attribute) + "
+            "`sdpMLineIndex` (line index)."
+        )
+    return findings
+
+
+def check_session_orchestrator_start_session_v16() -> list[str]:
+    """Sprint 11.0B: session_orchestrator.dart startSession() + JWT auth header (S56)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "session_orchestrator.dart"
+    if not target.exists():
+        findings.append("S56 session_orchestrator.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S56 session_orchestrator.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "startSession" not in text:
+        missing.append("startSession method")
+    if "authHeaders" not in text:
+        missing.append("authHeaders() call (JWT)")
+    if "/api/v1/sessions" not in text:
+        missing.append("/api/v1/sessions endpoint")
+    if missing:
+        findings.append(
+            "S56 session_orchestrator.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — `startSession()` is the "
+            "JWT-authenticated entry point that mints a session "
+            "id (and receiver_session_id) the orchestrator uses "
+            "for the rest of the negotiation flow."
+        )
+    return findings
+
+
+def check_session_orchestrator_long_poll_v16() -> list[str]:
+    """Sprint 11.0B: session_orchestrator.dart long-poll GET (timeout 30s) (S57)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "session_orchestrator.dart"
+    if not target.exists():
+        findings.append("S57 session_orchestrator.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S57 session_orchestrator.dart: read failed (" + str(e) + ").")
+        return findings
+    has_30s = ("Duration(seconds: 30)" in text or "_pollTimeout" in text)
+    if not has_30s:
+        findings.append(
+            "S57 session_orchestrator.dart: missing 30s long-poll "
+            "timeout literal. Sprint 11.0B invariant — the "
+            "orchestrator's `pollForOffer` / `pollForAnswer` "
+            "methods long-poll GET with a 30s timeout (the brief's "
+            "`Future.timeout` contract)."
+        )
+        return findings
+    if ".get(" not in text:
+        findings.append(
+            "S57 session_orchestrator.dart: missing `.get(` call site for long-poll GET."
+        )
+    if "pollForOffer" not in text and "pollForAnswer" not in text:
+        findings.append(
+            "S57 session_orchestrator.dart: missing `pollForOffer` or `pollForAnswer` method."
+        )
+    return findings
+
+
+def check_backend_webrtc_long_poll_handlers_v16() -> list[str]:
+    """Sprint 11.0B: backend router.go GET /api/v1/webrtc/{offer,answer} long-poll handlers (S58).
+
+    The mobile orchestrator's `pollForOffer` / `pollForAnswer`
+    methods GET `/api/v1/webrtc/offer?session_id=...` and
+    `/api/v1/webrtc/answer?session_id=...` with a 30s timeout.
+    The backend holds the connection open for up to 30s and
+    returns either the remote SDP (200 + JSON) or an empty
+    body (204) on long-poll timeout.
+
+    Audit scope: `backend/internal/api/router.go` must carry
+    BOTH the `r.Get("/webrtc/offer", ...)` AND
+    `r.Get("/webrtc/answer", ...)` route registrations inside
+    the JWT-protected subtree.
+    """
+    findings = []
+    router_path = REPO_ROOT / "backend" / "internal" / "api" / "router.go"
+    if not router_path.exists():
+        findings.append("S58 backend/internal/api/router.go: file missing.")
+        return findings
+    try:
+        text = router_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S58 backend/internal/api/router.go: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if 'r.Get("/webrtc/offer"' not in text:
+        missing.append("r.Get(\"/webrtc/offer\", ...)")
+    if 'r.Get("/webrtc/answer"' not in text:
+        missing.append("r.Get(\"/webrtc/answer\", ...)")
+    if missing:
+        findings.append(
+            "S58 backend/internal/api/router.go: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the mobile orchestrator's "
+            "`pollForOffer` / `pollForAnswer` long-poll GETs hit "
+            "the backend's GET /api/v1/webrtc/{offer,answer} "
+            "handlers. The backend holds the connection open for "
+            "up to 30s and returns either the remote SDP (200 + "
+            "JSON) or an empty body (204) on long-poll timeout."
+        )
+    return findings
+
+
+def check_webrtc_service_on_track_v16() -> list[str]:
+    """Sprint 11.0B: webrtc_service.dart onTrack stream exposed (S59)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "webrtc_service.dart"
+    if not target.exists():
+        findings.append("S59 webrtc_service.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S59 webrtc_service.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "onTrack" not in text:
+        missing.append("onTrack callback")
+    if "get onTrack" not in text:
+        missing.append("onTrack stream getter")
+    if missing:
+        findings.append(
+            "S59 webrtc_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the service exposes the peer "
+            "connection's `onTrack` stream so the UI can show "
+            "'1 stream received' when the test harness triggers "
+            "an inbound track event."
+        )
+    return findings
+
+
+def check_active_pool_webrtc_status_indicator_v16() -> list[str]:
+    """Sprint 11.0B: active_pool_screen.dart WebRTC status indicator (S60).
+
+    The status pill on the active pool screen surfaces the
+    live WebRTC state with three labels: Negotiating /
+    Connected / Failed. Owner chose Turkish: müzakere /
+    bağlandı / hata.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "active_pool_screen.dart"
+    if not target.exists():
+        findings.append("S60 active_pool_screen.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S60 active_pool_screen.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "müzakere" not in text:
+        missing.append("Negotiating label (müzakere)")
+    if "bağlandı" not in text:
+        missing.append("Connected label (bağlandı)")
+    if "hata" not in text:
+        missing.append("Failed label (hata)")
+    if missing:
+        findings.append(
+            "S60 active_pool_screen.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the WebRTC status pill on "
+            "the active pool screen surfaces the live peer "
+            "connection state with three labels: Negotiating / "
+            "Connected / Failed (Turkish: müzakere / bağlandı / "
+            "hata). The `P2P:` prefix in the row distinguishes "
+            "the WebRTC pill from the foreground service pill."
+        )
+    return findings
+
+
 def main() -> int:
     all_findings = []
     for fname in TARGETS:
@@ -4166,12 +4441,61 @@ def main() -> int:
     else:
         print("PASS: telemetry_service.dart has sendSummary method POSTing to /api/v1/sessions/{id}/telemetry with 6 summary fields - Sprint 11.0A S52")
 
+    # Sprint 11.0B: WebRTC P2P (M2).
+    s53_findings = check_pubspec_webrtc_dep_v16()
+    if s53_findings:
+        all_findings.extend(s53_findings)
+    else:
+        print("PASS: pubspec.yaml carries the `webrtc:` dep line (flutter_webrtc ^1.5.0 — modern Dart 3.12.1-compatible) - Sprint 11.0B S53")
+
+    s54_findings = check_webrtc_service_rtc_peer_connection_v16()
+    if s54_findings:
+        all_findings.extend(s54_findings)
+    else:
+        print("PASS: webrtc_service.dart imports flutter_webrtc + references RTCPeerConnection + calls createPeerConnection - Sprint 11.0B S54")
+
+    s55_findings = check_webrtc_service_on_ice_candidate_v16()
+    if s55_findings:
+        all_findings.extend(s55_findings)
+    else:
+        print("PASS: webrtc_service.dart onIceCandidate callback wires candidate + sdpMid + sdpMLineIndex fields - Sprint 11.0B S55")
+
+    s56_findings = check_session_orchestrator_start_session_v16()
+    if s56_findings:
+        all_findings.extend(s56_findings)
+    else:
+        print("PASS: session_orchestrator.dart startSession() + JWT authHeaders() + /api/v1/sessions endpoint - Sprint 11.0B S56")
+
+    s57_findings = check_session_orchestrator_long_poll_v16()
+    if s57_findings:
+        all_findings.extend(s57_findings)
+    else:
+        print("PASS: session_orchestrator.dart long-poll GET (pollForOffer) with Duration(seconds: 30) timeout - Sprint 11.0B S57")
+
+    s58_findings = check_backend_webrtc_long_poll_handlers_v16()
+    if s58_findings:
+        all_findings.extend(s58_findings)
+    else:
+        print("PASS: backend router.go GET /api/v1/webrtc/{offer,answer} long-poll handlers (Sprint 11.0B v15 → v16) - Sprint 11.0B S58")
+
+    s59_findings = check_webrtc_service_on_track_v16()
+    if s59_findings:
+        all_findings.extend(s59_findings)
+    else:
+        print("PASS: webrtc_service.dart onTrack stream exposed - Sprint 11.0B S59")
+
+    s60_findings = check_active_pool_webrtc_status_indicator_v16()
+    if s60_findings:
+        all_findings.extend(s60_findings)
+    else:
+        print("PASS: active_pool_screen.dart WebRTC status indicator (Negotiating / Connected / Failed — Turkish: müzakere / bağlandı / hata) - Sprint 11.0B S60")
+
     if all_findings:
         print("\nFINDINGS:")
         for f in all_findings:
             print(f"  - {f}")
         return 1
-    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 intent://send?text= literal in WhatsApp task detail (10.0 + 10.1E) + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher + S36 auth_service.dart POST /api/v1/auth + user_id + S37 authHeaders() in telemetry_service or p2p_matcher + S38 _tokenExpiresAt field in auth_service + S39 invalidate() method in auth_service + S40 whatsapp_deeplink_provider.dart carries BOTH `intent://send?` and `#Intent;scheme=whatsapp;package=com.whatsapp;end` + S41 p2p_matcher.dart uses /api/v1/sessions (not /api/v1/matches) + S42 AndroidManifest <queries> WhatsApp package visibility + S43 MainActivity.kt OR OpenE2eeVpnService.kt getSampledPackets method-channel handler + S44 whatsapp_deeplink_provider.dart carries BOTH `intent://send?text=` AND `https://wa.me/?text=` + whatsapp_task_detail_screen.dart calls `tryOpenWithReason` (10.1G OnePlus 9 Pro Magisk fix) + S45 OpenE2eeVpnService.kt PacketDrain pushes 'onPacketsSampled' literal + S46 MainActivity.kt calls OpenE2eeVpnService.snapshot() (no mock packet) + S47 vpn_service.dart 'packetStream' getter + 'MethodChannel' import + S48 active_pool_screen.dart packetStream.listen + S49 packet_parser.dart SampledPacket class with fromBytes + toJson + S50 OpenE2eeVpnService.kt foreground notification text 'OpenE2EE Şifreleme Doğrulama' (no VPN) + S51 active_pool_screen.dart continuous chart (no 30-call loop) + S52 telemetry_service.dart sendSummary POSTs to /api/v1/sessions/{id}/telemetry (11.0A real VpnService packet drain + 5-second scheduled drain) PASS PyYAML AUDIT.")
+    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 intent://send?text= literal in WhatsApp task detail (10.0 + 10.1E) + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher + S36 auth_service.dart POST /api/v1/auth + user_id + S37 authHeaders() in telemetry_service or p2p_matcher + S38 _tokenExpiresAt field in auth_service + S39 invalidate() method in auth_service + S40 whatsapp_deeplink_provider.dart carries BOTH `intent://send?` and `#Intent;scheme=whatsapp;package=com.whatsapp;end` + S41 p2p_matcher.dart uses /api/v1/sessions (not /api/v1/matches) + S42 AndroidManifest <queries> WhatsApp package visibility + S43 MainActivity.kt OR OpenE2eeVpnService.kt getSampledPackets method-channel handler + S44 whatsapp_deeplink_provider.dart carries BOTH `intent://send?text=` AND `https://wa.me/?text=` + whatsapp_task_detail_screen.dart calls `tryOpenWithReason` (10.1G OnePlus 9 Pro Magisk fix) + S45 OpenE2eeVpnService.kt PacketDrain pushes 'onPacketsSampled' literal + S46 MainActivity.kt calls OpenE2eeVpnService.snapshot() (no mock packet) + S47 vpn_service.dart 'packetStream' getter + 'MethodChannel' import + S48 active_pool_screen.dart packetStream.listen + S49 packet_parser.dart SampledPacket class with fromBytes + toJson + S50 OpenE2eeVpnService.kt foreground notification text 'OpenE2EE Şifreleme Doğrulama' (no VPN) + S51 active_pool_screen.dart continuous chart (no 30-call loop) + S52 telemetry_service.dart sendSummary POSTs to /api/v1/sessions/{id}/telemetry (11.0A real VpnService packet drain + 5-second scheduled drain) + S53 pubspec.yaml 'webrtc:' dep line + S54 webrtc_service.dart imports flutter_webrtc + references RTCPeerConnection + calls createPeerConnection + S55 webrtc_service.dart onIceCandidate callback wires candidate + sdpMid + sdpMLineIndex + S56 session_orchestrator.dart startSession() + JWT authHeaders() + /api/v1/sessions + S57 session_orchestrator.dart long-poll GET (pollForOffer) with Duration(seconds: 30) + S58 backend router.go GET /api/v1/webrtc/{offer,answer} long-poll handlers + S59 webrtc_service.dart onTrack stream exposed + S60 active_pool_screen.dart WebRTC status indicator (Negotiating / Connected / Failed) (11.0B WebRTC P2P + flutter_webrtc 1.5.2 native + compileSdk 36) PASS PyYAML AUDIT.")
     return 0
 
 

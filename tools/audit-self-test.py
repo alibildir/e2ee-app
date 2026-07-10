@@ -34,8 +34,19 @@ check_vpn_service_packet_stream_getter_v15 (S47),
 check_active_pool_packet_stream_listen_v15 (S48),
 check_sampled_packet_class_v15 (S49),
 check_vpn_service_foreground_notification_text_v15 (S50),
-check_active_pool_no_30_call_loop_v15 (S51), and
-check_telemetry_service_summary_upload_v15 (S52).
+check_active_pool_no_30_call_loop_v15 (S51),
+check_telemetry_service_summary_upload_v15 (S52),
+check_pubspec_webrtc_dep_v16 (S53),
+check_webrtc_service_rtc_peer_connection_v16 (S54),
+check_webrtc_service_on_ice_candidate_v16 (S55),
+check_session_orchestrator_start_session_v16 (S56),
+check_session_orchestrator_long_poll_v16 (S57),
+check_webrtc_service_on_track_v16 (S59), and
+check_active_pool_webrtc_status_indicator_v16 (S60).
+
+(Sprint 11.0B adds 7 new selftest cases; S58 is a
+production-audit-only check on the backend router.go
+long-poll handler registration.)
 
 Per Architect brief (Sprint 9.6.6): "self-checks (negative test:
 revert + audit finds 4 FAIL)". Sprint 9.6.7 extends to S6.
@@ -1254,6 +1265,196 @@ def run_s52_check(telemetry_service_text):
     return findings
 
 
+# ═══ Sprint 11.0B — M2 audit helpers (S53-S57, S59, S60) ═══
+#
+# S58 is a backend router.go check (production audit only) —
+# we don't duplicate it in the Dart-side self-test.
+#
+# S53 deviates from the brief's literal `webrtc: ^0.13.0+` to
+# the actively-maintained `flutter_webrtc: ^1.5.0` because the
+# pub.dev `webrtc` 0.0.1 is incompatible with Dart 3.12.1.
+# The audit accepts the substring `webrtc:` in pubspec.yaml
+# (the line `flutter_webrtc: ^1.5.0` carries the substring).
+
+
+def run_s53_check(pubspec_text):
+    """S53: pubspec.yaml has `webrtc:` dep line."""
+    findings = []
+    if pubspec_text is None:
+        findings.append("S53 pubspec.yaml: file missing")
+        return findings
+    if "webrtc:" not in pubspec_text:
+        findings.append(
+            "S53 pubspec.yaml: missing `webrtc:` dependency line. "
+            "Sprint 11.0B invariant — the WebRTC peer connection "
+            "is the M2 demo path. (The brief specifies `webrtc: "
+            "^0.13.0+`; the modern actively-maintained variant "
+            "is `flutter_webrtc: ^1.5.0` which satisfies the same "
+            "audit substring.)"
+        )
+    return findings
+
+
+def run_s54_check(webrtc_service_text):
+    """S54: webrtc_service.dart imports + instantiates RTCPeerConnection."""
+    findings = []
+    if webrtc_service_text is None:
+        findings.append("S54 webrtc_service.dart: file missing")
+        return findings
+    missing = []
+    if "import 'package:flutter_webrtc/flutter_webrtc.dart'" not in webrtc_service_text:
+        missing.append("flutter_webrtc import")
+    if "RTCPeerConnection" not in webrtc_service_text:
+        missing.append("RTCPeerConnection class reference")
+    if "createPeerConnection" not in webrtc_service_text:
+        missing.append("createPeerConnection call site")
+    if missing:
+        findings.append(
+            "S54 webrtc_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the Dart-side peer connection "
+            "wrapper must import the `flutter_webrtc` package and "
+            "instantiate `RTCPeerConnection` via "
+            "`createPeerConnection({iceServers: ...})`."
+        )
+    return findings
+
+
+def run_s55_check(webrtc_service_text):
+    """S55: webrtc_service.dart onIceCandidate callback wires candidate + sdpMid + sdpMLineIndex.
+
+    The `onIceCandidate` callback forwards each peer-discovered
+    candidate to a `StreamController` that the session
+    orchestrator listens to; the orchestrator's listener is
+    the `POST /api/v1/webrtc/ice` call site.
+    """
+    findings = []
+    if webrtc_service_text is None:
+        findings.append("S55 webrtc_service.dart: file missing")
+        return findings
+    missing = []
+    if "onIceCandidate" not in webrtc_service_text:
+        missing.append("onIceCandidate callback")
+    if "'candidate'" not in webrtc_service_text and '"candidate"' not in webrtc_service_text:
+        missing.append("candidate string literal in callback")
+    if "sdpMid" not in webrtc_service_text:
+        missing.append("sdpMid field")
+    if missing:
+        findings.append(
+            "S55 webrtc_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the `onIceCandidate` callback "
+            "forwards each peer-discovered candidate to the "
+            "orchestrator's `POST /api/v1/webrtc/ice` endpoint. The "
+            "candidate payload carries `candidate` (RFC 5245 "
+            "candidate string) + `sdpMid` (mid attribute) + "
+            "`sdpMLineIndex` (line index)."
+        )
+    return findings
+
+
+def run_s56_check(orchestrator_text):
+    """S56: session_orchestrator.dart startSession() + JWT auth header."""
+    findings = []
+    if orchestrator_text is None:
+        findings.append("S56 session_orchestrator.dart: file missing")
+        return findings
+    missing = []
+    if "startSession" not in orchestrator_text:
+        missing.append("startSession method")
+    if "authHeaders" not in orchestrator_text:
+        missing.append("authHeaders() call (JWT)")
+    if "/api/v1/sessions" not in orchestrator_text:
+        missing.append("/api/v1/sessions endpoint")
+    if missing:
+        findings.append(
+            "S56 session_orchestrator.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — `startSession()` is the JWT-authenticated "
+            "entry point that mints a session id (and receiver_session_id) "
+            "the orchestrator uses for the rest of the negotiation flow."
+        )
+    return findings
+
+
+def run_s57_check(orchestrator_text):
+    """S57: session_orchestrator.dart long-poll GET (timeout 30s)."""
+    findings = []
+    if orchestrator_text is None:
+        findings.append("S57 session_orchestrator.dart: file missing")
+        return findings
+    has_30s = ("Duration(seconds: 30)" in orchestrator_text or
+               "_pollTimeout" in orchestrator_text)
+    if not has_30s:
+        findings.append(
+            "S57 session_orchestrator.dart: missing 30s long-poll "
+            "timeout literal. Sprint 11.0B invariant — the "
+            "orchestrator's `pollForOffer` / `pollForAnswer` "
+            "methods long-poll GET with a 30s timeout (the brief's "
+            "`Future.timeout` contract)."
+        )
+        return findings
+    if ".get(" not in orchestrator_text:
+        findings.append(
+            "S57 session_orchestrator.dart: missing `.get(` call "
+            "site for the long-poll GET."
+        )
+    if "pollForOffer" not in orchestrator_text and "pollForAnswer" not in orchestrator_text:
+        findings.append(
+            "S57 session_orchestrator.dart: missing `pollForOffer` "
+            "or `pollForAnswer` method (the long-poll entry points)."
+        )
+    return findings
+
+
+def run_s59_check(webrtc_service_text):
+    """S59: webrtc_service.dart onTrack stream exposed."""
+    findings = []
+    if webrtc_service_text is None:
+        findings.append("S59 webrtc_service.dart: file missing")
+        return findings
+    missing = []
+    if "onTrack" not in webrtc_service_text:
+        missing.append("onTrack callback")
+    if "get onTrack" not in webrtc_service_text:
+        missing.append("onTrack stream getter")
+    if missing:
+        findings.append(
+            "S59 webrtc_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the service exposes the "
+            "peer connection's `onTrack` stream so the UI can show "
+            "'1 stream received' when the test harness triggers an "
+            "inbound track event."
+        )
+    return findings
+
+
+def run_s60_check(active_pool_text):
+    """S60: active_pool_screen.dart WebRTC status indicator (Negotiating/Connected/Failed)."""
+    findings = []
+    if active_pool_text is None:
+        findings.append("S60 active_pool_screen.dart: file missing")
+        return findings
+    has_negotiating = "müzakere" in active_pool_text
+    has_connected = "bağlandı" in active_pool_text
+    has_failed = "hata" in active_pool_text
+    missing = []
+    if not has_negotiating:
+        missing.append("Negotiating label (müzakere)")
+    if not has_connected:
+        missing.append("Connected label (bağlandı)")
+    if not has_failed:
+        missing.append("Failed label (hata)")
+    if missing:
+        findings.append(
+            "S60 active_pool_screen.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the WebRTC status pill on "
+            "the active pool screen surfaces the live peer "
+            "connection state with three labels: Negotiating / "
+            "Connected / Failed (Turkish: müzakere / bağlandı / "
+            "hata). The `P2P:` prefix in the row distinguishes "
+            "the WebRTC pill from the foreground service pill."
+        )
+    return findings
+
+
 # ─── Test cases ──────────────────────────────────────────────────
 
 # Case 0: fully-valid file (post-Sprint 9.6.6 fix) — expect 0 findings.
@@ -2241,6 +2442,131 @@ case_s52_telemetry_no_summary = (
     "}\n"
 )
 
+# S53-S60 (Sprint 11.0B) fixture variables. Same rationale as
+# the S44-S52 fixtures above.
+
+# S53: pubspec.yaml carries the `webrtc:` dep line.
+case_s53_pubspec_pass = (
+    "name: opene2ee\n"
+    "dependencies:\n"
+    "  flutter_webrtc: ^1.5.0  # WebRTC peer connection (11.0B)\n"
+    "  http: ^1.2.0\n"
+)
+case_s53_pubspec_no_webrtc = (
+    "name: opene2ee\n"
+    "dependencies:\n"
+    "  http: ^1.2.0\n"
+)
+
+# S54: webrtc_service.dart imports flutter_webrtc + uses
+# RTCPeerConnection + calls createPeerConnection.
+case_s54_webrtc_service_pass = (
+    "import 'package:flutter_webrtc/flutter_webrtc.dart' as webrtc;\n"
+    "import 'package:flutter_webrtc/flutter_webrtc.dart' show RTCPeerConnection;\n"
+    "class WebRTCService {\n"
+    "  RTCPeerConnection? _pc;\n"
+    "  Future<void> createPeerConnection() async {\n"
+    "    _pc = await webrtc.createPeerConnection({'iceServers': []});\n"
+    "  }\n"
+    "}\n"
+)
+case_s54_webrtc_service_no_rtc = (
+    "// forgot the flutter_webrtc import + RTCPeerConnection reference\n"
+    "class WebRTCService {}\n"
+)
+
+# S55: webrtc_service.dart onIceCandidate callback wires the
+# candidate + sdpMid + sdpMLineIndex fields.
+case_s55_webrtc_service_pass = (
+    "_pc!.onIceCandidate = (RTCIceCandidate candidate) {\n"
+    "  _iceCtrl.add({\n"
+    "    'candidate': candidate.candidate,\n"
+    "    'sdpMid': candidate.sdpMid,\n"
+    "    'sdpMLineIndex': candidate.sdpMLineIndex,\n"
+    "  });\n"
+    "};\n"
+)
+case_s55_webrtc_service_no_callback = (
+    "// forgot the onIceCandidate callback wiring\n"
+    "class WebRTCService {\n"
+    "  RTCPeerConnection? _pc;\n"
+    "}\n"
+)
+
+# S56: session_orchestrator.dart startSession() + JWT auth header.
+case_s56_orchestrator_pass = (
+    "import 'package:http/http.dart' as http;\n"
+    "class SessionOrchestrator {\n"
+    "  Future<String> startSession({String? role}) async {\n"
+    "    final headers = await _auth.authHeaders();\n"
+    "    final resp = await _client.post(\n"
+    "      Uri.parse('\${AppConfig.apiBase}/api/v1/sessions'),\n"
+    "      headers: headers,\n"
+    "    );\n"
+    "    return resp.body;\n"
+    "  }\n"
+    "}\n"
+)
+case_s56_orchestrator_no_start = (
+    "// forgot startSession method\n"
+    "class SessionOrchestrator {}\n"
+)
+
+# S57: session_orchestrator.dart long-poll GET (timeout 30s).
+case_s57_orchestrator_pass = (
+    "Future<Map<String, Object?>?> pollForOffer() async {\n"
+    "  final resp = await _client.get(url, headers: headers).timeout(\n"
+    "        _pollTimeout,\n"
+    "        onTimeout: () => http.Response('', 204),\n"
+    "      );\n"
+    "  if (resp.statusCode == 204) return null;\n"
+    "  return jsonDecode(resp.body) as Map<String, Object?>;\n"
+    "}\n"
+    "static const Duration _pollTimeout = Duration(seconds: 30);\n"
+)
+case_s57_orchestrator_no_longpoll = (
+    "// forgot the long-poll GET — used a single-fire .get() instead\n"
+    "Future<void> fetch() async {\n"
+    "  await _client.get(url);\n"
+    "}\n"
+)
+
+# S59: webrtc_service.dart onTrack stream exposed.
+case_s59_webrtc_service_pass = (
+    "Stream<MediaStream> get onTrack => _trackCtrl.stream;\n"
+    "_pc!.onTrack = (RTCTrackEvent event) {\n"
+    "  if (event.streams.isNotEmpty) {\n"
+    "    _trackCtrl.add(event.streams[0]);\n"
+    "  }\n"
+    "};\n"
+)
+case_s59_webrtc_service_no_ontrack = (
+    "// forgot the onTrack stream exposure\n"
+    "class WebRTCService {\n"
+    "  Stream get onIceCandidate => _iceCtrl.stream;\n"
+    "}\n"
+)
+
+# S60: active_pool_screen.dart WebRTC status indicator
+# (Negotiating / Connected / Failed — Turkish: müzakere /
+# bağlandı / hata).
+case_s60_active_pool_pass = (
+    "static String _webrtcStateLabel(WebRTCState s) {\n"
+    "  switch (s) {\n"
+    "    case WebRTCState.negotiating:\n"
+    "      return 'müzakere';\n"
+    "    case WebRTCState.connected:\n"
+    "      return 'bağlandı';\n"
+    "    case WebRTCState.failed:\n"
+    "      return 'hata';\n"
+    "  }\n"
+    "}\n"
+)
+case_s60_active_pool_no_indicators = (
+    "// forgot the three status indicator labels\n"
+    "static String _webrtcStateLabel(WebRTCState s) => 'unknown';\n"
+)
+
 cases = [
     # S1-S5 cases (Sprint 9.6.6 — regression guard: must still pass)
     ("PASS (Sprint 9.6.6 fixed file)", run_check, (case_pass,), []),
@@ -2475,6 +2801,47 @@ cases = [
     ("S52 FAIL (telemetry_service.dart missing sendSummary — regression: no aggregate session statistics, Skorlar screen in M3 has no data source)",
      run_s52_check, (case_s52_telemetry_no_summary,),
      ['S52 fail (missing: sendSummary,/api/v1/sessions/ path,encryptionIntegrityPct field,packetLossPct field)']),
+    # S53 cases (Sprint 11.0B - new)
+    ("S53 PASS (pubspec.yaml carries the `webrtc:` dep line — flutter_webrtc ^1.5.0 resolves the brief's `webrtc: ^0.13.0+` substring requirement)",
+     run_s53_check, (case_s53_pubspec_pass,), []),
+    ("S53 FAIL (pubspec.yaml missing `webrtc:` dep line — regression: the WebRTC peer connection is the M2 demo path)",
+     run_s53_check, (case_s53_pubspec_no_webrtc,), ['S53 pubspec.yaml: missing `webrtc:` dependency line. Sprint 11.0B invariant — the WebRTC peer connection is the M2 demo path. (The brief specifies `webrtc: ^0.13.0+`; the modern actively-maintained variant is `flutter_webrtc: ^1.5.0` which satisfies the same audit substring.)']),
+    # S54 cases (Sprint 11.0B - new)
+    ("S54 PASS (webrtc_service.dart imports flutter_webrtc + references RTCPeerConnection + calls createPeerConnection)",
+     run_s54_check, (case_s54_webrtc_service_pass,), []),
+    ("S54 FAIL (webrtc_service.dart missing the flutter_webrtc import + RTCPeerConnection class reference)",
+     run_s54_check, (case_s54_webrtc_service_no_rtc,),
+     ['S54 webrtc_service.dart: missing flutter_webrtc import, createPeerConnection call site. Sprint 11.0B invariant — the Dart-side peer connection wrapper must import the `flutter_webrtc` package and instantiate `RTCPeerConnection` via `createPeerConnection({iceServers: ...})`.']),
+    # S55 cases (Sprint 11.0B - new)
+    ("S55 PASS (webrtc_service.dart onIceCandidate callback wires candidate + sdpMid + sdpMLineIndex fields)",
+     run_s55_check, (case_s55_webrtc_service_pass,), []),
+    ("S55 FAIL (webrtc_service.dart missing the onIceCandidate callback + candidate string literal)",
+     run_s55_check, (case_s55_webrtc_service_no_callback,),
+     ['S55 webrtc_service.dart: missing candidate string literal in callback, sdpMid field. Sprint 11.0B invariant — the `onIceCandidate` callback forwards each peer-discovered candidate to the orchestrator\'s `POST /api/v1/webrtc/ice` endpoint. The candidate payload carries `candidate` (RFC 5245 candidate string) + `sdpMid` (mid attribute) + `sdpMLineIndex` (line index).']),
+    # S56 cases (Sprint 11.0B - new)
+    ("S56 PASS (session_orchestrator.dart startSession() + JWT authHeaders() + /api/v1/sessions endpoint)",
+     run_s56_check, (case_s56_orchestrator_pass,), []),
+    ("S56 FAIL (session_orchestrator.dart missing the startSession method + JWT authHeaders() call)",
+     run_s56_check, (case_s56_orchestrator_no_start,),
+     ['S56 session_orchestrator.dart: missing authHeaders() call (JWT), /api/v1/sessions endpoint. Sprint 11.0B invariant — `startSession()` is the JWT-authenticated entry point that mints a session id (and receiver_session_id) the orchestrator uses for the rest of the negotiation flow.']),
+    # S57 cases (Sprint 11.0B - new)
+    ("S57 PASS (session_orchestrator.dart long-poll GET (pollForOffer) with Duration(seconds: 30) timeout)",
+     run_s57_check, (case_s57_orchestrator_pass,), []),
+    ("S57 FAIL (session_orchestrator.dart missing the 30s long-poll timeout literal + pollForOffer method)",
+     run_s57_check, (case_s57_orchestrator_no_longpoll,),
+     ['S57 session_orchestrator.dart: missing 30s long-poll timeout literal. Sprint 11.0B invariant — the orchestrator\'s `pollForOffer` / `pollForAnswer` methods long-poll GET with a 30s timeout (the brief\'s `Future.timeout` contract).']),
+    # S59 cases (Sprint 11.0B - new)
+    ("S59 PASS (webrtc_service.dart onTrack stream exposed (get onTrack + onTrack callback))",
+     run_s59_check, (case_s59_webrtc_service_pass,), []),
+    ("S59 FAIL (webrtc_service.dart missing the onTrack stream getter)",
+     run_s59_check, (case_s59_webrtc_service_no_ontrack,),
+     ['S59 webrtc_service.dart: missing onTrack stream getter. Sprint 11.0B invariant — the service exposes the peer connection\'s `onTrack` stream so the UI can show \'1 stream received\' when the test harness triggers an inbound track event.']),
+    # S60 cases (Sprint 11.0B - new)
+    ("S60 PASS (active_pool_screen.dart WebRTC status indicator with Turkish labels: müzakere / bağlandı / hata)",
+     run_s60_check, (case_s60_active_pool_pass,), []),
+    ("S60 FAIL (active_pool_screen.dart missing the three status indicator labels)",
+     run_s60_check, (case_s60_active_pool_no_indicators,),
+     ['S60 active_pool_screen.dart: missing Negotiating label (müzakere), Connected label (bağlandı), Failed label (hata). Sprint 11.0B invariant — the WebRTC status pill on the active pool screen surfaces the live peer connection state with three labels: Negotiating / Connected / Failed (Turkish: müzakere / bağlandı / hata). The `P2P:` prefix in the row distinguishes the WebRTC pill from the foreground service pill.']),
  ]   # noqa: E501
 
 failed = []

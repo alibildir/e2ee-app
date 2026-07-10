@@ -6,7 +6,14 @@ plugins {
 
 android {
     namespace = "com.opene2ee.opene2ee"
-    compileSdk = flutter.compileSdkVersion
+    // Sprint 11.0B — flutter_webrtc 0.13.x requires compileSdk >= 36.
+    // The flutter.compileSdkVersion default is 35; we override to 36
+    // here so the plugin's `peer_connection_factory` native ABI loads
+    // without a `:app:compileDebugKotlin` warning cascade. The
+    // targetSdk stays at flutter.targetSdkVersion (35) so the
+    // Android 14+ foreground service type variety behavior (Sprint
+    // 11.0A) is unchanged.
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {

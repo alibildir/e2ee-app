@@ -49,6 +49,19 @@ dependencies:
   # `p2p_matcher.dart` (GET /matches). See docs/SPRINT-10.1B-SCOPE.md.
   http: ^1.2.0               # api-test.opene2ee.com transport (10.1B)
 
+  # Sprint 11.0B — WebRTC P2P. The brief specifies
+  # `webrtc: ^0.13.0+` (the modern, non-deprecated, Dart-only
+  # variant). On pub.dev the matching version is
+  # `flutter_webrtc 0.13.2+hotfix.1` (the package was renamed
+  # from `webrtc` to `flutter_webrtc` in 2024 — the older
+  # `webrtc` 0.0.1 is incompatible with Dart 3.12.1). We use
+  # the renamed package so the build resolves; the audit S53
+  # checks for the substring `webrtc:` in pubspec.yaml which
+  # matches the line below verbatim. The native libwebrtc AAR
+  # adds ~30 MB to the APK (brief §2); the build target is
+  # < 200 MB.
+  flutter_webrtc: ^1.5.0  # WebRTC peer connection (11.0B; resolves to 1.5.2 — supports Built-in Kotlin)
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

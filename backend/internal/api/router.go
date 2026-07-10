@@ -143,6 +143,14 @@ func (a *API) buildRouter() http.Handler {
 
 			// webrtc signalling (Sprint 3 PR-21a)
 			r.Get("/webrtc/config", a.handleWebRTCConfig())
+			// Sprint 11.0B — long-poll GETs for offer/answer. The
+			// mobile session orchestrator calls these with a 30s
+			// timeout; the backend holds the connection open
+			// until either the peer posts the counterpart SDP
+			// (returns 200 + JSON body) or the long-poll window
+			// expires (returns 204 + empty body). S58 invariant.
+			r.Get("/webrtc/offer", a.handleWebRTCOfferLongPoll())
+			r.Get("/webrtc/answer", a.handleWebRTCAnswerLongPoll())
 			r.Post("/webrtc/offer", a.handleWebRTCOffer())
 			r.Post("/webrtc/answer", a.handleWebRTCAnswer())
 			r.Post("/webrtc/ice", a.handleWebRTCICE())
