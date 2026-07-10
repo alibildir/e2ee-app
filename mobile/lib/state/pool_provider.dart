@@ -1,6 +1,7 @@
 // mobile/lib/state/pool_provider.dart
 //
-// Sprint 10.1C — UI debug görünürlüğü + integration.
+// Sprint 10.1C + 10.1E — UI debug görünürlüğü + integration +
+// backend endpoint fix.
 //
 // What changed vs. 10.1A
 // ----------------------
@@ -19,8 +20,8 @@
 //                              successful call.
 //          - `lastSuccess`   : human-readable summary of the last
 //                              successful call (e.g. "12 paket
-//                              alındı", "Eşleşme: rcs (peer
-//                              sess-abc12345)"). Cleared on next
+//                              alındı", "Eşleşme bulundu:
+//                              sess-abc1…"). Cleared on next
 //                              error.
 //          - `isLoading`     : true while an API call is in
 //                              flight; the screen uses it for a
@@ -35,13 +36,27 @@
 //                              Surfaced in debug builds as "API
 //                              çağrı sayısı: {n}".
 //
+// 10.1E — P2P matcher endpoint fix
+// --------------------------------
+// The 10.1B/10.1D `P2PMatcher.findMatch()` called
+// `GET /api/v1/matches`, which 404'd because the backend never
+// had that route (verified in `router.go` — only
+// auth, matrix, sessions, telemetry, webrtc, users are
+// exposed). 10.1E replaces the call with
+// `P2PMatcher.findActiveReceivers(selfDeviceId)` which polls
+// `GET /api/v1/sessions` and filters to `status=active`,
+// `role=receiver`, `device_id_hash != self` on the mobile side
+// (brief option C — backend untouched). The first surviving id
+// is the peer for the current tick.
+//
 // Why this sprint
 // ---------------
 // Owner feedback (10.07.2026 22:21): "çalışıp çalışmadığını
 // arayüzden anlayamadım hiç tepki yok gibi". The 10.1A mock
 // ticker made the screen look alive, but the user couldn't
 // tell whether the underlying API was being hit. 10.1C makes
-// every API call observable.
+// every API call observable. 10.1E fixes the silent 404 by
+// pointing the matcher at a route that actually exists.
 //
 // Audit gaps closed
 // -----------------
@@ -57,7 +72,9 @@
 // string), not the device installation id, IMEI, MSISDN, or
 // any user identifier. The VpnService returns MASKED IP
 // metadata — the original IP bytes never leave the device
-// (ADR-0006).
+// (ADR-0006). The mobile-side filter only inspects
+// `device_id_hash` (a server-side salted hash, NOT a raw device
+// id) when comparing against the caller.
 
 import 'dart:async';
 
@@ -265,8 +282,15 @@ class PoolNotifier extends StateNotifier<PoolState> {
       apiCallCount: state.apiCallCount + 1,
     );
     try {
-      // 1. P2P match poll.
-      final match = await _matcher.findMatch(_sessionId);
+      // 1. P2P match poll. Sprint 10.1E — was
+      //    `_matcher.findMatch(_sessionId)` (returned
+      //    `MatchResult?`). Now `_matcher.findActiveReceivers(...)`
+      //    returns a `List<String>` of active-receiver session
+      //    ids other than ourselves (the backend has no
+      //    `/api/v1/matches` route; we use `/api/v1/sessions` and
+      //    filter on-device). The first id is the peer for this
+      //    tick.
+      final peers = await _matcher.findActiveReceivers(_sessionId);
       // 2. Drain the VPN ring + push to telemetry if non-empty.
       final samples = await _vpn.getSampledPackets();
       if (samples.isNotEmpty) {
@@ -278,15 +302,13 @@ class PoolNotifier extends StateNotifier<PoolState> {
         );
       }
       final ts = DateTime.now();
-      final transport = match?.transport ?? 'yok';
       state = state.copyWith(
         isLoading: false,
         sonGuncelleme: ts,
         lastUpdate: ts,
         clearLastError: true,
-        lastSuccess: match != null
-            ? 'Eşleşme bulundu: $transport (peer '
-                '${match.peerSessionId.substring(0, match.peerSessionId.length.clamp(0, 8))}…)'
+        lastSuccess: peers.isNotEmpty
+            ? 'Eşleşme bulundu: ${peers.first.substring(0, peers.first.length.clamp(0, 8))}…'
             : 'Eşleşme kontrol edildi: yok (${samples.length} paket)',
       );
     } catch (e) {

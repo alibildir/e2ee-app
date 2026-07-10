@@ -222,6 +222,25 @@ Verifies:
         auth_service.dart (S39) — the 401-retry contract.
         Downstream services call `_auth.invalidate()` when the
         backend rejects the JWT; the next call re-auths.
+  30. **Sprint 10.1E:** WhatsApp deep link Android Intent
+        format in `whatsapp_deeplink_provider.dart` (S40) — the
+        `whatsapp_deeplink_provider.dart` file must carry BOTH
+        the `intent://send?` prefix AND the
+        `#Intent;scheme=whatsapp;package=com.whatsapp;end` suffix
+        literal. Sprint 10.0's `whatsapp://send?text=` scheme was
+        unreliable on Android (MIUI / OEM ROMs silently no-op'd
+        the launch); the new Android Intent URI forces
+        PackageManager to route to the WhatsApp package. Both
+        halves of the URI are load-bearing — dropping either
+        makes the launch silently no-op.
+  31. **Sprint 10.1E:** P2PMatcher uses `/api/v1/sessions`
+        (S41) — the `p2p_matcher.dart` file must contain the
+        literal `/api/v1/sessions` AND must NOT contain the
+        literal `/api/v1/matches` (the 10.1B/10.1D path that
+        404'd because the backend never had that route).
+        Mobile-side filter (status=active, role=receiver,
+        device_id_hash != self) replaces the missing server-side
+        match endpoint per the brief's option C.
 """
 import json
 import re
@@ -2376,30 +2395,37 @@ def check_no_vpn_string_in_sprint10_ui() -> list[str]:
 
 
 def check_whatsapp_deeplink_literal_present() -> list[str]:
-    """Sprint 10.0: whatsapp deep link literal in WhatsApp task detail (S26).
+    """Sprint 10.0 + 10.1E: whatsapp deep link literal in WhatsApp task detail (S26).
 
-    The WhatsApp task detail screen must invoke WhatsApp via the
-    `whatsapp://send?text=` deep link so the prepared message is
-    pre-filled in the user's WhatsApp composer. Replacing this with
-    a different scheme (e.g. a custom intent or a server-side
-    out-of-band delivery) is a Sprint 10.x product decision and
-    should require an explicit scope change.
+    The WhatsApp task detail screen must invoke WhatsApp via a
+    deep link so the prepared message is pre-filled in the user's
+    WhatsApp composer. Sprint 10.0 used the `whatsapp://send?text=`
+    scheme; Sprint 10.1E switched to the Android Intent URI
+    `intent://send?text=<encoded>#Intent;scheme=whatsapp;package=com.whatsapp;end`
+    because the old scheme was silently no-op'd on some Android OEM
+    ROMs (verified by Owner directive 10.07.2026). Replacing the
+    new scheme with a different intent format is a Sprint 10.x
+    product decision and should require an explicit scope change.
 
     Audit scope: `mobile/lib/screens/whatsapp_task_detail_screen.dart`
-    must contain the substring `whatsapp://send?text=`. The audit
-    also accepts the substring inside a comment because the
-    intent is to enforce *visibility* of the scheme choice, not
-    to enforce a particular Dart API surface.
+    must contain the substring `intent://send?text=` (the new
+    Android Intent prefix). The audit also accepts the substring
+    inside a comment / docstring because the intent is to enforce
+    *visibility* of the scheme choice, not to enforce a particular
+    Dart API surface. S40 (in `whatsapp_deeplink_provider.dart`)
+    enforces the construction-side invariants — the screen
+    documents the scheme, the provider builds the actual URI.
     """
     findings = []
     target = REPO_ROOT / "mobile" / "lib" / "screens" / "whatsapp_task_detail_screen.dart"
-    needle = "whatsapp://send?text="
+    needle = "intent://send?text="
     if not target.exists():
         findings.append(
             "S26 mobile/lib/screens/whatsapp_task_detail_screen.dart: "
-            "file missing. Sprint 10.0 invariant — the WhatsApp task "
-            "detail screen is the entry point for the whatsapp://send?text= "
-            "deep link."
+            "file missing. Sprint 10.1E invariant — the WhatsApp task "
+            "detail screen is the entry point for the "
+            "intent://send?text=...#Intent;scheme=whatsapp;package=com.whatsapp;end "
+            "Android Intent deep link."
         )
         return findings
     try:
@@ -2413,9 +2439,145 @@ def check_whatsapp_deeplink_literal_present() -> list[str]:
     if needle not in text:
         findings.append(
             "S26 mobile/lib/screens/whatsapp_task_detail_screen.dart: "
-            "missing the literal `whatsapp://send?text=`. Sprint 10.0 "
+            "missing the literal `intent://send?text=`. Sprint 10.1E "
             "invariant — the deep link scheme is the contract for the "
-            "WhatsApp task."
+            "WhatsApp task. The 10.0 `whatsapp://send?text=` scheme "
+            "was unreliable on Android (MIUI / OEM ROMs silently "
+            "no-op'd the launch); the new Android Intent format "
+            "forces PackageManager to route to the WhatsApp package."
+        )
+    return findings
+
+
+def check_whatsapp_deeplink_intent_format() -> list[str]:
+    """Sprint 10.1E: WhatsApp deep link Android Intent format (S40).
+
+    The 10.0 `whatsapp://send?text=` scheme was unreliable on
+    Android (silently no-op'd on some OEM ROMs, notably Xiaomi
+    MIUI). Sprint 10.1E replaces it with the Android Intent URI
+        intent://send?text=<URL-ENCODED-MESSAGE>#Intent;scheme=whatsapp;package=com.whatsapp;end
+    so PackageManager is forced to route the intent to the
+    WhatsApp package. The phone= parameter is optional (Owner
+    did not ask for it); only the text= parameter is required.
+
+    Both halves of the URI are load-bearing: dropping either
+    makes the launch silently no-op. S40 verifies the provider
+    file carries BOTH literals (regression guard for a future
+    sprint that tries to "simplify" the URI back to the
+    unreliable 10.0 form).
+
+    Audit scope: `mobile/lib/state/whatsapp_deeplink_provider.dart`
+    must contain BOTH the `intent://send?` literal AND the
+    `#Intent;scheme=whatsapp;package=com.whatsapp;end` fragment
+    literal. The screen file (S26) is checked separately — the
+    screen documents the scheme, the provider builds the URI.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "state" / "whatsapp_deeplink_provider.dart"
+    prefix_needle = "intent://send?"
+    suffix_needle = "#Intent;scheme=whatsapp;package=com.whatsapp;end"
+    if not target.exists():
+        findings.append(
+            "S40 mobile/lib/state/whatsapp_deeplink_provider.dart: "
+            "file missing. Sprint 10.1E invariant — the Android "
+            "Intent URI `intent://send?text=<encoded>#Intent;scheme="
+            "whatsapp;package=com.whatsapp;end` is constructed in "
+            "this file. The 10.0 `whatsapp://send?text=` scheme was "
+            "unreliable on Android (MIUI / OEM ROMs silently no-op'd "
+            "the launch)."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S40 mobile/lib/state/whatsapp_deeplink_provider.dart: "
+            "read failed (" + str(e) + ")."
+        )
+        return findings
+    missing = [n for n in (prefix_needle, suffix_needle) if n not in text]
+    if missing:
+        findings.append(
+            "S40 mobile/lib/state/whatsapp_deeplink_provider.dart: "
+            f"missing required Android Intent literal(s): {', '.join(missing)}. "
+            "Sprint 10.1E invariant — both halves of the URI are "
+            "load-bearing: the `intent://send?` prefix tells Android "
+            "to parse the URI as an Intent, and the "
+            "`#Intent;scheme=whatsapp;package=com.whatsapp;end` "
+            "fragment tells PackageManager which scheme + which "
+            "package to route the intent to. Dropping either makes "
+            "the launch silently no-op. The 10.0 `whatsapp://send?text=` "
+            "scheme was unreliable on Android (Owner directive "
+            "10.07.2026)."
+        )
+    return findings
+
+
+def check_p2p_matcher_sessions_endpoint() -> list[str]:
+    """Sprint 10.1E: P2PMatcher uses /api/v1/sessions (S41).
+
+    The 10.1B/10.1D `P2PMatcher` called `GET /api/v1/matches?sessionId=...`,
+    which 404'd because the OpenE2EE backend never had that route
+    (verified in `router.go` — the real route table is auth, matrix,
+    sessions, telemetry, webrtc, users). Sprint 10.1E replaces it
+    with `GET /api/v1/sessions` (the existing session-list endpoint)
+    and filters to active receivers on the mobile side per the
+    brief's option C.
+
+    S41 verifies the p2p_matcher has the new endpoint literal AND
+    does NOT have the old `/api/v1/matches` literal. The negative
+    check prevents a future regression that re-introduces the
+    broken 404 path. (S40 has a similar negative-AND-positive
+    pattern for the WhatsApp Intent URI; we use the same shape
+    here so a future maintainer reading either S40 or S41 sees
+    the same audit-recipe style.)
+
+    Audit scope: `mobile/lib/services/p2p_matcher.dart` must
+    contain the literal `/api/v1/sessions` AND must NOT contain
+    the literal `/api/v1/matches`.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "p2p_matcher.dart"
+    new_needle = "/api/v1/sessions"
+    forbidden_needle = "/api/v1/matches"
+    if not target.exists():
+        findings.append(
+            "S41 mobile/lib/services/p2p_matcher.dart: file missing. "
+            "Sprint 10.1E invariant — the mobile-side active-receiver "
+            "filter calls `GET /api/v1/sessions` (replaces the 10.1B "
+            "`/api/v1/matches` path that 404'd because the backend "
+            "never had that route)."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S41 mobile/lib/services/p2p_matcher.dart: read failed ("
+            + str(e) + ")."
+        )
+        return findings
+    if new_needle not in text:
+        findings.append(
+            "S41 mobile/lib/services/p2p_matcher.dart: missing the "
+            "literal `/api/v1/sessions`. Sprint 10.1E invariant — "
+            "the mobile-side active-receiver filter calls "
+            "`GET /api/v1/sessions` (the existing session-list "
+            "endpoint) and filters to `status=active`, "
+            "`role=receiver`, `device_id_hash != self` on-device. "
+            "Replaces the 10.1B `/api/v1/matches` path that 404'd "
+            "because the backend never had that route (verified in "
+            "`router.go`)."
+        )
+    if forbidden_needle in text:
+        findings.append(
+            "S41 mobile/lib/services/p2p_matcher.dart: contains the "
+            "FORBIDDEN literal `/api/v1/matches`. Sprint 10.1E "
+            "invariant — the old path 404'd and must not return. "
+            "Replace every reference to `/api/v1/matches` with "
+            "`/api/v1/sessions` and migrate the call shape to the "
+            "mobile-side filter (`status=active`, `role=receiver`, "
+            "`device_id_hash != self`)."
         )
     return findings
 
@@ -3035,12 +3197,12 @@ def main() -> int:
     else:
         print("PASS: mobile/lib/main.dart + mobile/lib/screens/*.dart contain no `vpn` substring (case-insensitive) — Sprint 10.0 S25")
 
-    # Sprint 10.0: whatsapp deep link literal in WhatsApp task detail (S26).
+    # Sprint 10.0 + 10.1E: whatsapp deep link literal in WhatsApp task detail (S26).
     s26_findings = check_whatsapp_deeplink_literal_present()
     if s26_findings:
         all_findings.extend(s26_findings)
     else:
-        print("PASS: mobile/lib/screens/whatsapp_task_detail_screen.dart contains the literal `whatsapp://send?text=` - Sprint 10.0 S26")
+        print("PASS: mobile/lib/screens/whatsapp_task_detail_screen.dart contains the literal `intent://send?text=` - Sprint 10.0 + 10.1E S26")
 
     # Sprint 10.1A: fl_chart LineChart literal in active pool screen (S27).
     s27_findings = check_active_pool_linechart_literal_present()
@@ -3112,12 +3274,26 @@ def main() -> int:
     else:
         print("PASS: mobile/lib/services/auth_service.dart contains `invalidate()` method - Sprint 10.1D S39")
 
+    # Sprint 10.1E: WhatsApp deep link Android Intent format (S40).
+    s40_findings = check_whatsapp_deeplink_intent_format()
+    if s40_findings:
+        all_findings.extend(s40_findings)
+    else:
+        print("PASS: mobile/lib/state/whatsapp_deeplink_provider.dart carries BOTH `intent://send?` prefix and `#Intent;scheme=whatsapp;package=com.whatsapp;end` suffix - Sprint 10.1E S40")
+
+    # Sprint 10.1E: P2PMatcher uses /api/v1/sessions (S41).
+    s41_findings = check_p2p_matcher_sessions_endpoint()
+    if s41_findings:
+        all_findings.extend(s41_findings)
+    else:
+        print("PASS: mobile/lib/services/p2p_matcher.dart uses `/api/v1/sessions` (and does NOT contain the broken `/api/v1/matches`) - Sprint 10.1E S41")
+
     if all_findings:
         print("\nFINDINGS:")
         for f in all_findings:
             print(f"  - {f}")
         return 1
-    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 whatsapp://send?text= literal in WhatsApp task detail + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher + S36 auth_service.dart POST /api/v1/auth + user_id + S37 authHeaders() in telemetry_service or p2p_matcher + S38 _tokenExpiresAt field in auth_service + S39 invalidate() method in auth_service PASS PyYAML AUDIT.")
+    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 intent://send?text= literal in WhatsApp task detail (10.0 + 10.1E) + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher + S36 auth_service.dart POST /api/v1/auth + user_id + S37 authHeaders() in telemetry_service or p2p_matcher + S38 _tokenExpiresAt field in auth_service + S39 invalidate() method in auth_service + S40 whatsapp_deeplink_provider.dart carries BOTH `intent://send?` and `#Intent;scheme=whatsapp;package=com.whatsapp;end` + S41 p2p_matcher.dart uses /api/v1/sessions (not /api/v1/matches) PASS PyYAML AUDIT.")
     return 0
 
 

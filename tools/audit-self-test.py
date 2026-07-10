@@ -22,7 +22,9 @@ check_service_api_key_from_environment (S35),
 check_auth_service_exists (S36),
 check_service_uses_auth_headers (S37),
 check_auth_token_expiry_field (S38), and
-check_auth_invalidate_method (S39).
+check_auth_invalidate_method (S39),
+check_whatsapp_deeplink_intent_format (S40), and
+check_p2p_matcher_sessions_endpoint (S41).
 
 Per Architect brief (Sprint 9.6.6): "self-checks (negative test:
 revert + audit finds 4 FAIL)". Sprint 9.6.7 extends to S6.
@@ -33,6 +35,8 @@ Sprint 10.0 extends to S25-S26.
 Sprint 10.1A extends to S27-S29.
 Sprint 10.1C extends to S33-S35.
 Sprint 10.1D extends to S36-S39.
+Sprint 10.1E extends to S40-S41 (and updates S26 from
+`whatsapp://send?text=` to `intent://send?text=`).
 
 S1-S5 cases: 6 (1 PASS + 5 FAIL, ...).
 S6 cases: 4 (1 PASS + 3 FAIL, ...).
@@ -51,7 +55,7 @@ S18 cases: 2 (1 PASS + 1 FAIL — pubspec.lock not tracked).
 S19 cases: 2 (1 PASS + 1 FAIL — .metadata not tracked).
 S20 cases: 2 (1 PASS + 1 FAIL — pubspec.yaml missing name).
 S25 cases: 2 (1 PASS + 1 FAIL — `vpn` substring in main.dart).
-S26 cases: 2 (1 PASS + 1 FAIL — `whatsapp://send?text=` missing).
+S26 cases: 2 (1 PASS + 1 FAIL — `intent://send?text=` missing).
 S27 cases: 2 (1 PASS + 1 FAIL — `LineChart` literal missing in active pool screen).
 S28 cases: 2 (1 PASS + 1 FAIL — `Timer.periodic` literal missing in pool provider).
 S29 cases: 2 (1 PASS + 1 FAIL — `HapticFeedback`/`SystemSound` literal missing in active pool screen).
@@ -62,8 +66,11 @@ S36 cases: 2 (1 PASS + 1 FAIL — POST /api/v1/auth user_id literals missing in 
 S37 cases: 2 (1 PASS + 1 FAIL — authHeaders() call missing in telemetry/p2p services).
 S38 cases: 2 (1 PASS + 1 FAIL — _tokenExpiresAt field missing in auth_service).
 S39 cases: 2 (1 PASS + 1 FAIL — invalidate() method missing in auth_service).
+S40 cases: 2 (1 PASS + 1 FAIL — `intent://send?` + `#Intent;scheme=whatsapp;package=com.whatsapp;end` literals missing in whatsapp_deeplink_provider).
+S41 cases: 2 (1 PASS + 1 FAIL — /api/v1/sessions literal missing OR forbidden /api/v1/matches still present in p2p_matcher).
+S41 cases: 2 (1 PASS + 1 FAIL — /api/v1/sessions literal missing OR forbidden /api/v1/matches still present in p2p_matcher).
 
-Total: 63 cases.
+Total: 67 cases.
 """
 import sys
 from pathlib import Path
@@ -673,17 +680,21 @@ def run_s25_check(main_text, screens_text):
 
 
 def run_s26_check(whatsapp_screen_text):
-    """Sprint 10.0: whatsapp deep link literal in WhatsApp task detail (S26).
+    """Sprint 10.0 + 10.1E: whatsapp deep link literal in WhatsApp task detail (S26).
 
     Mirrors check_whatsapp_deeplink_literal_present. The file
     `mobile/lib/screens/whatsapp_task_detail_screen.dart` must
-    contain the literal `whatsapp://send?text=`.
+    contain the literal `intent://send?text=` (Sprint 10.1E
+    replaced the 10.0 `whatsapp://send?text=` scheme with the
+    Android Intent URI because the old scheme was unreliable on
+    some Android OEM ROMs — the new scheme forces PackageManager
+    to route to the WhatsApp package).
     """
     findings = []
     if whatsapp_screen_text is None:
         findings.append("S26 fail (file missing)")
         return findings
-    if "whatsapp://send?text=" not in whatsapp_screen_text:
+    if "intent://send?text=" not in whatsapp_screen_text:
         findings.append("S26 fail (literal missing)")
     return findings
 
@@ -868,6 +879,48 @@ def run_s39_check(auth_service_text):
         return findings
     if "invalidate()" not in auth_service_text:
         findings.append("S39 fail (invalidate() method missing)")
+    return findings
+
+
+def run_s40_check(whatsapp_provider_text):
+    """Sprint 10.1E: WhatsApp deep link Android Intent format (S40).
+
+    Mirrors check_whatsapp_deeplink_intent_format. The file
+    `mobile/lib/state/whatsapp_deeplink_provider.dart` must
+    contain BOTH the `intent://send?` prefix literal AND the
+    `#Intent;scheme=whatsapp;package=com.whatsapp;end` suffix
+    literal. Both halves of the URI are load-bearing; dropping
+    either makes the launch silently no-op on Android.
+    """
+    findings = []
+    if whatsapp_provider_text is None:
+        findings.append("S40 fail (file missing)")
+        return findings
+    needles = ("intent://send?", "#Intent;scheme=whatsapp;package=com.whatsapp;end")
+    missing = [n for n in needles if n not in whatsapp_provider_text]
+    if missing:
+        findings.append("S40 fail (missing: " + ",".join(missing) + ")")
+    return findings
+
+
+def run_s41_check(p2p_matcher_text):
+    """Sprint 10.1E: P2PMatcher uses /api/v1/sessions (S41).
+
+    Mirrors check_p2p_matcher_sessions_endpoint. The file
+    `mobile/lib/services/p2p_matcher.dart` must contain the
+    literal `/api/v1/sessions` (the new mobile-side filter
+    endpoint) AND must NOT contain the literal
+    `/api/v1/matches` (the 10.1B/10.1D path that 404'd because
+    the backend never had that route).
+    """
+    findings = []
+    if p2p_matcher_text is None:
+        findings.append("S41 fail (file missing)")
+        return findings
+    if "/api/v1/sessions" not in p2p_matcher_text:
+        findings.append("S41 fail (missing /api/v1/sessions)")
+    if "/api/v1/matches" in p2p_matcher_text:
+        findings.append("S41 fail (forbidden /api/v1/matches still present)")
     return findings
 
 
@@ -1639,9 +1692,9 @@ cases = [
     ("S25 FAIL (main.dart contains the literal `vpn` - regression: future sprint re-introduces VPN framing)",
      run_s25_check, ("void main() { connectVpn(); }\n", "// clean\n"), ["S25 fail (main)"]),
     # S26 cases (Sprint 10.0 - new)
-    ("S26 PASS (whatsapp_task_detail_screen.dart contains the literal `whatsapp://send?text=`)",
-     run_s26_check, ("final uri = 'whatsapp://send?text=hello';\n",), []),
-    ("S26 FAIL (whatsapp_task_detail_screen.dart missing the literal `whatsapp://send?text=`)",
+    ("S26 PASS (whatsapp_task_detail_screen.dart contains the literal `intent://send?text=`)",
+     run_s26_check, ("final uri = 'intent://send?text=hello#Intent;scheme=whatsapp;package=com.whatsapp;end';\n",), []),
+    ("S26 FAIL (whatsapp_task_detail_screen.dart missing the literal `intent://send?text=`)",
      run_s26_check, ("// replaced with custom intent later\n",), ["S26 fail (literal missing)"]),
     # S27 cases (Sprint 10.1A - new)
     ("S27 PASS (active_pool_screen.dart contains the literal `LineChart` from package:fl_chart)",
@@ -1688,11 +1741,32 @@ cases = [
      run_s38_check, ("DateTime? _tokenExpiresAt;\nbool get hasValidToken => _tokenExpiresAt != null;\n",), []),
     ("S38 FAIL (auth_service.dart missing `_tokenExpiresAt` - regression: every protected call re-auths)",
      run_s38_check, ("// expiry tracking field removed; using one-shot token\nString? _cachedToken;\n",), ["S38 fail (_tokenExpiresAt field missing)"]),
-    # S39 cases (Sprint 10.1D - new)
+     # S39 cases (Sprint 10.1D - new)
     ("S39 PASS (auth_service.dart contains `invalidate()` method for 401 retry contract)",
      run_s39_check, ("void invalidate() {\n  _cachedToken = null;\n  _tokenExpiresAt = null;\n}\n",), []),
     ("S39 FAIL (auth_service.dart missing `invalidate()` - regression: 401 leaves stale cached JWT)",
      run_s39_check, ("// flush-on-401 method removed; cached JWT stays until 1h expiry\n",), ["S39 fail (invalidate() method missing)"]),
+    # S40 cases (Sprint 10.1E - new)
+    ("S40 PASS (whatsapp_deeplink_provider.dart carries BOTH `intent://send?` prefix and `#Intent;scheme=whatsapp;package=com.whatsapp;end` suffix)",
+     run_s40_check, (
+         "static Uri buildUri() => Uri.parse(\n"
+         "  'intent://send?text=foo#Intent;scheme=whatsapp;package=com.whatsapp;end',\n"
+         ");\n",), []),
+    ("S40 FAIL (whatsapp_deeplink_provider.dart missing BOTH Android Intent literals - regression: 10.0 whatsapp://send?text= scheme was unreliable on Android)",
+     run_s40_check, (
+         "// forgot both halves of the Android Intent URI, reverted to legacy\n"
+         "static Uri buildUri() => Uri.parse('whatsapp://send?text=foo');\n",),
+     ["S40 fail (missing: intent://send?,#Intent;scheme=whatsapp;package=com.whatsapp;end)"]),
+    # S41 cases (Sprint 10.1E - new)
+    ("S41 PASS (p2p_matcher.dart uses /api/v1/sessions and does NOT contain the broken /api/v1/matches)",
+     run_s41_check, (
+         "final uri = Uri.parse('\${AppConfig.apiBase}/api/v1/sessions');\n"
+         "final resp = await _client.get(uri, headers: headers);\n",), []),
+    ("S41 FAIL (p2p_matcher.dart missing /api/v1/sessions - regression: 10.1B /api/v1/matches 404'd because the backend never had that route)",
+     run_s41_check, (
+         "// reverted to the 10.1B path that 404'd\n"
+         "final uri = Uri.parse('\${AppConfig.apiBase}/api/v1/matches?sessionId=...');\n",),
+     ["S41 fail (missing /api/v1/sessions)", "S41 fail (forbidden /api/v1/matches still present)"]),
 ]   # noqa: E501
 
 failed = []
