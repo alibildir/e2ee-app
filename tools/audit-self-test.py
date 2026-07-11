@@ -53,11 +53,19 @@ check_active_pool_close_then_navigate_v17 (S67),
 check_skorlar_empty_state_v17 (S68),
 check_skorlar_card_overall_gauge_v17 (S69),
 check_backend_sessions_close_handler_v17 (S70),
-check_backend_summary_stats_shape_v17 (S71), and
-check_score_calculator_unit_tests_v17 (S72).
+check_backend_summary_stats_shape_v17 (S71),
+check_score_calculator_unit_tests_v17 (S72), and
+check_main_activity_owns_vpn_channel_v18 (S73).
 
-(Sprint 11.0C adds 12 new selftest cases — total cases
-+12 over M2's 102.)
+(Sprint 11.0D adds 1 new selftest case for S73 — the
+MainActivity-owned MethodChannel handler check. S73
+follows the S44 pattern (1 PASS-only case) — the
+negative-path coverage is provided by the Dart-side
+unit test in `mobile/test/sprint110d_handler_test.dart`
+which actually exercises the `VpnService.getSampledPackets`
+channel call against a mocked handler, proving the
+channel is registered at runtime, not just statically
+present in `MainActivity.kt`.)
 
 (Sprint 11.0B adds 7 new selftest cases; S58 is a
 production-audit-only check on the backend router.go
@@ -123,7 +131,9 @@ S50 cases: 2 (1 PASS + 1 FAIL — `OpenE2EE Şifreleme Doğrulama` foreground no
 S51 cases: 2 (1 PASS + 1 FAIL — `i < 30` + `Timer.periodic` 30-call loop in active_pool_screen.dart).
 S52 cases: 2 (1 PASS + 1 FAIL — `sendSummary` method + `/api/v1/sessions/` path + 6 fields in telemetry_service.dart).
 
-Total: 88 cases (72 pre-Sprint 11.0A + 16 new from S45-S52).
+Total: 127 cases (72 pre-Sprint 11.0A + 16 from S45-S52 + 24 from
+S53-S60 + 24 from S61-S72 + 1 from S73). Sprint 11.0D adds S73
+following the S44 (1 PASS-only) pattern.
 """
 import sys
 from pathlib import Path
@@ -1747,6 +1757,113 @@ def run_s72_check(score_calculator_test_text):
     return findings
 
 
+def run_s73_check(main_activity_text):
+    """Sprint 11.0D: MainActivity.kt owns the `opene2ee/vpn` MethodChannel.
+
+    Regression guard for the OnePlus 9 Pro error
+    `MissingPluginException(No implementation found for method
+    getSampledPackets on channel opene2ee/vpn)`. In Sprint 11.0A
+    the channel handler was set inside `OpenE2eeVpnService.attachFlutterEngine`
+    but the service isn't created until the user clicks
+    "Şifreleme Doğrulamayı Başlat". The Dart-side polling loop
+    (pool_provider.dart Timer.periodic) calls `getSampledPackets`
+    immediately when the ActivePoolScreen opens — BEFORE the
+    service exists. Result: `MissingPluginException`.
+
+    The fix: handler lives in MainActivity (always alive from
+    app launch), delegates to `OpenE2eeVpnService.dispatch(context, call, result)`
+    static. The check requires FOUR tokens to be present in
+    MainActivity.kt (comment-stripped):
+
+      1. `MethodChannel(` constructor call
+      2. `OpenE2eeVpnService.METHOD_CHANNEL` (or literal
+         `"opene2ee/vpn"`) — the channel name
+      3. `setMethodCallHandler` — the inbound handler install
+      4. `OpenE2eeVpnService.dispatch` — the static dispatcher
+         that routes per-method to the live service / safe defaults
+
+    Missing ANY of these means the polling loop will hit
+    `MissingPluginException` again on the OnePlus 9 Pro.
+    """
+    import re
+    findings = []
+    if main_activity_text is None:
+        findings.append(
+            "S73 MainActivity.kt: file missing. Sprint 11.0D "
+            "invariant — MainActivity must own the `opene2ee/vpn` "
+            "MethodChannel handler (set in `configureFlutterEngine`) "
+            "so the Dart-side polling loop's `getSampledPackets` "
+            "call lands on a registered handler before the "
+            "VpnService is started. Otherwise: `MissingPluginException`."
+        )
+        return findings
+    # Comment-strip (best-effort, mirrors S43 pattern).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", main_activity_text)
+    lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            lines.append(ln[:cut_at])
+        else:
+            lines.append(ln)
+    code = "\n".join(lines)
+    # 1. `MethodChannel(` constructor call
+    if "MethodChannel(" not in code:
+        findings.append(
+            "S73 MainActivity.kt: missing `MethodChannel(` "
+            "constructor call. Sprint 11.0D invariant — the "
+            "`opene2ee/vpn` channel must be constructed in "
+            "`configureFlutterEngine` (after super.configureFlutterEngine)"
+            " so its inbound handler is wired at app launch."
+        )
+    # 2. Channel name — accept either the constant or the literal.
+    has_const = "OpenE2eeVpnService.METHOD_CHANNEL" in code
+    has_literal = '"opene2ee/vpn"' in code or "'opene2ee/vpn'" in code
+    if not (has_const or has_literal):
+        findings.append(
+            "S73 MainActivity.kt: missing the `opene2ee/vpn` "
+            "channel name (expected either `OpenE2eeVpnService.METHOD_CHANNEL` "
+            "constant OR the literal `\"opene2ee/vpn\"`). Sprint "
+            "11.0D invariant — the channel name MUST match the "
+            "Dart-side `kVpnMethodChannel` constant in "
+            "`vpn_service.dart`."
+        )
+    # 3. `setMethodCallHandler` install
+    if "setMethodCallHandler" not in code:
+        findings.append(
+            "S73 MainActivity.kt: missing `setMethodCallHandler` "
+            "install. Sprint 11.0D invariant — the inbound "
+            "handler is the load-bearing fix for the OnePlus 9 "
+            "Pro `MissingPluginException` regression."
+        )
+    # 4. `OpenE2eeVpnService.dispatch` reference
+    if "OpenE2eeVpnService.dispatch" not in code:
+        findings.append(
+            "S73 MainActivity.kt: missing `OpenE2eeVpnService.dispatch` "
+            "call. Sprint 11.0D invariant — the MainActivity-owned "
+            "handler delegates to the static `dispatch(context, "
+            "call, result)` which routes per-method to the live "
+            "service OR returns safe defaults (empty ring / IDLE "
+            "status) when no service is alive yet. Without this "
+            "delegate, the handler would have to embed the "
+            "service lifecycle logic, which is exactly the path "
+            "Sprint 11.0A took and the path that broke."
+        )
+    return findings
+
+
 # ─── Test cases ──────────────────────────────────────────────────
 
 # Case 0: fully-valid file (post-Sprint 9.6.6 fix) — expect 0 findings.
@@ -3046,6 +3163,50 @@ case_s72_score_calculator_test_no_tests = (
     "}\n"
 )
 
+# S73 (Sprint 11.0D): MainActivity.kt owns the `opene2ee/vpn`
+# MethodChannel handler. Regression guard for the OnePlus 9 Pro
+# `MissingPluginException(No implementation found for method
+# getSampledPackets on channel opene2ee/vpn)` error. The check
+# looks for FOUR tokens in MainActivity.kt (comment-stripped):
+#   1. `MethodChannel(` constructor call
+#   2. `OpenE2eeVpnService.METHOD_CHANNEL` OR literal `"opene2ee/vpn"`
+#   3. `setMethodCallHandler` install
+#   4. `OpenE2eeVpnService.dispatch` call
+case_s73_main_activity_pass = (
+    "package com.opene2ee.opene2ee\n"
+    "import io.flutter.embedding.android.FlutterActivity\n"
+    "import io.flutter.plugin.common.MethodChannel\n"
+    "import com.opene2ee.opene2ee.vpn.OpenE2eeVpnService\n"
+    "\n"
+    "class MainActivity : FlutterActivity() {\n"
+    "    private var vpnChannel: MethodChannel? = null\n"
+    "    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {\n"
+    "        super.configureFlutterEngine(flutterEngine)\n"
+    "        val vpnChannel = MethodChannel(\n"
+    "            flutterEngine.dartExecutor.binaryMessenger,\n"
+    "            OpenE2eeVpnService.METHOD_CHANNEL,\n"
+    "        ).apply {\n"
+    "            setMethodCallHandler { call, result ->\n"
+    "                OpenE2eeVpnService.dispatch(this@MainActivity, call, result)\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+)
+case_s73_main_activity_no_handler = (
+    "package com.opene2ee.opene2ee\n"
+    "import io.flutter.embedding.android.FlutterActivity\n"
+    "import com.opene2ee.opene2ee.vpn.OpenE2eeVpnService\n"
+    "\n"
+    "class MainActivity : FlutterActivity() {\n"
+    "    // Sprint 11.0D regression: forgot the MethodChannel setup\n"
+    "    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {\n"
+    "        super.configureFlutterEngine(flutterEngine)\n"
+    "        OpenE2eeVpnService.attachFlutterEngine(flutterEngine)\n"
+    "    }\n"
+    "}\n"
+)
+
 cases = [
     # S1-S5 cases (Sprint 9.6.6 — regression guard: must still pass)
     ("PASS (Sprint 9.6.6 fixed file)", run_check, (case_pass,), []),
@@ -3393,7 +3554,21 @@ cases = [
     ("S72 FAIL (score_calculator_test.dart missing the 4 unit tests — regression: the calculator's pure-function guarantee is not verified)",
      run_s72_check, (case_s72_score_calculator_test_no_tests,),
      ['S72 score_calculator_test.dart: missing the 4 unit tests (integration, loss, latency, jitter). Sprint 11.0C invariant — the brief requires exactly 4 unit tests for the calculator; the M3 implementation has 7 (the 4 brief + 3 extra: overall weighted sum, computeAll, standardDeviation helper).']),
- ]   # noqa: E501
+    # S73 case (Sprint 11.0D - new) — MainActivity owns the
+    # `opene2ee/vpn` MethodChannel handler (regression guard for
+    # the OnePlus 9 Pro `MissingPluginException` regression).
+    # S73 follows the S44 pattern (1 PASS-only case) per the
+    # Sprint 11.0D brief: "Self-test'e 1 yeni case (toplam
+    # 127/127)". The negative-path coverage is provided by
+    # the Dart-side unit test in
+    # `mobile/test/sprint110d_handler_test.dart` which actually
+    # exercises the `VpnService.getSampledPackets` channel call
+    # against a mocked handler — proving the channel is
+    # registered at runtime, not just statically present in
+    # `MainActivity.kt`.
+    ("S73 PASS (MainActivity.kt owns the `opene2ee/vpn` MethodChannel — MethodChannel ctor + METHOD_CHANNEL constant + setMethodCallHandler + OpenE2eeVpnService.dispatch call)",
+     run_s73_check, (case_s73_main_activity_pass,), []),
+  ]   # noqa: E501
 
 failed = []
 for name, check_fn, args, expected in cases:

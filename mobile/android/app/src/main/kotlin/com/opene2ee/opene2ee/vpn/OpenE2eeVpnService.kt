@@ -35,6 +35,32 @@
 //                "OpenE2EE Şifreleme Doğrulama" (no "VPN" string
 //                per S25 invariant — S50).
 //
+// Sprint 11.0D — channel ownership moved BACK to MainActivity.
+//                In 11.0A the `opene2ee/vpn` MethodChannel handler
+//                was installed by `attachFlutterEngine` in this
+//                service — but `attachFlutterEngine` only runs
+//                AFTER the service is created (via `onCreate`),
+//                and the service is only created on Dart's `start`
+//                call. The Dart-side `pool_provider.dart` polling
+//                loop calls `vpn.getSampledPackets()` every 5s
+//                starting the moment the ActivePoolScreen is
+//                first opened — BEFORE `start`. Result: OnePlus 9
+//                Pro owner reported `MissingPluginException(No
+//                implementation found for method getSampledPackets
+//                on channel opene2ee/vpn)`. The fix: handler lives
+//                at the activity level (always alive from app
+//                launch), delegates to a new
+//                `OpenE2eeVpnService.dispatch(context, call, result)`
+//                static which routes per-method to the live
+//                service OR returns safe defaults (empty ring /
+//                IDLE status) when no service is alive yet. The
+//                instance `attachFlutterEngine` is preserved (it
+//                now sets the companion `methodChannel` for
+//                outbound `onPacketsSampled` pushes only — no
+//                inbound `setMethodCallHandler`). See S73
+//                invariant: `MainActivity.kt` owns the
+//                `opene2ee/vpn` MethodChannel handler.
+//
 // This file is the canonical Kotlin source for the OpenE2EE Android VPN
 // service. It lives under `mobile/android/app/src/main/kotlin/` so the
 // Android Gradle Plugin picks it up on `./gradlew assembleDebug`. The
@@ -56,6 +82,11 @@
 //                     `VpnService.prepare` first)
 //       "stop"      → flush ring + tear down tunnel + stop foreground
 //       "status"    → snapshot of {state, packetsObserved, ringSize, samplingCap}
+//       "getSampledPackets" → snapshot of the bounded ring
+//                              (Sprint 11.0A; replaces the 10.1F
+//                              mock packet). Safe to call BEFORE
+//                              the service is running — dispatch
+//                              returns an empty list.
 //       "setAllowedApplications" → restrict VPN to a per-app allowlist
 //                                   (Android 5.0+, VpnService.Builder.allowedApplications)
 //       "setDisallowedApplications" → inverse — bypass VPN for these apps
@@ -63,6 +94,8 @@
 //                           (handled by MainActivity; this service exposes
 //                            the helper that returns the intent action)
 // - Channel methods TO Dart:
+//       "onPacketsSampled" → 5-second scheduled push of the bounded
+//                              ring (S45 invariant; Sprint 11.0A)
 //       "onTelemetry" → final flush of ring + capture timestamp
 //       "onError"     → TUN/protocol errors with a code + message
 //
@@ -116,6 +149,7 @@ import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -299,6 +333,167 @@ class OpenE2eeVpnService : VpnService() {
             val instance = activeInstance ?: return null
             return instance.snapshotRing()
         }
+
+        /**
+         * Sprint 11.0D — single entry point for ALL Dart → service
+         * MethodChannel calls. MainActivity's `opene2ee/vpn`
+         * MethodChannel handler is a thin wrapper that calls this
+         * method:
+         *
+         *   vpnChannel.setMethodCallHandler { call, result ->
+         *       OpenE2eeVpnService.dispatch(this, call, result)
+         *   }
+         *
+         * This is the fix for the Sprint 11.0A regression where the
+         * channel handler lived inside the service: Dart polled
+         * `getSampledPackets` before the service was started (i.e.
+         * before the user clicked "Şifreleme Doğrulamayı Başlat"),
+         * the handler was never installed, and Dart got
+         * `MissingPluginException`. By centralising the dispatch in
+         * a static (which never depends on a live service instance),
+         * the inbound side is ALWAYS reachable from app launch.
+         *
+         * Behaviour matrix (see [onMethodCall] for the per-method
+         * contract preserved from 11.0A):
+         *   - `getSampledPackets`: returns activeInstance ring OR
+         *     empty list if no service yet. SAFE to call before the
+         *     service starts.
+         *   - `status`: returns activeInstance status OR the
+         *     canonical IDLE status map. SAFE pre-service.
+         *   - `start`: uses [context] to launch the foreground
+         *     service via [ContextCompat.startForegroundService],
+         *     then delegates to the running instance's
+         *     [onMethodCall] for the response. This is the missing
+         *     piece in Sprint 11.0A — the service was never started
+         *     because no one called `startForegroundService` for it.
+         *   - `stop`: delegates to active instance, or returns
+         *     STOPPED if no service.
+         *   - `setAllowedApplications` /
+         *     `setDisallowedApplications`: stores on active instance
+         *     (or no-ops if no service yet).
+         *   - `requestPrepare`: returns the consent Intent action
+         *     (the actual consent dialog is owned by
+         *     `opene2ee/vpn_permissions` — MainActivity handles it).
+         *   - else: `notImplemented`.
+         */
+        @JvmStatic
+        fun dispatch(context: Context, call: MethodCall, result: MethodChannel.Result) {
+            try {
+                when (call.method) {
+                    "start" -> {
+                        // Sprint 11.0D — actually start the foreground
+                        // service. The intent has NO action so the
+                        // service's `onStartCommand` falls into the
+                        // `else if (running.get() == false) startCapture()`
+                        // branch and brings up the TUN. We use
+                        // [ContextCompat.startForegroundService] (the
+                        // API 26+ path; the compat shim handles the
+                        // pre-O fallback to plain `startService`).
+                        val intent = Intent(context, OpenE2eeVpnService::class.java)
+                        ContextCompat.startForegroundService(context, intent)
+                        // Delegate to the active instance if it
+                        // already exists (idempotent), else return
+                        // a pending `preparing` status so Dart's
+                        // state stream flips.
+                        val instance = activeInstance
+                        if (instance != null) {
+                            instance.onMethodCall(call, result)
+                        } else {
+                            // Service is spinning up — the system
+                            // will call `onCreate` → register as
+                            // activeInstance → `onStartCommand` →
+                            // `startCapture` shortly. Tell Dart to
+                            // poll `status` again to observe the
+                            // transition.
+                            result.success(idleStatusMap().toMutableMap().apply {
+                                this["state"] = "DRAINING" // service is bringing up TUN
+                            })
+                        }
+                    }
+                    "stop" -> {
+                        val instance = activeInstance
+                        if (instance != null) {
+                            instance.onMethodCall(call, result)
+                        } else {
+                            result.success(idleStatusMap().toMutableMap().apply {
+                                this["state"] = "STOPPED"
+                            })
+                        }
+                    }
+                    "status" -> {
+                        val instance = activeInstance
+                        if (instance != null) {
+                            instance.onMethodCall(call, result)
+                        } else {
+                            result.success(idleStatusMap())
+                        }
+                    }
+                    "getSampledPackets" -> {
+                        // SAFE to call before the service is alive:
+                        // an empty list is the correct "no samples
+                        // yet" answer. This is the primary call that
+                        // was throwing `MissingPluginException` in
+                        // Sprint 11.0A.
+                        val r = snapshot() ?: emptyList()
+                        result.success(r)
+                    }
+                    "setAllowedApplications" -> {
+                        val instance = activeInstance
+                        if (instance != null) {
+                            instance.onMethodCall(call, result)
+                        } else {
+                            // Pre-service set: stash on a
+                            // companion-side pending list so the
+                            // service picks it up on `onCreate`. For
+                            // Sprint 11.0D we keep the simpler
+                            // behaviour: drop with a warning result.
+                            result.success(false)
+                        }
+                    }
+                    "setDisallowedApplications" -> {
+                        val instance = activeInstance
+                        if (instance != null) {
+                            instance.onMethodCall(call, result)
+                        } else {
+                            result.success(false)
+                        }
+                    }
+                    "requestPrepare" -> {
+                        // The actual consent flow lives on the
+                        // `opene2ee/vpn_permissions` channel; this
+                        // is kept for the 10.1F Dart-side contract
+                        // (which calls `requestPrepare` first, then
+                        // the permissions channel). The intent
+                        // action is what `VpnService.prepare()`
+                        // returns in the standard Android flow.
+                        result.success("android.net.VpnService")
+                    }
+                    else -> result.notImplemented()
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "dispatch error: ${call.method}", t)
+                result.error("vpn_method_error", t.message, null)
+            }
+        }
+
+        /**
+         * Canonical IDLE status payload returned by [dispatch] when
+         * the service has not been started yet. Matches the shape of
+         * [currentStatusMap] so Dart's `VpnService._stateFromMap`
+         * receives the expected keys (state / packetsObserved /
+         * ringSize / samplingCap / lastError / allowedApplications /
+         * disallowedApplications).
+         */
+        @JvmStatic
+        fun idleStatusMap(): Map<String, Any?> = mapOf(
+            "state" to "IDLE",
+            "packetsObserved" to 0,
+            "ringSize" to 0,
+            "samplingCap" to SAMPLING_CAP_PACKETS,
+            "lastError" to null,
+            "allowedApplications" to null,
+            "disallowedApplications" to null,
+        )
     }
 
     /** Lifecycle states exposed via `status` to Dart. */
@@ -348,17 +543,42 @@ class OpenE2eeVpnService : VpnService() {
     private var drainTask: ScheduledFuture<*>? = null
 
     /**
-     * Wire the MethodChannel — called once from `MainActivity.configureFlutterEngine`
-     * at app startup. Must run on the UI thread; the MethodChannel ctor is
-     * thread-safe but the handler swap is best done there.
+     * Sprint 11.0D — `attachFlutterEngine` is now a NO-OP for
+     * INBOUND channel registration. The `opene2ee/vpn`
+     * MethodChannel handler is owned by `MainActivity`
+     * (registered in its `configureFlutterEngine` override,
+     * which runs at app launch — BEFORE the VpnService is ever
+     * started).
+     *
+     * Why this changed: in Sprint 11.0A, the handler was set
+     * here, BUT the Dart-side `pool_provider.dart` polling loop
+     * calls `vpn.getSampledPackets()` immediately when the
+     * ActivePoolScreen is first opened (the PoolNotifier is
+     * constructed lazily when `ref.watch(poolProvider)` is first
+     * read). At that moment the VpnService is NOT yet running
+     * (the user has not clicked "Şifreleme Doğrulamayı Başlat"),
+     * so the handler was never set, and Dart got
+     * `MissingPluginException(No implementation found for
+     * method getSampledPackets on channel opene2ee/vpn)`.
+     *
+     * The MainActivity-owned handler delegates to the
+     * [Companion.dispatch] static dispatcher which returns
+     * safe defaults when no service is active, OR calls the
+     * service's instance methods when the service IS active.
+     *
+     * The OUTBOUND side of the channel (the `onPacketsSampled`
+     * event the 5-second `PacketDrain` pushes to Dart) still
+     * needs a [MethodChannel] reference, which is the
+     * [Companion.methodChannel] field. We publish the channel
+     * from the engine here so the drain can read it without
+     * holding an engine reference.
      */
     fun attachFlutterEngine(engine: FlutterEngine) {
         val ch = MethodChannel(engine.dartExecutor.binaryMessenger, METHOD_CHANNEL)
-        ch.setMethodCallHandler(::onMethodCall)
-        methodChannel = ch
-        // Sprint 11.0A — also publish the channel to the companion
-        // so the foreground service can push `onPacketsSampled`
-        // events to Dart without holding an engine reference.
+        // Publish the channel for OUTBOUND pushes from
+        // `PacketDrain` (the 5-second `onPacketsSampled` event).
+        // Do NOT install an inbound handler here — MainActivity
+        // owns that side (see class doc + S73 invariant).
         Companion.methodChannel = ch
     }
 
