@@ -206,6 +206,18 @@ class MainActivity : FlutterActivity() {
         when (call.method) {
             "requestVpnPermission" -> requestVpnPermission(result)
             "isVpnPrepared" -> result.success(isVpnPrepared())
+            // Sprint 11.0F — expose the existing
+            // `ensureNotificationPermission` helper to Dart so the
+            // `requestAndStart()` flow can request the Android 13+
+            // POST_NOTIFICATIONS runtime permission BEFORE the
+            // foreground service starts. Pre-11.0F, the helper
+            // existed but was unreachable from Dart (the method
+            // handler didn't list it). On the OnePlus 9 Pro (Android
+            // 13), if POST_NOTIFICATIONS is denied, the foreground
+            // notification is silently suppressed — the service
+            // runs (no crash) but the user sees no UI feedback
+            // that the VPN is active. Senaryo C in the brief.
+            "ensureNotificationPermission" -> ensureNotificationPermission(result)
             else -> result.notImplemented()
         }
     }

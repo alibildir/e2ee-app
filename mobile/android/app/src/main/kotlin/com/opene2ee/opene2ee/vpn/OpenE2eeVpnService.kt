@@ -378,6 +378,12 @@ class OpenE2eeVpnService : VpnService() {
          */
         @JvmStatic
         fun dispatch(context: Context, call: MethodCall, result: MethodChannel.Result) {
+            // Sprint 11.0F — diagnostic breadcrumb at the dispatcher
+            // entry. Pairs with the per-service-instance breadcrumbs
+            // (`onStartCommand: entry`, `startCapture: entry`) so the
+            // Owner can pinpoint where the regression is hanging on
+            // the OnePlus 9 Pro Magisk Zygisk flow.
+            Log.d(TAG, "dispatch: entry (method=${call.method})")
             try {
                 when (call.method) {
                     "start" -> {
@@ -391,12 +397,14 @@ class OpenE2eeVpnService : VpnService() {
                         // pre-O fallback to plain `startService`).
                         val intent = Intent(context, OpenE2eeVpnService::class.java)
                         ContextCompat.startForegroundService(context, intent)
+                        Log.d(TAG, "dispatch: startForegroundService() invoked, awaiting onStartCommand")
                         // Delegate to the active instance if it
                         // already exists (idempotent), else return
                         // a pending `preparing` status so Dart's
                         // state stream flips.
                         val instance = activeInstance
                         if (instance != null) {
+                            Log.d(TAG, "dispatch: activeInstance present, delegating onMethodCall")
                             instance.onMethodCall(call, result)
                         } else {
                             // Service is spinning up — the system
@@ -405,6 +413,7 @@ class OpenE2eeVpnService : VpnService() {
                             // `startCapture` shortly. Tell Dart to
                             // poll `status` again to observe the
                             // transition.
+                            Log.d(TAG, "dispatch: no activeInstance yet, returning DRAINING (service spinning up)")
                             result.success(idleStatusMap().toMutableMap().apply {
                                 this["state"] = "DRAINING" // service is bringing up TUN
                             })
@@ -435,6 +444,12 @@ class OpenE2eeVpnService : VpnService() {
                         // was throwing `MissingPluginException` in
                         // Sprint 11.0A.
                         val r = snapshot() ?: emptyList()
+                        // Sprint 11.0F — diagnostic breadcrumb. Logs
+                        // the size of the returned ring so the Owner
+                        // can see whether the polling loop is reaching
+                        // the channel and what state the sampling is
+                        // in (empty vs non-empty).
+                        Log.d(TAG, "dispatch: getSampledPackets returned ${r.size} packets (activeInstance=${activeInstance != null})")
                         result.success(r)
                     }
                     "setAllowedApplications" -> {
@@ -751,33 +766,63 @@ class OpenE2eeVpnService : VpnService() {
      */
     private fun startCapture(): State {
         if (running.get()) return state
+        // Sprint 11.0F — diagnostic breadcrumbs. Each `Log.d` line is
+        // emitted BEFORE the named side-effect so the Owner (or
+        // anyone running `adb logcat -d -s OpenE2eeVpn:V`) can
+        // pinpoint which step regressed. The `S75` audit invariant
+        // asserts at least 5 of these are present in the source.
+        Log.d(TAG, "startCapture: entry (running=false, state=$state)")
         try {
             val builder = buildVpnBuilder()
+            Log.d(TAG, "startCapture: buildVpnBuilder returned (addAddress=${TUN_ADDRESS.hostAddress}, mtu=$TUN_MTU)")
             val pfd = builder.establish()
             if (pfd == null) {
-                // Most likely cause: user cancelled the consent dialog or no permission.
+                // Sprint 11.0F — make the error message actionable.
+                // On OnePlus 9 Pro (rootlu, Magisk Zygisk) the
+                // `VpnService.Builder.establish()` call returns
+                // null even though the user already granted consent
+                // via `VpnService.prepare(this)` (because the
+                // foreground-service consent was confirmed in a
+                // PRIOR process / boot — `prepare()` returns null
+                // in that case too). The most common cause on a
+                // rooted OnePlus is Magisk's Zygisk module
+                // intercepting VpnService.establish() as part of
+                // its root-hide trick. The actionable advice: open
+                // Magisk → Settings → Zygisk → Disable, then
+                // reboot. Without this hint, the user sees a
+                // generic error and the regression looks
+                // unresolvable.
                 state = State.ERROR
                 lastError = "VpnService.Builder.establish() returned null " +
-                        "(user declined consent or system refused)"
+                        "(user declined consent, system refused, OR " +
+                        "OnePlus Magisk Zygisk is intercepting). " +
+                        "Workaround: Magisk → Settings → Zygisk → Disable, " +
+                        "reboot, reinstall APK. See sprint-110f-final-report.md."
+                Log.e(TAG, lastError!!)
                 notifyError(lastError!!)
                 return state
             }
+            Log.d(TAG, "startCapture: builder.establish() returned pfd=$pfd (TUN descriptor acquired)")
             tunInterface = pfd
             running.set(true)
             state = State.SAMPLING
             packetsObserved.set(0)
             synchronized(ringLock) { ring.clear() }
             startForegroundCompat()
+            Log.d(TAG, "startCapture: startForegroundCompat() returned (foreground promotion OK)")
             startReaderThread(pfd)
+            Log.d(TAG, "startCapture: startReaderThread(pfd) returned (TUN reader thread spawned)")
             // Sprint 11.0A — start the 5-second scheduled drain that
             // pushes the current ring to Dart via the shared
             // methodChannel. The handler is `PacketDrain::tick`.
             startDrainLoop()
+            Log.d(TAG, "startCapture: startDrainLoop() returned (5-second scheduled drain armed)")
+            Log.d(TAG, "startCapture: success — state=$state (SAMPLING)")
         } catch (e: Throwable) {
             running.set(false)
             state = State.ERROR
             lastError = "startCapture failed: ${e.javaClass.simpleName}: ${e.message}"
-            Log.e(TAG, lastError!!, e)
+            Log.e(TAG, lastError, e)
             notifyError(lastError!!)
         }
         return state
@@ -874,6 +919,12 @@ class OpenE2eeVpnService : VpnService() {
     }
 
     private fun notifyError(message: String) {
+        // Sprint 11.0F — diagnostic breadcrumb. The `onError` push
+        // to Dart is the user-visible error surface; logging it
+        // here too ensures the Owner (or any logcat session) sees
+        // the error even if the channel push fails (e.g. Dart
+        // side not listening).
+        Log.e(TAG, "notifyError: $message")
         methodChannel?.invokeMethod(
             "onError",
             mapOf(
@@ -1303,6 +1354,12 @@ class OpenE2eeVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Sprint 11.0F — diagnostic breadcrumb. Pairs with the
+        // `startCapture: entry` line further down so the Owner can
+        // confirm the service was actually created by the system
+        // (vs. the dispatcher's `startForegroundService` call having
+        // been intercepted somewhere).
+        Log.d(TAG, "onStartCommand: entry (intent.action=${intent?.action}, startId=$startId)")
         // Sprint 11.0E — CRITICAL: call `startForeground()` BEFORE any
         // other work. Android 8+ (API 26+) imposes a 5-second rule:
         // when a service is started via `Context.startForegroundService(...)`,
@@ -1330,6 +1387,7 @@ class OpenE2eeVpnService : VpnService() {
         // is used on UPSIDE_DOWN_CAKE+ so the foregroundServiceType
         // matches the manifest `foregroundServiceType="specialUse"`.
         ensureForegroundService()
+        Log.d(TAG, "onStartCommand: ensureForegroundService() returned (foreground promotion OK)")
 
         // The Dart side calls `startCapture()` via the MethodChannel
         // rather than through service-start intents — but we honour
@@ -1338,8 +1396,13 @@ class OpenE2eeVpnService : VpnService() {
         if (intent?.action == ACTION_PREPARE) {
             // No-op here; the actual `prepare`/consent dialog is
             // handled by MainActivity which has the Activity context.
+            Log.d(TAG, "onStartCommand: intent.action=ACTION_PREPARE — no-op (consent dialog owned by MainActivity)")
         } else if (running.get() == false) {
+            Log.d(TAG, "onStartCommand: about to call startCapture() (running=false)")
             startCapture()
+            Log.d(TAG, "onStartCommand: startCapture() returned (state=$state)")
+        } else {
+            Log.d(TAG, "onStartCommand: already running, skipping startCapture (idempotent)")
         }
         return START_NOT_STICKY
     }

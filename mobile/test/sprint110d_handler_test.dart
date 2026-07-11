@@ -72,7 +72,13 @@ void main() {
         // Dart-side inbound handler for `onPacketsSampled` events
         // (S47 invariant) but does NOT install a Kotlin-side
         // handler — that's the MainActivity's job (S73).
-        final vpn = VpnService();
+        //
+        // Sprint 11.0F — `VpnService()` is now a singleton
+        // factory. The mock test needs a fresh instance with a
+        // dedicated channel so the mock handler doesn't leak
+        // into other tests sharing the singleton. Use
+        // `VpnService.forTesting()` for that.
+        final vpn = VpnService.forTesting();
 
         // We expect the platform messenger to receive exactly one
         // call to `opene2ee/vpn` with method name `getSampledPackets`.

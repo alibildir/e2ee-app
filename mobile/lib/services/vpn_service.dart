@@ -45,6 +45,7 @@
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'packet_parser.dart';
@@ -82,7 +83,12 @@ enum VpnLifecycleState {
 }
 
 class VpnService {
-  VpnService({MethodChannel? channel})
+  /// Sprint 11.0F — private constructor used by the singleton
+  /// initializer and the test factory. The default `VpnService()`
+  /// factory (below) returns the singleton; tests use
+  /// `VpnService.forTesting(channel: ...)` to inject a custom
+  /// [MethodChannel].
+  VpnService._internal({MethodChannel? channel})
       : _channel = channel ?? const MethodChannel('opene2ee/vpn') {
     // Sprint 11.0A — wire the `onPacketsSampled` event stream.
     // S47 invariant: the `MethodChannel` is the same channel the
@@ -93,6 +99,49 @@ class VpnService {
     // TelemetryService — can each observe the same events).
     _channel.setMethodCallHandler(_onNativeCall);
   }
+
+  /// Sprint 11.0F — singleton accessor. All app code uses this
+  /// (the default `VpnService()` factory below delegates here).
+  /// Pre-11.0F, each call site constructed a fresh
+  /// [VpnService], which:
+  ///   (a) replaced the previous `_channel.setMethodCallHandler`
+  ///       (so events landed on whichever instance was
+  ///       constructed LAST — typically `PoolNotifier` in the
+  ///       Riverpod provider graph, not the `active_pool_screen`),
+  ///   (b) created a fresh `_packetCtrl` / `_stateCtrl`
+  ///       StreamController, so UI subscribers to the OLD
+  ///       instance's `packetStream` / `stateStream` never saw
+  ///       updates.
+  /// Result on OnePlus 9 Pro (Owner 11:01 report, Senaryo D):
+  /// the Kotlin service was running, the foreground notification
+  /// was visible, but the UI's state pill stayed on "HAZIRLANIYOR"
+  /// and the packet count never incremented. The fix is a
+  /// singleton: ONE [VpnService] for the whole app, with ONE
+  /// shared `_packetCtrl` / `_stateCtrl` and ONE channel
+  /// handler.
+  static final VpnService _instance = VpnService._internal();
+
+  /// Sprint 11.0F — explicit singleton accessor. The
+  /// `VpnService()` factory below is the preferred call site
+  /// for app code (backwards compatible); `VpnService.instance`
+  /// is the canonical form for tests + future call sites.
+  static VpnService get instance => _instance;
+
+  /// Sprint 11.0F — backwards-compatible factory that returns
+  /// the singleton. Pre-11.0F, `VpnService()` constructed a
+  /// fresh instance; that call shape is preserved (the factory
+  /// here returns the singleton), so existing call sites in
+  /// `pool_provider.dart`, `active_pool_screen.dart`, and the
+  /// Sprint 11.0D handler test don't have to change.
+  factory VpnService() => _instance;
+
+  /// Sprint 11.0F — test-only factory for injecting a custom
+  /// [MethodChannel] (e.g. `TestDefaultBinaryMessengerBinding`
+  /// mock). Returns a fresh instance — do NOT use from app
+  /// code, use the default [VpnService] constructor (singleton)
+  /// or [VpnService.instance] instead.
+  factory VpnService.forTesting({MethodChannel? channel}) =>
+      VpnService._internal(channel: channel);
 
   final MethodChannel _channel;
   final StreamController<List<SampledPacket>> _packetCtrl =
@@ -168,42 +217,97 @@ class VpnService {
   /// Returns `true` if the service is running, `false` if the
   /// user declined consent or any step failed (throwing on
   /// platform errors). The implementation:
-  ///   1. invoke `requestPrepare` on the permissions channel
+  ///   1. ensure Android 13+ `POST_NOTIFICATIONS` runtime
+  ///      permission is granted (Sprint 11.0F — Senaryo C fix;
+  ///      pre-11.0F the helper existed in MainActivity but was
+  ///      unreachable from Dart, so on Android 13+ the user
+  ///      would never see the foreground notification even
+  ///      though the service was running);
+  ///   2. invoke `requestPrepare` on the permissions channel
   ///      (handled by MainActivity);
-  ///   2. on consent → invoke `start` on the main channel;
-  ///   3. return whether `start` succeeded.
+  ///   3. on consent → invoke `start` on the main channel;
+  ///   4. return whether `start` succeeded.
   /// The state stream is updated at every transition so the UI
   /// pill flips `preparing → running` (or `preparing → revoked`).
+  ///
+  /// Sprint 11.0F — `debugPrint` breadcrumbs at each step. The
+  /// OnePlus 9 Pro "tap Aktif Nöbet → nothing happens" symptom
+  /// (Owner 10:56 report) was traced via these breadcrumbs to
+  /// either Senaryo A (Magisk Zygisk intercepts
+  /// `Builder.establish()` → null → error) or Senaryo C
+  /// (POST_NOTIFICATIONS denied → notification silent). The
+  /// breadcrumbs + the new `ensureNotificationPermission` call
+  /// in step 1 give the Owner the runtime evidence to disambiguate.
   Future<bool> requestAndStart() async {
     _stateCtrl.add(VpnLifecycleState.preparing);
+    debugPrint('VpnService.requestAndStart: state=preparing');
     try {
-      // Step 1: ask the activity to launch the consent dialog.
+      const permChannel = MethodChannel('opene2ee/vpn_permissions');
+
+      // Step 1 (Sprint 11.0F — Senaryo C fix): ensure the
+      // Android 13+ POST_NOTIFICATIONS runtime permission is
+      // granted. On API < 33 the call is a no-op success.
+      // On API 33+ the helper shows the runtime permission
+      // dialog if not already granted; the user can still
+      // decline, in which case the service runs but the
+      // notification is silent. The Dart flow does NOT block
+      // on this — the helper is fire-and-forget — so the
+      // flow continues to step 2 even if the user hasn't
+      // responded yet.
+      try {
+        final notifGranted = await permChannel
+            .invokeMethod<bool>('ensureNotificationPermission');
+        debugPrint(
+            'VpnService.requestAndStart: ensureNotificationPermission returned $notifGranted');
+      } catch (e) {
+        debugPrint(
+            'VpnService.requestAndStart: ensureNotificationPermission threw (continuing anyway): $e');
+      }
+
+      // Step 2: ask the activity to launch the consent dialog.
       // MainActivity owns `opene2ee/vpn_permissions`; we use a
       // separate channel to avoid colliding with the main one
       // (which is owned by `OpenE2eeVpnService`).
-      const permChannel = MethodChannel('opene2ee/vpn_permissions');
       final ok = await permChannel.invokeMethod<bool>('requestVpnPermission');
+      debugPrint('VpnService.requestAndStart: requestVpnPermission returned $ok');
       if (ok != true) {
         _stateCtrl.add(VpnLifecycleState.revoked);
+        debugPrint('VpnService.requestAndStart: revoked (consent denied)');
         return false;
       }
-      // Step 2: kick off the foreground service.
+      // Step 3: kick off the foreground service.
       final r = await _channel.invokeMethod<Map<Object?, Object?>>('start');
+      debugPrint('VpnService.requestAndStart: start returned $r');
       _stateCtrl.add(_stateFromMap(r?.cast<String, Object?>()));
       return true;
-    } catch (_) {
+    } catch (e) {
+      debugPrint('VpnService.requestAndStart: caught exception: $e');
       _stateCtrl.add(VpnLifecycleState.error);
       return false;
     }
   }
 
-  /// Tear-down helper used by the screen on `dispose`. Cancels
-  /// the MethodChannel handler so the messenger does not hold
-  /// a stale reference after the activity is gone.
+  /// Tear-down helper. Sprint 11.0F — idempotent + safe on the
+  /// singleton: the singleton's `dispose()` is a no-op (the
+  /// `forTesting()` instances can still tear down properly).
+  /// Pre-11.0F, every widget rebuild created a fresh
+  /// `VpnService` whose `dispose()` was called on the screen's
+  /// teardown. With the singleton, the screen teardown is NOT
+  /// the end of the service — `PoolNotifier` (the Riverpod
+  /// provider) and the singleton's UI both outlive any single
+  /// screen. Closing the stream controllers here would
+  /// permanently silence the singleton, which is exactly the
+  /// regression we are trying to fix.
   void dispose() {
+    if (identical(this, _instance)) {
+      // Singleton — no-op. The streams stay open for the
+      // lifetime of the app. The channel handler stays
+      // registered. Re-calling `dispose()` is safe.
+      return;
+    }
     _channel.setMethodCallHandler(null);
-    _packetCtrl.close();
-    _stateCtrl.close();
+    if (!_packetCtrl.isClosed) _packetCtrl.close();
+    if (!_stateCtrl.isClosed) _stateCtrl.close();
   }
 
   /// Map a Kotlin `state` string (UPPERCASE) to a Dart

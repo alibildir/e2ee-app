@@ -4516,6 +4516,181 @@ def check_vpn_service_startforeground_within_5s_v19() -> list[str]:
     return findings
 
 
+def check_vpn_service_log_d_breadcrumbs_v20() -> list[str]:
+    """Sprint 11.0F: OpenE2eeVpnService.kt has Log.d breadcrumbs (S75).
+
+    Regression guard for the OnePlus 9 Pro "service runs, UI
+    doesn't update" symptom (Owner 10:56 / 11:01 reports). The
+    brief lists 5 candidate scenarios (A-E); the
+    `Log.d`-breadcrumb invariant exists so the next time the
+    Owner sees a similar regression, the `adb logcat -d -s
+    OpenE2eeVpn:V` output pinpoints which step regressed
+    WITHOUT requiring the Coder session to re-add the
+    diagnostics. Without the breadcrumbs, the regression
+    surface is opaque (one "service doesn't work" symptom,
+    five candidate root causes, no runtime evidence to
+    disambiguate).
+
+    The check requires AT LEAST 5 `Log.d(TAG,` statements
+    across three call sites in OpenE2eeVpnService.kt:
+      - `startCapture()` (entry / buildVpnBuilder / establish
+        null + non-null branches / startForegroundCompat /
+        startReaderThread / startDrainLoop / success)
+      - `onStartCommand` (entry / ensureForegroundService /
+        intent-action branch / startCapture pre+post)
+      - `Companion.dispatch` (entry / startForegroundService /
+        activeInstance present / activeInstance null /
+        getSampledPackets response)
+    Plus `notifyError` for the error path.
+
+    Missing this many breadcrumbs means the regression
+    surface is opaque to the next sprint's Coder session.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"
+    if not target.exists():
+        findings.append(
+            "S75 OpenE2eeVpnService.kt: file missing. Sprint 11.0F "
+            "invariant — the service must emit Log.d breadcrumbs at "
+            "each step of the startCapture / onStartCommand / dispatch "
+            "flow so the next regression can be diagnosed via "
+            "`adb logcat -d -s OpenE2eeVpn:V`."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S75 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Comment-strip (mirrors S43 / S73 / S74 pattern).
+    import re
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            lines.append(ln[:cut_at])
+        else:
+            lines.append(ln)
+    code = "\n".join(lines)
+    # Count `Log.d(TAG,` occurrences. Sprint 11.0F brief requires
+    # at least 5.
+    log_d_count = code.count("Log.d(TAG,")
+    if log_d_count < 5:
+        findings.append(
+            "S75 OpenE2eeVpnService.kt: only " + str(log_d_count) +
+            " `Log.d(TAG,` statement(s) found; Sprint 11.0F "
+            "invariant requires at least 5 across "
+            "startCapture / onStartCommand / dispatch / "
+            "notifyError so the OnePlus 9 Pro regression is "
+            "diagnosable via `adb logcat -d -s OpenE2eeVpn:V`."
+        )
+    return findings
+
+
+def check_vpn_service_dart_singleton_v20() -> list[str]:
+    """Sprint 11.0F: vpn_service.dart exposes VpnService as a Dart singleton (S76).
+
+    Regression guard for the OnePlus 9 Pro Senaryo D
+    regression (Owner 11:01 report): the Kotlin service was
+    running, the foreground notification was visible, but the
+    UI's state pill stayed on "HAZIRLANIYOR" and the packet
+    count never incremented. Root cause: every widget rebuild
+    constructed a fresh `VpnService()` in
+    `active_pool_screen.dart` line 70, which (a) replaced the
+    previous `_channel.setMethodCallHandler` on the global
+    `opene2ee/vpn` channel — events landed on whichever
+    instance was constructed LAST (typically `PoolNotifier`
+    in the Riverpod provider graph, not the screen), and
+    (b) created a fresh `_packetCtrl` / `_stateCtrl`
+    StreamController — the UI's old listeners never saw
+    updates.
+
+    The fix: `VpnService` is now a singleton. The check
+    requires THREE tokens in `vpn_service.dart`:
+      1. `VpnService._internal(` — the private constructor
+         used by the static `_instance` initializer.
+      2. `static VpnService get instance` (or
+         `static final VpnService _instance` + a getter) —
+         the singleton accessor.
+      3. `factory VpnService()` — the backwards-compatible
+         factory that returns the singleton (so the existing
+         `VpnService()` call sites in `pool_provider.dart` /
+         `active_pool_screen.dart` / Sprint 11.0D test
+         continue to work without changes).
+
+    Missing any of these re-opens the Senaryo D regression.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "vpn_service.dart"
+    if not target.exists():
+        findings.append(
+            "S76 vpn_service.dart: file missing. Sprint 11.0F "
+            "invariant — VpnService must be a singleton (private "
+            "constructor + static instance getter + factory "
+            "default ctor) so widget rebuilds share the same "
+            "MethodChannel handler + StreamControllers."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S76 vpn_service.dart: read failed (" + str(e) + ")."
+        )
+        return findings
+    # 1. Private constructor.
+    if "VpnService._internal(" not in text:
+        findings.append(
+            "S76 vpn_service.dart: missing `VpnService._internal(` "
+            "private constructor. Sprint 11.0F invariant — the "
+            "singleton pattern requires a private constructor "
+            "to prevent external instantiation (otherwise every "
+            "`new VpnService()` call leaks a new MethodChannel "
+            "handler + fresh StreamControllers)."
+        )
+    # 2. Singleton accessor (either `static VpnService get instance`
+    #    OR `static final VpnService _instance`).
+    has_getter = "static VpnService get instance" in text
+    has_field = "static final VpnService _instance" in text
+    if not (has_getter or has_field):
+        findings.append(
+            "S76 vpn_service.dart: missing the singleton accessor "
+            "(`static VpnService get instance` or "
+            "`static final VpnService _instance`). Sprint 11.0F "
+            "invariant — without the static field/getter, every "
+            "call site constructs a fresh VpnService and the "
+            "OnePlus 9 Pro Senaryo D regression returns."
+        )
+    # 3. Backwards-compatible factory.
+    if "factory VpnService()" not in text:
+        findings.append(
+            "S76 vpn_service.dart: missing `factory VpnService()` "
+            "backwards-compatible factory. Sprint 11.0F invariant — "
+            "the existing call sites in `pool_provider.dart`, "
+            "`active_pool_screen.dart`, and the Sprint 11.0D "
+            "handler test use the default `VpnService()` form; "
+            "the factory makes that form return the singleton so "
+            "no call site needs to change."
+        )
+    return findings
+
+
 # ═══ Sprint 11.0B — M2 production audit (S53-S60) ═══
 #
 # The M2 brief specifies `webrtc: ^0.13.0+` as the dep. The
@@ -5217,6 +5392,18 @@ def main() -> int:
         all_findings.extend(s74_findings)
     else:
         print("PASS: OpenE2eeVpnService.kt calls startForeground() before Builder.establish() (5-second foreground-service rule) - Sprint 11.0E S74")
+
+    s75_findings = check_vpn_service_log_d_breadcrumbs_v20()
+    if s75_findings:
+        all_findings.extend(s75_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt has Log.d breadcrumbs (5+ statements across startCapture + onStartCommand + dispatch) - Sprint 11.0F S75")
+
+    s76_findings = check_vpn_service_dart_singleton_v20()
+    if s76_findings:
+        all_findings.extend(s76_findings)
+    else:
+        print("PASS: vpn_service.dart exposes VpnService as a Dart singleton (private _internal ctor + VpnService.instance static getter) - Sprint 11.0F S76")
 
     if all_findings:
         print("\nFINDINGS:")
