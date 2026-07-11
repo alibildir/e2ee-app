@@ -144,6 +144,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.annotation.RequiresApi
@@ -211,6 +213,37 @@ class OpenE2eeVpnService : VpnService() {
          */
         @JvmField
         val stateLock: Any = Any()
+
+        /**
+         * Sprint 11.0K — main looper Handler. The Flutter
+         * Engine requires `MethodChannel.invokeMethod` to be
+         * invoked on the Android UI thread (the main
+         * `Looper`). Pre-11.0K, all three call sites
+         * (flushTelemetry's `onTelemetry`, notifyError's
+         * `onError`, PacketDrain's `onPacketsSampled`) called
+         * `methodChannel?.invokeMethod` from background threads
+         * (PacketDrain = `opene2ee-vpn-drain` ScheduledExecutor
+         * worker; flushTelemetry / notifyError = the TUN reader
+         * thread). The Engine threw `@UiThread` violations and
+         * the Owner saw "VPN active, internet OK, UI never
+         * updates" (state: DRAINING, packetsObserved: 0,
+         * ringSize: 0). 11.0K wraps all three call sites in
+         * `mainHandler.post { ... }` via the `pushToDart` helper.
+         *
+         * The Handler is `@JvmField` so the post is one line at
+         * the call site (no allocation per push). It is created
+         * EAGERLY at class-load time so the first push doesn't
+         * have to wait for `Looper.getMainLooper()` to be
+         * queried from a non-main thread (subtle but documented
+         * in `Handler` Javadoc — querying the main looper from a
+         * worker thread is fine but the Handler itself should be
+         * constructed on a thread that has the main Looper's
+         * classloader available; lazy init in a worker thread
+         * can hit a `NullPointerException` on some Android
+         * OEM ROMs — OnePlus OxygenOS is one of them).
+         */
+        @JvmField
+        val mainHandler: Handler = Handler(Looper.getMainLooper())
 
         /** Must match `kVpnMethodChannel` in Dart. */
         const val METHOD_CHANNEL = "opene2ee/vpn"
@@ -1027,12 +1060,76 @@ class OpenE2eeVpnService : VpnService() {
     )
 
     /**
+     * Sprint 11.0K — push a method-call from a background thread
+     * (PacketDrain ScheduledExecutorService worker, TUN reader
+     * thread, etc.) to the Dart side over the MethodChannel.
+     *
+     * The Flutter Engine REQUIRES `MethodChannel.invokeMethod`
+     * to be invoked on the Android UI thread (the main
+     * `Looper`). The error is the `@UiThread` annotation
+     * violation:
+     *
+     *   `onPacketsSampled push failed: Methods marked with
+     *    @UiThread must be executed on the main thread.
+     *    Current thread: opene2ee-vpn-drain.`
+     *
+     * This is the OnePlus 9 Pro "VPN active, internet
+     * working, but UI never updates" symptom (Owner 12:31
+     * logcat: 98 packets observed in 80s, deltaPerInterval
+     * Log.d in logcat, but Dart side never receives the
+     * `onPacketsSampled` event so `state: DRAINING` and
+     * `ringSize: 0` stay frozen in the UI).
+     *
+     * Pre-11.0K, the three call sites (flushTelemetry's
+     * `onTelemetry`, notifyError's `onError`, PacketDrain's
+     * `onPacketsSampled`) called `methodChannel?.invokeMethod`
+     * directly from their caller threads — which are the
+     * `opene2ee-vpn-drain` ScheduledExecutorService worker
+     * thread (PacketDrain) and the TUN reader thread
+     * (flushTelemetry / notifyError invoked from
+     * `startCapture`). 11.0K wraps ALL three in a
+     * `Handler(Looper.getMainLooper()).post { ... }` so the
+     * call is dispatched to the main looper.
+     *
+     * Audit S82 verifies:
+     *   1. ALL `methodChannel?.invokeMethod` AND
+     *      `ch.invokeMethod` calls in this file are wrapped
+     *      in `Handler(Looper.getMainLooper()).post { ... }`
+     *      (a `Handler` field declared on the companion is
+     *      the canonical pattern).
+     *   2. The companion declares a `@JvmField val mainHandler:
+     *      Handler = Handler(Looper.getMainLooper())` so the
+     *      post is one-line at the call site.
+     */
+    private fun pushToDart(method: String, args: Any?) {
+        mainHandler.post {
+            try {
+                methodChannel?.invokeMethod(method, args)
+            } catch (t: Throwable) {
+                // Logged as warn (not error) because the
+                // engine being detached / engine swap is a
+                // benign race during config changes; the
+                // outer `lastError` field is the canonical
+                // error surface for Dart.
+                Log.w(TAG, "pushToDart: $method push failed: ${t.message}")
+            }
+        }
+    }
+
+    /**
      * Forward a metadata batch back to Dart over the MethodChannel.
      * Called once at stop time and on ring-cap threshold.
      */
     private fun flushTelemetry() {
         val payload: List<Map<String, Any?>> = synchronized(ringLock) { ring.toList() }
-        methodChannel?.invokeMethod(
+        // Sprint 11.0K — push to Dart on the main looper
+        // (Flutter Engine `@UiThread` requirement). Pre-11.0K
+        // this called `methodChannel?.invokeMethod` from the
+        // TUN reader thread; the Engine threw `@UiThread`
+        // and Dart never received `onTelemetry`. 11.0K
+        // delegates to `pushToDart` which `mainHandler.post`s
+        // to the UI thread.
+        pushToDart(
             "onTelemetry",
             mapOf(
                 "sessionId" to null, // populated by Dart-side glue from PR-7's sessionId
@@ -1049,7 +1146,9 @@ class OpenE2eeVpnService : VpnService() {
         // the error even if the channel push fails (e.g. Dart
         // side not listening).
         Log.e(TAG, "notifyError: $message")
-        methodChannel?.invokeMethod(
+        // Sprint 11.0K — push to Dart on the main looper
+        // (Flutter Engine `@UiThread` requirement).
+        pushToDart(
             "onError",
             mapOf(
                 "code" to "vpn_runtime_error",
@@ -1156,13 +1255,28 @@ class OpenE2eeVpnService : VpnService() {
                 // the snapshot; the next 5s tick will try again.
                 return
             }
-            try {
-                // Sprint 11.0A — the literal event name Dart subscribes
-                // to. Audit S45 verifies this exact token in
-                // OpenE2eeVpnService.kt source.
-                ch.invokeMethod("onPacketsSampled", packets)
-            } catch (t: Throwable) {
-                Log.w(TAG, "onPacketsSampled push failed: ${t.message}")
+            // Sprint 11.0K — push to Dart on the main looper.
+            // Pre-11.0K, the inline `ch.invokeMethod` was called
+            // on the `opene2ee-vpn-drain` ScheduledExecutorService
+            // worker thread. The Flutter Engine threw `@UiThread:
+            // Methods marked with @UiThread must be executed on the
+            // main thread. Current thread: opene2ee-vpn-drain` and
+            // the Owner saw `state: DRAINING, packetsObserved: 0,
+            // ringSize: 0` even though the TUN reader was pushing
+            // 98 packets in 80s (the ring was full, the drain was
+            // ticking, but Dart never received the events).
+            // 11.0K delegates to `pushToDart` which `mainHandler.post`s
+            // to the UI thread.
+            //
+            // Audit S82 verifies the event name `"onPacketsSampled"`
+            // (S45 invariant) AND that the call is wrapped in
+            // `mainHandler.post { ... }` (S82 invariant).
+            OpenE2eeVpnService.mainHandler.post {
+                try {
+                    ch.invokeMethod("onPacketsSampled", packets)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "onPacketsSampled push failed: ${t.message}")
+                }
             }
         }
     }
@@ -1245,6 +1359,21 @@ class OpenE2eeVpnService : VpnService() {
                     // WRITE the packet back to the TUN output. The
                     // `protect()` call was a 11.0A-era misconception
                     // and has been REMOVED in 11.0J.
+                    //
+                    // Sprint 11.0K — `flushTelemetry()` is called
+                    // from this TUN reader thread; its underlying
+                    // `methodChannel?.invokeMethod` is dispatched
+                    // to the Android UI thread via `pushToDart` →
+                    // `mainHandler.post { ... }` to satisfy the
+                    // Flutter Engine `@UiThread` requirement.
+                    // Pre-11.0K, this push happened on the TUN
+                    // reader thread directly and the engine threw
+                    // `@UiThread` violations for `onTelemetry`
+                    // (and `onPacketsSampled` from the PacketDrain
+                    // worker thread). The visible symptom was
+                    // Owner-12:31's "VPN active, internet OK, UI
+                    // never updates" — 98 packets in 80s, drain
+                    // tick visible, but Dart never got the events.
                     try {
                         output.write(buf, 0, n)
                         output.flush()

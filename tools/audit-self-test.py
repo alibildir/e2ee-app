@@ -63,6 +63,7 @@ check_active_pool_screen_ui_propagation_v21 (S77),
 check_vpn_service_state_transition_breadcrumbs_v22 (S78),
 check_vpn_service_addroute_bad_address_v23 (S79), and
 check_vpn_service_tun_passthrough_v24 (S80).
+Sprint 11.0K adds `check_vpn_service_ui_thread_push_v26` (S82).
 
 (Sprint 11.0F adds 2 new selftest cases for S75 + S76 —
 the OnePlus 9 Pro Senaryo D regression guards. S75
@@ -162,9 +163,17 @@ S50 cases: 2 (1 PASS + 1 FAIL — `OpenE2EE Şifreleme Doğrulama` foreground no
 S51 cases: 2 (1 PASS + 1 FAIL — `i < 30` + `Timer.periodic` 30-call loop in active_pool_screen.dart).
 S52 cases: 2 (1 PASS + 1 FAIL — `sendSummary` method + `/api/v1/sessions/` path + 6 fields in telemetry_service.dart).
 
-Total: 133 cases (72 pre-Sprint 11.0A + 16 from S45-S52 + 24 from
+Total: 134 cases (72 pre-Sprint 11.0A + 16 from S45-S52 + 24 from
 S53-S60 + 24 from S61-S72 + 1 from S73 + 1 from S74 + 1 from
-S76 + 1 from S77 + 1 from S78 + 1 from S79 + 1 from S80).
+S76 + 1 from S77 + 1 from S78 + 1 from S79 + 1 from S80 +
+1 from S82).
+Sprint 11.0K adds 1 new selftest case for S82 (UI-thread
+push — `methodChannel?.invokeMethod` dispatched via
+`Handler(Looper.getMainLooper()).post { ... }`) — the
+OnePlus 9 Pro "VPN active, internet working, UI never
+updates" regression guard (Owner 12:31 report, PID 4244,
+real root cause: `@UiThread` violation on the
+`opene2ee-vpn-drain` ScheduledExecutor worker thread).
 Sprint 11.0J adds 1 new selftest case for S80 (TUN
 passthrough — `output.write(buf, 0, n)` after
 `input.read(buf)`) — the OnePlus 9 Pro "VPN active,
@@ -2566,6 +2575,143 @@ def run_s80_check(opene2ee_vpn_service_text):
     return findings
 
 
+def run_s82_check(opene2ee_vpn_service_text):
+    """Sprint 11.0K: OpenE2eeVpnService.kt dispatches
+    MethodChannel calls to the Android main looper (S82).
+
+    Regression guard for the OnePlus 9 Pro "VPN active,
+    internet working, UI never updates" symptom (Owner 12:31
+    report, PID 4244, 98 packets in 80s, `deltaPerInterval`
+    Log.d in logcat, but UI stays frozen on
+    `state: DRAINING, packetsObserved: 0, ringSize: 0`).
+
+    REAL root cause (overriding the 11.0K brief hypothesis):
+    the Flutter Engine requires `MethodChannel.invokeMethod`
+    to be called on the Android UI thread (the main
+    `Looper`). Pre-11.0K, the three call sites
+    (flushTelemetry's `onTelemetry`, notifyError's
+    `onError`, PacketDrain's `onPacketsSampled`) invoked
+    `methodChannel?.invokeMethod` directly from their
+    caller threads (TUN reader thread + PacketDrain
+    ScheduledExecutor worker thread). The engine threw
+    `@UiThread` violations and Dart never received any
+    of the three events.
+
+    11.0K fix:
+      1. Companion declares `@JvmField val mainHandler:
+         Handler = Handler(Looper.getMainLooper())` (eagerly
+         initialized at class-load time).
+      2. flushTelemetry + notifyError dispatch via a
+         `pushToDart(method, args)` helper that calls
+         `mainHandler.post { ... }`.
+      3. PacketDrain inlines `OpenE2eeVpnService.mainHandler
+         .post { ch.invokeMethod("onPacketsSampled", packets) }`.
+      4. New imports: `android.os.Handler` +
+         `android.os.Looper`.
+
+    The check requires FIVE tokens in `OpenE2eeVpnService.kt`
+    (comment-stripped):
+      1. `import android.os.Handler` literal.
+      2. `import android.os.Looper` literal.
+      3. `Handler(Looper.getMainLooper())` literal.
+      4. `mainHandler.post` literal.
+      5. `invoke_method_count <= mainHandler.post_count` —
+         every direct `methodChannel?.invokeMethod(` or
+         `ch.invokeMethod(` call site is wrapped in
+         `mainHandler.post { ... }` (anti-pattern guard).
+    """
+    import re
+    findings = []
+    if opene2ee_vpn_service_text is None:
+        findings.append("S82 OpenE2eeVpnService.kt: file missing")
+        return findings
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", opene2ee_vpn_service_text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # 1. `import android.os.Handler`.
+    if "import android.os.Handler" not in code:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing `import "
+            "android.os.Handler`. Sprint 11.0K invariant — "
+            "the Handler class is required for the "
+            "`mainHandler.post { ... }` dispatch. Add the "
+            "import."
+        )
+    # 2. `import android.os.Looper`.
+    if "import android.os.Looper" not in code:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing `import "
+            "android.os.Looper`. Sprint 11.0K invariant — "
+            "the Looper class is required to construct the "
+            "main-thread Handler via `Handler(Looper.getMainLooper())`. "
+            "Add the import."
+        )
+    # 3. `Handler(Looper.getMainLooper())` companion field.
+    if not re.search(r"Handler\s*\(\s*Looper\.getMainLooper\s*\(\s*\)\s*\)", code):
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing the "
+            "`Handler(Looper.getMainLooper())` companion field. "
+            "Sprint 11.0K invariant — the `mainHandler` "
+            "field must be declared as `@JvmField val "
+            "mainHandler: Handler = Handler(Looper.getMainLooper())` "
+            "on the companion object so the first push from a "
+            "worker thread does not have to construct the "
+            "Handler."
+        )
+    # 4. `mainHandler.post` dispatch.
+    if "mainHandler.post" not in code:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing `mainHandler.post` "
+            "dispatch. Sprint 11.0K invariant — the three "
+            "MethodChannel invocations (`onTelemetry` in "
+            "flushTelemetry, `onError` in notifyError, "
+            "`onPacketsSampled` in PacketDrain) must use "
+            "`mainHandler.post { methodChannel?.invokeMethod "
+            "(...) }` (or the `pushToDart` helper which calls "
+            "it)."
+        )
+    # 5. Anti-pattern guard: every direct `methodChannel?.invokeMethod`
+    #    or `ch.invokeMethod` call site is wrapped in
+    #    `mainHandler.post { ... }`.
+    invoke_call_count = 0
+    for m in re.finditer(r"methodChannel\?\.invokeMethod\s*\(|ch\.invokeMethod\s*\(", code):
+        invoke_call_count += 1
+    post_count = len(re.findall(r"mainHandler\.post\s*\{", code))
+    if invoke_call_count > post_count:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: found " +
+            str(invoke_call_count) + " direct "
+            "`methodChannel?.invokeMethod(` / "
+            "`ch.invokeMethod(` call site(s) but only " +
+            str(post_count) + " `mainHandler.post { ... }` "
+            "wrapper(s). Sprint 11.0K invariant — the "
+            "Flutter Engine throws `@UiThread` for every push "
+            "that happens on a non-UI thread (PacketDrain "
+            "worker, TUN reader thread). All " +
+            str(invoke_call_count) + " invoke sites must be "
+            "wrapped in a `mainHandler.post { ... }` block."
+        )
+    return findings
+
+
 # ─── Test cases ──────────────────────────────────────────────────
 
 # Case 0: fully-valid file (post-Sprint 9.6.6 fix) — expect 0 findings.
@@ -4119,6 +4265,42 @@ case_s80_vpn_service_tun_passthrough_pass = (
     "}\n"
 )
 
+# S82 (Sprint 11.0K) — OpenE2eeVpnService.kt dispatches
+# MethodChannel calls to the Android main looper. Regression
+# guard for OnePlus 9 Pro "VPN active, internet OK, UI never
+# updates" symptom (Owner 12:31 report, PID 4244; real root
+# cause: `@UiThread` violation on PacketDrain worker thread).
+case_s82_vpn_service_ui_thread_push_pass = (
+    "package com.opene2ee.opene2ee.vpn\n"
+    "import android.os.Handler\n"
+    "import android.os.Looper\n"
+    "import android.os.ParcelFileDescriptor\n"
+    "class OpenE2eeVpnService {\n"
+    "    companion object {\n"
+    "        @JvmField\n"
+    "        val mainHandler: Handler = Handler(Looper.getMainLooper())\n"
+    "    }\n"
+    "    private fun flushTelemetry() {\n"
+    "        val ch = methodChannel\n"
+    "        mainHandler.post {\n"
+    "            ch?.invokeMethod(\"onTelemetry\", null)\n"
+    "        }\n"
+    "    }\n"
+    "    private fun notifyError(message: String) {\n"
+    "        val ch = methodChannel\n"
+    "        mainHandler.post {\n"
+    "            ch?.invokeMethod(\"onError\", null)\n"
+    "        }\n"
+    "    }\n"
+    "    private fun pushToDart() {\n"
+    "        val ch = methodChannel\n"
+    "        mainHandler.post {\n"
+    "            ch?.invokeMethod(\"onPacketsSampled\", null)\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+)
+
 cases = [
     # S1-S5 cases (Sprint 9.6.6 — regression guard: must still pass)
     ("PASS (Sprint 9.6.6 fixed file)", run_check, (case_pass,), []),
@@ -4548,6 +4730,17 @@ cases = [
     # + 1 = 133 (was 132 before Sprint 11.0J).
     ("S80 PASS (OpenE2eeVpnService.kt has TUN passthrough (output.write after input.read) and NO protect(Socket()) no-op — regression guard for OnePlus 9 Pro internet-killed-by-default-route)",
      run_s80_check, (case_s80_vpn_service_tun_passthrough_pass,), []),
+    # S82 case (Sprint 11.0K - new) — OpenE2eeVpnService.kt
+    # dispatches MethodChannel calls to the Android main
+    # looper (via `Handler(Looper.getMainLooper()).post { ...
+    # }` or the `pushToDart` helper). Regression guard for the
+    # OnePlus 9 Pro "VPN active, internet OK, UI never
+    # updates" symptom (Owner 12:31 report, PID 4244; real
+    # root cause: `@UiThread` violation on PacketDrain
+    # ScheduledExecutor worker thread). Total selftest: 133
+    # + 1 = 134 (was 133 before Sprint 11.0K).
+    ("S82 PASS (OpenE2eeVpnService.kt dispatches MethodChannel.invokeMethod to the Android main looper via Handler(Looper.getMainLooper()).post { ... } — regression guard for OnePlus 9 Pro @UiThread violation on PacketDrain worker)",
+     run_s82_check, (case_s82_vpn_service_ui_thread_push_pass,), []),
   ]   # noqa: E501
 
 failed = []

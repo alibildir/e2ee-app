@@ -5231,14 +5231,172 @@ def check_vpn_service_tun_passthrough_v24() -> list[str]:
     return findings
 
 
-# ═══ Sprint 11.0B — M2 production audit (S53-S60) ═══
-#
-# The M2 brief specifies `webrtc: ^0.13.0+` as the dep. The
-# pub.dev `webrtc` 0.0.1 is incompatible with Dart 3.12.1; the
-# actively-maintained `flutter_webrtc` 1.5.2 (a rename of the
-# original `webrtc` package) is what the build resolves. The
-# audit accepts the substring `webrtc:` in pubspec.yaml —
-# `flutter_webrtc: ^1.5.0` matches.
+def check_vpn_service_ui_thread_push_v26() -> list[str]:
+    """Sprint 11.0K: OpenE2eeVpnService.kt dispatches MethodChannel
+    calls to the Android main looper (S82).
+
+    Regression guard for the OnePlus 9 Pro "VPN active, internet
+    working, UI never updates" symptom (Owner 12:31 logcat, PID 4244,
+    98 packets in 80s, PacketDrain `deltaPerInterval` Log.d IS in
+    logcat, but `state: DRAINING, packetsObserved: 0, ringSize: 0`
+    stays frozen in the UI).
+
+    REAL root cause (overriding the 11.0K brief hypothesis): the
+    Flutter Engine requires `MethodChannel.invokeMethod` to be called
+    on the Android UI thread (the main `Looper`). Pre-11.0K, the
+    three call sites (flushTelemetry's `onTelemetry`, notifyError's
+    `onError`, PacketDrain's `onPacketsSampled`) invoked
+    `methodChannel?.invokeMethod` directly from their caller
+    threads:
+      - `flushTelemetry` is called from the TUN reader thread
+        (`startReaderThread`).
+      - `notifyError` is called from `startCapture` and
+        `startReaderThread`.
+      - `PacketDrain.run` is the `opene2ee-vpn-drain`
+        ScheduledExecutorService worker thread.
+    The engine threw `@UiThread: Methods marked with @UiThread must
+    be executed on the main thread. Current thread:
+    opene2ee-vpn-drain` and Dart never received any of the three
+    events. The Owner saw `state: DRAINING` because the Dart
+    `stateStream.listen` callback never fired.
+
+    11.0K fix:
+      1. Companion declares `@JvmField val mainHandler: Handler =
+         Handler(Looper.getMainLooper())` (eagerly initialized at
+         class-load time so the first push from a worker thread
+         does not have to construct the Handler).
+      2. All three call sites dispatch via `mainHandler.post { ... }`
+         — flushTelemetry and notifyError go through a
+         `pushToDart(method, args)` helper; PacketDrain inlines
+         the post.
+      3. New imports: `android.os.Handler` + `android.os.Looper`.
+
+    The check requires FIVE tokens in `OpenE2eeVpnService.kt`
+    (comment-stripped):
+      1. `import android.os.Handler` literal present.
+      2. `import android.os.Looper` literal present.
+      3. `Handler(Looper.getMainLooper())` literal present
+         (the companion `mainHandler` field).
+      4. `mainHandler.post` literal present (the dispatch call).
+      5. NO direct `methodChannel?.invokeMethod(` OR
+         `ch.invokeMethod(` from outside `mainHandler.post { ... }`
+         (anti-pattern guard — pre-11.0K regression).
+    """
+    import re
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"
+    if not target.exists():
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: file missing. Sprint 11.0K "
+            "invariant — all `methodChannel?.invokeMethod` calls "
+            "must be dispatched to the Android main looper via "
+            "`Handler(Looper.getMainLooper()).post { ... }` to "
+            "satisfy the Flutter Engine `@UiThread` requirement. "
+            "Owner 12:31 regression: PacketDrain ran on "
+            "`opene2ee-vpn-drain` ScheduledExecutor worker thread "
+            "and the engine threw `@UiThread` for every push; "
+            "Dart never received `onPacketsSampled` and the UI "
+            "stayed frozen on `state: DRAINING`."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Comment-strip (mirrors S43 / S73 / S74 / S75 / S78 / S79 / S80).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # 1. `import android.os.Handler`.
+    if "import android.os.Handler" not in code:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing `import "
+            "android.os.Handler`. Sprint 11.0K invariant — the "
+            "Handler class is required for the `mainHandler.post "
+            "{ ... }` dispatch. Add the import."
+        )
+    # 2. `import android.os.Looper`.
+    if "import android.os.Looper" not in code:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing `import "
+            "android.os.Looper`. Sprint 11.0K invariant — the "
+            "Looper class is required to construct the main-thread "
+            "Handler via `Handler(Looper.getMainLooper())`. Add "
+            "the import."
+        )
+    # 3. `Handler(Looper.getMainLooper())` companion field.
+    if not re.search(r"Handler\s*\(\s*Looper\.getMainLooper\s*\(\s*\)\s*\)", code):
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing the "
+            "`Handler(Looper.getMainLooper())` companion field. "
+            "Sprint 11.0K invariant — the `mainHandler` field "
+            "must be declared as `@JvmField val mainHandler: "
+            "Handler = Handler(Looper.getMainLooper())` on the "
+            "companion object so the first push from a worker "
+            "thread does not have to construct the Handler."
+        )
+    # 4. `mainHandler.post` dispatch.
+    if "mainHandler.post" not in code:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing `mainHandler.post` "
+            "dispatch. Sprint 11.0K invariant — at least one "
+            "call site (the three MethodChannel invocations: "
+            "`onTelemetry` in flushTelemetry, `onError` in "
+            "notifyError, `onPacketsSampled` in PacketDrain) must "
+            "use `mainHandler.post { methodChannel?.invokeMethod "
+            "(...) }` (or the `pushToDart` helper which calls it)."
+        )
+    # 5. Anti-pattern guard: NO direct `methodChannel?.invokeMethod`
+    #    OR `ch.invokeMethod` from outside `mainHandler.post { ... }`.
+    #    Find all `methodChannel?.invokeMethod(` and
+    #    `ch.invokeMethod(` call sites in code. Each must be
+    #    inside a `mainHandler.post { ... }` block.
+    #    The simplest invariant: the count of `mainHandler.post`
+    #    must be >= the count of `invokeMethod(` calls in the
+    #    file (with `methodChannel?` or `ch.` prefix).
+    invoke_call_count = 0
+    for m in re.finditer(r"methodChannel\?\.invokeMethod\s*\(|ch\.invokeMethod\s*\(", code):
+        invoke_call_count += 1
+    post_count = len(re.findall(r"mainHandler\.post\s*\{", code))
+    if invoke_call_count > post_count:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: found " + str(invoke_call_count) +
+            " direct `methodChannel?.invokeMethod(` / "
+            "`ch.invokeMethod(` call site(s) but only " +
+            str(post_count) + " `mainHandler.post { ... }` "
+            "wrapper(s). Sprint 11.0K invariant — the Flutter "
+            "Engine throws `@UiThread` for every push that "
+            "happens on a non-UI thread (PacketDrain worker, "
+            "TUN reader thread). All " + str(invoke_call_count) +
+            " invoke sites must be wrapped in a `mainHandler.post "
+            "{ ... }` block (or the `pushToDart` helper which "
+            "calls it). Owner 12:31 regression: the `onPacketsSampled` "
+            "push ran on the `opene2ee-vpn-drain` ScheduledExecutor "
+            "worker thread and the engine rejected the call."
+        )
+    return findings
 
 
 def check_pubspec_webrtc_dep_v16() -> list[str]:
@@ -5968,6 +6126,12 @@ def main() -> int:
         all_findings.extend(s80_findings)
     else:
         print("PASS: OpenE2eeVpnService.kt has tun passthrough (tunOutput.write after tunInput.read) — regression guard for OnePlus 9 Pro internet-killed-by-default-route - Sprint 11.0J S80")
+
+    s82_findings = check_vpn_service_ui_thread_push_v26()
+    if s82_findings:
+        all_findings.extend(s82_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt dispatches MethodChannel.invokeMethod to the Android main looper — regression guard for OnePlus 9 Pro @UiThread violation on PacketDrain worker - Sprint 11.0K S82")
 
     if all_findings:
         print("\nFINDINGS:")

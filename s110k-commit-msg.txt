@@ -1,0 +1,47 @@
+Sprint 11.0K - UI thread dispatch for MethodChannel.invokeMethod (S82 audit)
+
+Owner 12:31 logcat root cause: the Flutter Engine requires
+MethodChannel.invokeMethod to be called on the Android UI
+thread (the main Looper). Pre-11.0K, the three call sites
+(flushTelemetry's onTelemetry, notifyError's onError,
+PacketDrain's onPacketsSampled) invoked methodChannel?
+.invokeMethod directly from their caller threads (TUN reader
+thread + opene2ee-vpn-drain ScheduledExecutor worker thread).
+The engine threw @UiThread violations and Dart never received
+any of the three events.
+
+11.0K fix:
+  1. Companion declares @JvmField val mainHandler: Handler =
+     Handler(Looper.getMainLooper()) (eagerly initialized at
+     class-load time).
+  2. New private helper pushToDart(method, args) that wraps
+     mainHandler.post { methodChannel?.invokeMethod(method, args) }
+     with a defensive try/catch (Log.w on push failure).
+  3. flushTelemetry and notifyError delegate to pushToDart.
+  4. PacketDrain.run inlines OpenE2eeVpnService.mainHandler.post
+     { ch.invokeMethod("onPacketsSampled", packets) }.
+  5. New imports: android.os.Handler + android.os.Looper.
+
+Audit S82 (replaces the misdirected S81 reader-resilience
+audit - real root cause is the @UiThread violation, not
+silent reader crash) verifies:
+  1. import android.os.Handler literal present.
+  2. import android.os.Looper literal present.
+  3. Handler(Looper.getMainLooper()) companion field.
+  4. mainHandler.post dispatch present.
+  5. invoke_call_count <= mainHandler.post_count (anti-pattern
+     guard - no direct methodChannel?.invokeMethod outside a
+     mainHandler.post block).
+
+Verification: 134/134 audit-self-test, all 37 flutter tests
+pass, :app:compileDebugKotlin BUILD SUCCESSFUL, fresh APK
+SHA-256 captured in s110k-final-report.md.
+
+Note: 11.0A introduced a regression - the original S81
+reader-resilience work (per-iteration try/catch + pfd.file
+Descriptor.valid() entry check + output.flush batching every
+100 packets) was applied to startReaderThread, then reverted
+when the real root cause was identified as the @UiThread
+violation on the PacketDrain worker thread (not a silent
+reader crash). The reverted code is preserved in the
+s110k-reverted branch if needed for future defensive work.
