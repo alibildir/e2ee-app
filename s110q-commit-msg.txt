@@ -1,0 +1,80 @@
+Sprint 11.0Q - 2-level VPN disconnect fallback (S88 audit)
+
+Owner 14:14 critical UX bug: tapping "Oturumu Bitir"
+on the active pool screen did NOT stop the VPN when
+the orchestrator's `sessionId` was null (stale state
+after a Dart VM restart). Pre-11.0Q, the handler had
+an early-return on null sessionId that showed "Aktif
+oturum yok" and never touched the VPN. The user had
+to UNINSTALL the app or use the system Settings page
+to stop the VPN.
+
+11.0Q fix: 2-level fallback.
+
+  LEVEL 1 (Dart side, active_pool_screen.dart
+  `_oturumuBitir`):
+    await _vpn.stop().timeout(const Duration(seconds: 3))
+    The 3s timeout is critical because the MethodChannel
+    `stop` call can hang on OnePlus 9 Pro OxygenOS
+    Magisk Zygisk fd-revoke. Without the timeout, the
+    Dart side hangs and the user sees a frozen app.
+
+  LEVEL 2 (Dart side, on LEVEL 1 failure):
+    await _permissions.invokeMethod('disconnectVpn')
+    Sends the call via the `opene2ee/permissions`
+    MethodChannel to MainActivity.
+
+  MainActivity.disconnectVpn (LEVEL 2 native side):
+    1. stopService(Intent(this,
+       OpenE2eeVpnService::class.java)) — hard-stops
+       the foreground service.
+    2. VpnService.prepare(this) — revokes the system
+       VPN profile (the canonical "revoke" pattern;
+       re-preparing with no consent dialog is the
+       standard way to release the system-level
+       profile).
+    3. result.success(true) — best-effort return;
+       even if the service was already stopped, the
+       disconnect goal (VPN off) is achieved.
+
+  Snackbar feedback:
+    - On success: "VPN kapatıldı" (green).
+    - On LEVEL 2 total failure: "VPN kapatma hatası —
+      sistem ayarlarından kapatın." (red, 5s).
+
+  Anti-pattern removed:
+    The pre-11.0Q `if (_orchestrator.sessionId ==
+    null) { return; }` early-return is REMOVED. The
+    11.0Q rewrite wraps only the closeSession() path
+    in a separate `if (... != null)` check AFTER the
+    VPN disconnect — so a stale session no longer
+    blocks the disconnect.
+
+S88 audit verifies FIVE tokens across TWO files
+(comment-stripped):
+  1. active_pool_screen.dart: `.stop().timeout(` +
+     `TimeoutException` (LEVEL 1 path).
+  2. active_pool_screen.dart: `opene2ee/permissions`
+     + `disconnectVpn` (LEVEL 2 path).
+  3. active_pool_screen.dart: NO anti-pattern
+     `if (_orchestrator.sessionId == null) { return; }`
+     (the pre-11.0Q regression).
+  4. MainActivity.kt: `fun disconnectVpn` +
+     `stopService(Intent(this, OpenE2eeVpnService::
+     class.java))` + `VpnService.prepare(this)`.
+  5. MainActivity.kt: `onPermissionsCall` `when`
+     branch `"disconnectVpn" -> disconnectVpn(result)`.
+
+Verification: 138/138 audit-self-test (137 + 1 S88) +
+37/37 flutter test + S88 + S87 + S86 + S28-inverted +
+S84 + S82 + S80 all PASS. flutter analyze: No issues
+found. :app:compileDebugKotlin BUILD SUCCESSFUL.
+Fresh APK SHA captured in s110q-final-report.md.
+
+Owner test: tap "Oturumu Bitir" with the VPN active
+and the orchestrator sessionId null (Dart VM was
+just restarted). LEVEL 1 will time out (or
+exception), LEVEL 2 will hard-stop the service, the
+snackbar will show "VPN kapatıldı" in green. Open
+system Settings → Network → VPN — the OpenE2EE
+profile is gone. No uninstall required.

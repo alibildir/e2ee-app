@@ -17,6 +17,15 @@
 // bounded prefix of the TCP payload to fingerprint the SNI hash. For
 // now it is always `null`.
 //
+// Sprint 11.0A — added [SampledPacket] class. This is the
+// WIRE-FORMAT type the Kotlin `OpenE2eeVpnService` produces —
+// each entry is a `Map<String, Object?>` whose keys match
+// `SampledPacket.toJson()` verbatim. `fromBytes(raw)` is the
+// inverse of the Kotlin extractor for cases where the Dart side
+// needs to re-parse a buffer (e.g. the upcoming Sprint 12
+// perf-pipeline). Audit S49 invariant: this class carries
+// `fromBytes` + `toJson` round-trip methods.
+//
 // Privacy contract (ADR-0006 — verbatim invariants)
 // --------------------------------------------------
 // 1. NO raw packet payload is ever read or stored. The parser
@@ -34,7 +43,7 @@
 // speed; the FFI contract surface is preserved (the public types
 // here are what Kotlin will see when the MethodChannel
 // `getSampledPackets` returns a `List<Map<String, Object?>>` whose
-// values are these `ParsedPacket` instances serialized as
+// values are these `SampledPacket` instances serialized as
 // `toJson()` maps). If Sprint 11+ switches to the Go path, the
 // FFI shape is a drop-in replacement.
 
@@ -302,5 +311,158 @@ class PacketParser {
         (buf[offset + 1] << 16) |
         (buf[offset + 2] << 8) |
         buf[offset + 3];
+  }
+}
+
+// ═══ Sprint 11.0A — SampledPacket (S49 invariant) ═══
+//
+// Wire format produced by the Kotlin `OpenE2eeVpnService`
+// `extractMetadata` (see `mobile/android/app/src/main/kotlin/
+// com/opene2ee/opene2ee/vpn/OpenE2eeVpnService.kt`). The class
+// is the Dart-side mirror of the Kotlin Map shape so the
+// `SampledPacket.fromJson` factory can decode a `List<Map<String,
+// Object?>>` returned by the `getSampledPackets` MethodChannel
+// call, AND `SampledPacket.fromBytes` can re-parse a raw
+// `Uint8List` buffer for the rare case the Dart side wants to
+// inspect a single packet end-to-end. The two factories feed the
+// same field set; the `toJson` round-trips to MethodChannel wire
+// format verbatim.
+//
+// Privacy: every field is already privacy-safe (IP /24 masked,
+// no payload bytes, no device identifiers). `fromBytes` does not
+// retain the input buffer after the call returns (per ADR-0006).
+class SampledPacket {
+  SampledPacket({
+    required this.version,
+    required this.protocol,
+    required this.protocolNumber,
+    required this.packetLength,
+    required this.srcIpMasked,
+    required this.dstIpMasked,
+    this.srcPort,
+    this.dstPort,
+    this.tcpFlags,
+    this.tlsClientHelloFingerprint,
+  });
+
+  /// IP version: 4 or 6.
+  final int version;
+
+  /// L4 protocol name. Mirrors the [Protocol] enum's `name` so
+  /// `SampledPacket.toJson()` produces a string the Dart-side
+  /// `PacketParser.parse` can also parse. `tcp` / `udp` / `icmp`
+  /// / `other`.
+  final String protocol;
+
+  /// Raw IP-protocol number (6 = TCP, 17 = UDP, 1 = ICMP, …).
+  final int protocolNumber;
+
+  /// Total Length (IPv4) or Payload Length (IPv6) at capture
+  /// time. Field name `packetLength` matches the Kotlin
+  /// `extractIpv4` / `extractIpv6` key.
+  final int packetLength;
+
+  /// Source IP, masked at /24 (IPv4) or /48 (IPv6) per ADR-0006.
+  final String srcIpMasked;
+
+  /// Destination IP, masked at /24 (IPv4) or /48 (IPv6) per ADR-0006.
+  final String dstIpMasked;
+
+  /// TCP / UDP source port. `null` for ICMP and OTHER.
+  final int? srcPort;
+
+  /// TCP / UDP destination port. `null` for ICMP and OTHER.
+  final int? dstPort;
+
+  /// TCP flags byte (SYN=0x02, ACK=0x10, FIN=0x01, RST=0x04, …).
+  /// `null` for UDP, ICMP, OTHER.
+  final int? tcpFlags;
+
+  /// TLS ClientHello fingerprint (IPv4: IP-ID hex; IPv6: flow
+  /// label). `null` for UDP/ICMP/OTHER and for IPv6 packets
+  /// without a parseable fingerprint. Mirrors the Kotlin key
+  /// `tlsClientHelloFingerprint`.
+  final String? tlsClientHelloFingerprint;
+
+  /// Round-trip: map → object. Tolerant to missing optional
+  /// fields (the Kotlin side emits `null` for absent srcPort /
+  /// dstPort / tcpFlags / fingerprint). The [protocol] string
+  /// defaults to `'other'` when the wire map does not include
+  /// the field.
+  factory SampledPacket.fromJson(Map<String, Object?> m) {
+    final protoNum = (m['protocolNumber'] as int?) ??
+        _protocolNameToNumber(m['protocol'] as String? ?? 'other');
+    return SampledPacket(
+      version: (m['version'] as int?) ?? 4,
+      protocol: (m['protocol'] as String?) ?? 'other',
+      protocolNumber: protoNum,
+      packetLength: (m['packetLength'] as int?) ??
+          (m['totalLength'] as int?) ??
+          0,
+      srcIpMasked: (m['srcIpMasked'] as String?) ?? '0.0.0.0',
+      dstIpMasked: (m['dstIpMasked'] as String?) ?? '0.0.0.0',
+      srcPort: m['srcPort'] as int?,
+      dstPort: m['dstPort'] as int?,
+      tcpFlags: m['tcpFlags'] as int?,
+      tlsClientHelloFingerprint: m['tlsClientHelloFingerprint'] as String?,
+    );
+  }
+
+  /// Round-trip: raw IP bytes → object. Delegates to the existing
+  /// [PacketParser.parse] for the actual decode; the result is
+  /// then re-shaped into [SampledPacket]. Returns `null` when the
+  /// buffer is too short or the version nibble is unrecognised.
+  static SampledPacket? fromBytes(Uint8List raw) {
+    final parsed = PacketParser.parse(raw);
+    if (parsed == null) return null;
+    return SampledPacket(
+      version: parsed.version,
+      protocol: parsed.protocol.name,
+      protocolNumber: parsed.protocolNumber,
+      packetLength: parsed.totalLength,
+      srcIpMasked: parsed.srcIpMasked,
+      dstIpMasked: parsed.dstIpMasked,
+      srcPort: parsed.srcPort,
+      dstPort: parsed.dstPort,
+      tcpFlags: parsed.tcpFlags,
+      tlsClientHelloFingerprint: parsed.tlsFingerprint,
+    );
+  }
+
+  /// Wire format — matches the keys the Kotlin
+  /// `OpenE2eeVpnService.extractMetadata` emits. Both
+  /// `getSampledPackets` poll (MainActivity) and the
+  /// `onPacketsSampled` event (PacketDrain) feed this exact
+  /// shape into the Dart side.
+  Map<String, Object?> toJson() => {
+        'version': version,
+        'protocol': protocol,
+        'protocolNumber': protocolNumber,
+        'packetLength': packetLength,
+        'srcIpMasked': srcIpMasked,
+        'dstIpMasked': dstIpMasked,
+        if (srcPort != null) 'srcPort': srcPort,
+        if (dstPort != null) 'dstPort': dstPort,
+        if (tcpFlags != null) 'tcpFlags': tcpFlags,
+        if (tlsClientHelloFingerprint != null)
+          'tlsClientHelloFingerprint': tlsClientHelloFingerprint,
+      };
+
+  @override
+  String toString() => 'SampledPacket($srcIpMasked→$dstIpMasked '
+      '$protocol ${srcPort ?? '-'}→${dstPort ?? '-'} '
+      'len=$packetLength)';
+}
+
+int _protocolNameToNumber(String name) {
+  switch (name) {
+    case 'tcp':
+      return 6;
+    case 'udp':
+      return 17;
+    case 'icmp':
+      return 1;
+    default:
+      return 0;
   }
 }

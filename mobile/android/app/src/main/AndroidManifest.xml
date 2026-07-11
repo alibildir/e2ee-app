@@ -29,6 +29,19 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!--
+      Sprint 11.0A — `FOREGROUND_SERVICE_DATA_SYNC` (Android 14+,
+      API 34) lets the foreground service type be declared as
+      "dataSync" in addition to the existing "specialUse". Some
+      OEM ROMs (e.g. MIUI, OxygenOS) prefer the dataSync type for
+      apps whose foreground task is periodic data upload. Declared
+      alongside (not replacing) `FOREGROUND_SERVICE_SPECIAL_USE` so
+      the service can declare EITHER type in the
+      `foregroundServiceType` attribute and survive the variety
+      check on Android 14+ devices. See
+      https://developer.android.com/about/versions/14/changes/fgs-types-required
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <!--
       Sprint 7 Item 15 / MOB-10 — Biometric prompt (fingerprint / face)
@@ -114,12 +127,22 @@
           android:foregroundServiceType="specialUse" is the Android 14+
           requirement for VPN services that don't fall under the system
           category. The <property> tag explains the special use case.
+
+          Sprint 11.0A — Service description updated to mirror the
+          new "OpenE2EE Şifreleme Doğrulama" notification title
+          (S25 invariant: no "VPN" string anywhere user-visible).
+          The PRIVACY_TEXT eki ("Ağınızda şifreleme bütünlüğü
+          doğrulama oturumu — sadece /24 (IPv4) ve /48 (IPv6) maskeli
+          IP üstbilgisi cihazdan dışarı çıkar") is the disclosure
+          required by Android 14+ specialUse subtype. See
+          docs/ADR-0006-anonimlik.md §"Veri Minimizasyonu".
         -->
         <service
             android:name="com.opene2ee.opene2ee.vpn.OpenE2eeVpnService"
             android:exported="true"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse"
+            android:description="@string/open_e2ee_sifreleme_dogrulama_service_description">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="network_diagnostic_sampling_for_e2ee_proof" />

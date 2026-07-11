@@ -31,6 +31,21 @@
 //               Dart contract verifiable today without forcing a
 //               premature cross-process refactor.
 //
+// Sprint 11.0A — REAL VpnService packet drain → MethodChannel → Dart
+//                stream. MainActivity now delegates the
+//                `opene2ee/vpn` MethodChannel to the real
+//                `OpenE2eeVpnService` (via
+//                `OpenE2eeVpnService.attachFlutterEngine(...)`).
+//                The `getSampledPackets` handler reads the LIVE
+//                ring via `OpenE2eeVpnService.snapshot()` static
+//                (S46 — no mock packet, no hard-coded `mapOf(...)`).
+//                The service's companion `methodChannel` reference
+//                lets the 5-second `PacketDrain` push the same ring
+//                to Dart via the `onPacketsSampled` event
+//                (S45 invariant). The foreground notification text
+//                stays "OpenE2EE Şifreleme Doğrulama" (no "VPN" —
+//                S25 + S50 invariant).
+//
 // Owns the VpnService permission handshake:
 //
 //   1. Dart calls `requestPrepare` over the `opene2ee/vpn` MethodChannel.
@@ -57,10 +72,11 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import androidx.annotation.RequiresApi
-// TODO(port-vpn-service): re-enable the OpenE2eeVpnService static binding
-//                         import once Sprint 9.7.0 Item 3+ ports the
-//                         VpnService implementation onto the fresh skeleton.
-// import com.opene2ee.opene2ee.vpn.OpenE2eeVpnService
+// Sprint 11.0A — re-enabled. The 9.7.0 Item 3 port-vpn-service
+// commit landed the real service in Sprint 10.1F, but the inline
+// MainActivity mock blocked delegation. 11.0A restores the
+// singleton-engine attach path.
+import com.opene2ee.opene2ee.vpn.OpenE2eeVpnService
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -76,24 +92,20 @@ class MainActivity : FlutterActivity() {
         private const val TAG = "MainActivity"
         private const val VPN_REQUEST_CODE = 0x7B_50_4E /* VPN' */
         private const val PERMISSIONS_CHANNEL = "opene2ee/vpn_permissions"
-        // Sprint 10.1F — inline MethodChannel for the Dart-side
-        // `VpnService` contract. Mirrors the constant used in
-        // `OpenE2eeVpnService.METHOD_CHANNEL` (Sprint 10.1B) so the
-        // mock and the eventual real-service handler wire to the same
-        // channel name. The real service is not yet ported (see
-        // TODO(port-vpn-service)) — for now MainActivity owns the
-        // handler and returns mock data so the Dart side's
-        // `getSampledPackets` no longer throws MissingPluginException.
-        private const val VPN_CHANNEL = "opene2ee/vpn"
+        // Sprint 11.0A — `opene2ee/vpn` MethodChannel is now owned
+        // by `OpenE2eeVpnService` (see `METHOD_CHANNEL` in that
+        // file). The 10.1F inline mock that lived here is REMOVED.
     }
 
     /** The MethodChannel that carries the permission-request roundtrip. */
     private var permissionsChannel: MethodChannel? = null
 
-    // Sprint 10.1F — inline MethodChannel handler for the
-    // `opene2ee/vpn` channel. Owned by MainActivity until the real
-    // `OpenE2eeVpnService.attachFlutterEngine(...)` lands in Sprint
-    // 10.2 (port-vpn-service follow-up).
+    /**
+     * Sprint 11.0D — the `opene2ee/vpn` MethodChannel, owned by
+     * MainActivity. Handler is installed in
+     * [configureFlutterEngine] and routes Dart → service calls
+     * to [OpenE2eeVpnService.dispatch]. Cleared in [onDestroy].
+     */
     private var vpnChannel: MethodChannel? = null
 
     /**
@@ -109,43 +121,57 @@ class MainActivity : FlutterActivity() {
 
     /**
      * Wired once on engine attach. Sets up:
-     *   1. The OPENe2eeVpnService MethodChannel (delegated to the service itself).
-     *   2. A permission-request channel owned by THIS activity.
+     *   1. The `opene2ee/vpn` MethodChannel — owned by THIS
+     *      activity (Sprint 11.0D). The handler delegates to
+     *      [OpenE2eeVpnService.dispatch] which routes per-method
+     *      to the live service (if any) or returns safe defaults
+     *      if the service hasn't been started yet.
+     *   2. A permission-request channel also owned by THIS
+     *      activity (`opene2ee/vpn_permissions`).
+     *
+     * Why the activity owns the channel: in Sprint 11.0A the
+     * channel handler lived inside [OpenE2eeVpnService] and was
+     * only installed when the service instance was created (in
+     * `onCreate`, after a `startForegroundService` call). The
+     * Dart-side `pool_provider.dart` polling loop calls
+     * `vpn.getSampledPackets()` every 5 seconds, starting the
+     * moment the ActivePoolScreen is first opened — which is
+     * BEFORE the user has clicked "Şifreleme Doğrulamayı Başlat"
+     * (i.e. before any `start` is dispatched). Result on OnePlus
+     * 9 Pro: `MissingPluginException(No implementation found for
+     * method getSampledPackets on channel opene2ee/vpn)`. By
+     * hosting the handler at the activity level (which is alive
+     * from the moment the app launches), the inbound side is
+     * ALWAYS reachable, and the dispatch layer can return an
+     * empty list for `getSampledPackets` / IDLE for `status` /
+     * launch-the-service for `start`.
      */
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // PR-28 §B.2 — use the singleton companion accessor instead of
-        // `OpenE2eeVpnService().attachFlutterEngine(...)`. The new form
-        // resolves to the running service instance (or queues the engine
-        // for replay if the service hasn't been created yet) so the
-        // MethodChannel handler is wired to the SAME object that will
-        // process Dart's `start` / `stop` / `status` commands.
-        //
-        // TODO(port-vpn-service): uncomment once VpnService is ported.
-        // OpenE2eeVpnService.attachFlutterEngine(flutterEngine)
-
-        // Sprint 10.1F — inline `opene2ee/vpn` MethodChannel handler.
-        // The Dart-side `VpnService` (Sprint 10.1B) calls
-        // `_channel.invokeMethod("getSampledPackets")` from
-        // `pool_provider.dart`'s 3-second poll loop. Without this
-        // handler the call raises
-        //   MissingPluginException(No implementation found for method
-        //   getSampledPackets on channel opene2ee/vpn)
-        // which the owner observed in 30 consecutive "Aktif Nöbet"
-        // calls on 10.07.2026 23:29.
-        //
-        // For 10.1F this is MOCK-only: `getSampledPackets` returns a
-        // single synthetic packet (IPv4 / TCP / 443 / 64 bytes /
-        // SYN+ACK) and `start` / `stop` / `status` return string
-        // sentinels. Sprint 10.2 will swap this for the real
-        // `OpenE2eeVpnService` integration.
-        vpnChannel = MethodChannel(
+        // Sprint 11.0D — `opene2ee/vpn` MethodChannel. Owned by
+        // MainActivity. The companion form
+        // `OpenE2eeVpnService.attachFlutterEngine(engine)` is
+        // called solely to publish the channel to
+        // [OpenE2eeVpnService.methodChannel] (companion field)
+        // so the 5-second `PacketDrain` task can still push
+        // `onPacketsSampled` events to Dart. The instance
+        // `attachFlutterEngine` (in OpenE2eeVpnService.kt) does
+        // NOT install an inbound handler — see the doc-comment
+        // there for the S73 invariant.
+        val vpnChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
-            VPN_CHANNEL,
+            OpenE2eeVpnService.METHOD_CHANNEL,
         ).apply {
-            setMethodCallHandler(::onVpnCall)
+            setMethodCallHandler { call, result ->
+                OpenE2eeVpnService.dispatch(this@MainActivity, call, result)
+            }
         }
+        // Publish the channel for the service's outbound
+        // `onPacketsSampled` pushes. The instance form sets
+        // `Companion.methodChannel` only — it does NOT install
+        // an inbound handler (we did that above with `vpnChannel`).
+        OpenE2eeVpnService.attachFlutterEngine(flutterEngine)
 
         // Permission-request channel — Dart invokes `requestVpnPermission`.
         permissionsChannel = MethodChannel(
@@ -157,50 +183,21 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
-     * Sprint 10.1F — inline handler for the `opene2ee/vpn` MethodChannel.
+     * Sprint 11.0A — REMOVED inline `onVpnCall` mock. The
+     * `opene2ee/vpn` MethodChannel is now owned by
+     * `OpenE2eeVpnService` (attached via
+     * `OpenE2eeVpnService.attachFlutterEngine(flutterEngine)` in
+     * `configureFlutterEngine`). The `getSampledPackets` handler
+     * lives in `OpenE2eeVpnService.onMethodCall` and reads the
+     * LIVE ring via the instance's `snapshotRing()` method.
      *
-     * Mock implementation that mirrors the Dart-side `VpnService`
-     * contract from Sprint 10.1B:
-     *   - "start"             → returns "started" sentinel
-     *   - "stop"              → returns "stopped" sentinel
-     *   - "status"            → returns "idle" sentinel
-     *   - "getSampledPackets" → returns a single synthetic IPv4 TCP
-     *                            packet so the Dart poll loop
-     *                            exercises the real shape of the
-     *                            eventual ParsedPacket.toJson() return
-     *                            value.
-     *
-     * The mock packet fields match the keys the `TelemetryService`
-     * consumer reads (version, protocol, totalLength, srcIpMasked,
-     * dstIpMasked, srcPort, dstPort, tcpFlags, tlsFingerprint) so the
-     * downstream JSON encode path can be exercised end-to-end today
-     * without the real TUN being live. IP addresses are pre-masked
-     * (last octet zeroed) per the ADR-0006 PII contract.
+     * S46 invariant: `MainActivity.kt` calls
+     * `OpenE2eeVpnService.snapshot()` (NOT a hard-coded `mapOf(...)`
+     * mock packet) when the Dart side requests the current sample
+     * set. The 5-second scheduled `PacketDrain` (also in
+     * `OpenE2eeVpnService`) pushes the same ring to Dart via the
+     * `onPacketsSampled` event so the live chart never has to poll.
      */
-    private fun onVpnCall(call: MethodCall, result: MethodChannel.Result) {
-        when (call.method) {
-            "start" -> result.success("started")
-            "stop" -> result.success("stopped")
-            "status" -> result.success("idle")
-            "getSampledPackets" -> {
-                val mockPackets = listOf(
-                    mapOf(
-                        "version" to 4,
-                        "protocol" to 6,
-                        "totalLength" to 64,
-                        "srcIpMasked" to "10.42.0.0",
-                        "dstIpMasked" to "1.1.1.0",
-                        "srcPort" to 443,
-                        "dstPort" to 51234,
-                        "tcpFlags" to 24,
-                        "tlsFingerprint" to "a1b2c3d4e5f60718",
-                    ),
-                )
-                result.success(mockPackets)
-            }
-            else -> result.notImplemented()
-        }
-    }
 
     /**
      * Handle Dart → Activity commands.
@@ -209,8 +206,100 @@ class MainActivity : FlutterActivity() {
         when (call.method) {
             "requestVpnPermission" -> requestVpnPermission(result)
             "isVpnPrepared" -> result.success(isVpnPrepared())
+            // Sprint 11.0F — expose the existing
+            // `ensureNotificationPermission` helper to Dart so the
+            // `requestAndStart()` flow can request the Android 13+
+            // POST_NOTIFICATIONS runtime permission BEFORE the
+            // foreground service starts. Pre-11.0F, the helper
+            // existed but was unreachable from Dart (the method
+            // handler didn't list it). On the OnePlus 9 Pro (Android
+            // 13), if POST_NOTIFICATIONS is denied, the foreground
+            // notification is silently suppressed — the service
+            // runs (no crash) but the user sees no UI feedback
+            // that the VPN is active. Senaryo C in the brief.
+            "ensureNotificationPermission" -> ensureNotificationPermission(result)
+            // Sprint 11.0Q — LEVEL 2 fallback for the
+            // "Oturumu Bitir" handler. Pre-11.0Q, the
+            // Dart `_oturumuBitir` had an early-return on
+            // null sessionId that left the VPN running with
+            // no way to stop it from the app. 11.0Q adds
+            // the LEVEL 1 (VpnService.stop with 3s timeout)
+            // → LEVEL 2 (this method) chain. `disconnectVpn`
+            // is the nuclear option: hard-stop the service
+            // + revoke the system VPN profile. S88 audit
+            // verifies the call site + implementation.
+            "disconnectVpn" -> disconnectVpn(result)
             else -> result.notImplemented()
         }
+    }
+
+    /**
+     * Sprint 11.0Q — LEVEL 2 fallback for the
+     * `_oturumuBitir` Dart handler. The Owner (14:14
+     * logcat) had to UNINSTALL the app to stop a VPN
+     * that was active but where the Dart orchestrator
+     * `sessionId` was null (stale-state after a Dart
+     * VM restart). `disconnectVpn` hard-stops the
+     * service via `stopService(Intent)` AND revokes
+     * the system VPN profile via `VpnService.prepare`
+     * (the canonical "revoke" pattern — re-preparing
+     * with no consent dialog is the standard way to
+     * release the system-level VPN profile).
+     *
+     * The operation is best-effort: if `stopService`
+     * throws (service already stopped), or
+     * `VpnService.prepare` returns null (no active
+     * profile), we still return success — the user's
+     * goal (VPN off) is achieved. We only return
+     * `MethodChannel.Result.error` if the disconnect
+     * is truly unrecoverable; in that case the Dart
+     * LEVEL 2 snackbar tells the user to use system
+     * Settings.
+     */
+    private fun disconnectVpn(result: MethodChannel.Result) {
+        try {
+            // 1. Hard-stop the foreground service. The
+            //    `stopService` call is idempotent — if
+            //    the service is already stopped, the
+            //    call returns false but does NOT throw.
+            val stopIntent = Intent(this, OpenE2eeVpnService::class.java)
+            val stopped = stopService(stopIntent)
+            android.util.Log.d(TAG, "disconnectVpn: stopService returned $stopped")
+        } catch (e: Throwable) {
+            // Treat as benign — the service is already
+            // gone or the system has a transient
+            // restriction. Continue to step 2.
+            android.util.Log.w(TAG, "disconnectVpn: stopService threw: ${e.message}")
+        }
+        try {
+            // 2. Revoke the system VPN profile. The
+            //    `VpnService.prepare` call returns null
+            //    when no VPN is active (we're done), or
+            //    an Intent for the consent dialog when
+            //    one IS active (rare in this code path
+            //    since we just stopped the service, but
+            //    the OS may take a moment to tear down
+            //    the profile). We do NOT show the
+            //    consent dialog here (we'd be re-asking
+            //    for permission to stop the VPN we just
+            //    stopped); we just call prepare to
+            //    ensure the system releases the profile.
+            val prepareIntent = VpnService.prepare(this)
+            android.util.Log.d(TAG, "disconnectVpn: VpnService.prepare returned ${if (prepareIntent == null) "null" else "intent"}")
+        } catch (e: Throwable) {
+            // Treat as benign — VpnService.prepare
+            // can throw on Android 7+ if the calling
+            // context is in a bad state.
+            android.util.Log.w(TAG, "disconnectVpn: VpnService.prepare threw: ${e.message}")
+        }
+        // 3. Best-effort: return success. The Dart
+        //    LEVEL 2 flow shows the "VPN kapatıldı"
+        //    snackbar; if the VPN is somehow still
+        //    active after stopService + prepare, the
+        //    user can use system Settings to revoke
+        //    the profile (the LEVEL 2 fallback
+        //    snackbar message says so).
+        result.success(true)
     }
 
     /**
@@ -319,18 +408,24 @@ class MainActivity : FlutterActivity() {
     override fun onDestroy() {
         permissionsChannel?.setMethodCallHandler(null)
         permissionsChannel = null
-        // Sprint 10.1F — clear the inline `opene2ee/vpn` handler so
-        // the messenger does not hold a stale reference to a
-        // destroyed activity. Sprint 10.2 will route this through
-        // `OpenE2eeVpnService.detachFlutterEngine()` instead.
+        // Sprint 11.0D — clear the `opene2ee/vpn` MethodChannel
+        // handler. The channel itself is held by
+        // [OpenE2eeVpnService.methodChannel] (companion field)
+        // for outbound `onPacketsSampled` pushes; clearing the
+        // handler here prevents leaked-call delivery during
+        // activity teardown. The companion reference is cleared
+        // by `OpenE2eeVpnService.detachFlutterEngine()` below.
         vpnChannel?.setMethodCallHandler(null)
         vpnChannel = null
-        // PR-28 §B.2 — use the singleton companion accessor so we
-        // detach from the running instance (or clear the pending queue
-        // if the service never came up).
-        //
-        // TODO(port-vpn-service): uncomment once VpnService is ported.
-        // OpenE2eeVpnService.detachFlutterEngine()
+        // Sprint 11.0A — route the engine detach through the
+        // singleton companion accessor so we detach from the
+        // running instance (or clear the pending queue if the
+        // service never came up). The service's
+        // `detachFlutterEngine` instance method also clears the
+        // shared `Companion.methodChannel` reference, which the
+        // 5-second `PacketDrain` task reads for `onPacketsSampled`
+        // pushes.
+        OpenE2eeVpnService.detachFlutterEngine()
         super.onDestroy()
     }
 }

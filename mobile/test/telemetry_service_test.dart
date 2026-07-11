@@ -124,5 +124,65 @@ void main() {
       expect(calls, 0);
       svc.close();
     });
+
+    // Sprint 11.0A — 30-second summary batch upload (S52).
+    test('sendSummary 202 Accepted → posts to /api/v1/sessions/{id}/telemetry',
+        () async {
+      http.Client client = MockClient((req) async {
+        expect(req.method, 'POST');
+        // Sprint 11.0A S52 — endpoint carries the per-session
+        // `/api/v1/sessions/{id}/telemetry` path; the per-packet
+        // `/api/v1/telemetry` path stays for `send()`.
+        expect(req.url.path, '/api/v1/sessions/sess-test/telemetry');
+        final body = jsonDecode(req.body) as Map<String, Object?>;
+        expect(body['sessionId'], 'sess-test');
+        expect(body['totalPackets'], 1234);
+        expect(body['encryptedPackets'], 1230);
+        expect(body['packetLossPct'], 0.4);
+        expect(body['meanLatencyMs'], 12.7);
+        expect(body['jitterMs'], 3.2);
+        expect(body['encryptionIntegrityPct'], 99.7);
+        expect(body['windowStart'], isA<String>());
+        expect(body['windowEnd'], isA<String>());
+        return http.Response('', 202);
+      });
+      final svc = TelemetryService(
+        client: client,
+        apiKey: 'test-key',
+        sessionId: 'sess-test',
+      );
+      await svc.sendSummary(
+        totalPackets: 1234,
+        encryptedPackets: 1230,
+        packetLossPct: 0.4,
+        meanLatencyMs: 12.7,
+        jitterMs: 3.2,
+        encryptionIntegrityPct: 99.7,
+      );
+      svc.close();
+    });
+
+    test('sendSummary 401 → throws TelemetryException', () async {
+      http.Client client = MockClient((req) async {
+        return http.Response('unauthorized', 401);
+      });
+      final svc = TelemetryService(
+        client: client,
+        apiKey: 'bad-key',
+        sessionId: 'sess-test',
+      );
+      expect(
+        () => svc.sendSummary(
+          totalPackets: 0,
+          encryptedPackets: 0,
+          packetLossPct: 0,
+          meanLatencyMs: 0,
+          jitterMs: 0,
+          encryptionIntegrityPct: 0,
+        ),
+        throwsA(isA<TelemetryException>()),
+      );
+      svc.close();
+    });
   });
 }

@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../screens/active_pool_screen.dart';
 import '../screens/bilgilendirme_screen.dart';
 import '../screens/home_screen.dart';
+import '../screens/skorlar_screen.dart';
 import '../screens/whatsapp_task_detail_screen.dart';
 import '../state/is_accepted_provider.dart';
 
@@ -17,7 +18,7 @@ import '../state/is_accepted_provider.dart';
 ///   /home                              → HomeScreen (Görevler tab)
 ///   /home/gorevler                     → HomeScreen (alias of /home)
 ///   /home/aktif-nobet                  → ActivePoolScreen
-///   /home/skorlar                      → HomeScreen placeholder (Sprint 10.2+)
+///   /home/skorlar                      → SkorlarScreen (Sprint 11.0C)
 ///   /home/gorevler/whatsapp            → WhatsAppTaskDetailScreen
 class AppRouter {
   AppRouter._();
@@ -67,58 +68,15 @@ class AppRouter {
         builder: (context, state) => const ActivePoolScreen(),
       ),
       GoRoute(
+        // Sprint 11.0C — the Sprint 10.2+ placeholder is
+        // replaced by the real Skorlar screen. The new screen
+        // hits `GET /api/v1/sessions?status=completed` and
+        // renders the per-session score card list. The route
+        // path is unchanged so the bottom-nav 3rd tab still
+        // lands here.
         path: '/home/skorlar',
-        builder: (context, state) => const _SkorlarPlaceholder(),
+        builder: (context, state) => const SkorlarScreen(),
       ),
     ],
   );
-}
-
-/// Sprint 10.2+ placeholder. Today: same shell as HomeScreen with a
-/// "Skorlar — Sprint 10.2+" message so the bottom-nav 3rd tab is
-/// discoverable but does not lie about a missing screen.
-class _SkorlarPlaceholder extends StatelessWidget {
-  const _SkorlarPlaceholder();
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Skorlar'),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () => context.go('/home/gorevler'),
-        ),
-      ),
-      body: const Center(
-        child: Padding(
-          padding: EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.bar_chart_outlined, size: 48, color: Color(0xFF7C7A72)),
-              SizedBox(height: 12),
-              Text(
-                'Skorlar — Sprint 10.2+',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                  color: Color(0xFF14171E),
-                ),
-              ),
-              SizedBox(height: 6),
-              Text(
-                'fl_chart entegrasyonu Sprint 10.2 ile gelecek.',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 13,
-                  color: Color(0xFF7C7A72),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 }

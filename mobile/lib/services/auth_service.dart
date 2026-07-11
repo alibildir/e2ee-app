@@ -83,6 +83,13 @@ class AuthService {
   final Duration _timeout;
   final Duration _refreshSkew;
 
+  /// Public accessor for the underlying [http.Client] so
+  /// consumers (e.g. the Skorlar screen) can share the same
+  /// connection pool + timeouts instead of minting a fresh
+  /// client per request. Sprint 11.0C — added for
+  /// `SkorlarScreen._fetchScores`.
+  http.Client get client => _client;
+
   /// Cached JWT. `null` when no token has been fetched yet,
   /// OR after a 401 (the [invalidate] call flushed it).
   String? _cachedToken;

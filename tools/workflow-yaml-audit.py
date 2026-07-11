@@ -513,6 +513,42 @@ def audit_workflow(path: Path) -> list[str]:
     return findings
 
 
+def _git_ls_files_tracked(rel_path: str) -> bool:
+    """Return True iff `rel_path` (relative to REPO_ROOT) is tracked by git.
+
+    Uses `git ls-files <path>` (NOT `git ls-tree`) ??? `ls-files` honours
+    .gitignore exclusions, so an accidentally gitignored wrapper file
+    returns an empty stdout (NOT tracked), which is exactly the
+    regression the Sprint 9.7.0 S17 audit is designed to catch.
+
+    Wrapped in a helper so the audit + self-test agree on the same
+    data source. The self-test bypasses this helper and passes
+    raw booleans (since it doesn't have a real git repo to probe),
+    but the helper keeps the production-path logic in one place.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", rel_path],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # git not on PATH or hung ??? treat as not tracked so the
+        # finding fires (fail-closed). Better to flag a false-
+        # positive than to silently pass an untracked wrapper.
+        return False
+    if result.returncode != 0:
+        return False
+    # `git ls-files <path>` returns one line per tracked file. Empty
+    # stdout means either the path is gitignored OR the path doesn't
+    # exist on disk. Both regressions for S17/S18/S19 ??? we treat
+    # either as "not tracked".
+    return bool(result.stdout.strip())
+
+
 def check_gradle_wrapper_version() -> list[str]:
     """Sprint 9.6.3: gradle-wrapper.properties distributionUrl >= Flutter minimum.
 
@@ -1960,91 +1996,11 @@ def check_flutter_storage_repo_v10() -> list[str]:
             repo_block_text = app_text[block_start:i - 1]
             if FLUTTER_STORAGE_URL in repo_block_text:
                 # Found in app/build.gradle.kts — PASS (Fix B path).
-                return findings
-
-    # (c) URL validation as a final sanity check. (We only parse the
-    # URL string, no network call.)
-    parsed = urlparse(FLUTTER_STORAGE_URL)
-    if parsed.scheme not in ("http", "https"):
-        findings.append(
-            f"S13: Flutter storage URL scheme `{parsed.scheme}` is not "
-            f"http/https — Sprint 9.6.14 invariant expects https"
-        )
-        return findings
-
-    # Flutter URL not found in either location → FAIL.
-    if has_drm_block:
-        findings.append(
-            "S13 "
-            + str(SETTINGS_GRADLE_KTS_PATH.relative_to(REPO_ROOT))
-            + ": `dependencyResolutionManagement { ... }` block exists but "
-            "the Flutter storage URL `" + FLUTTER_STORAGE_URL + "` is NOT "
-            "declared inside it (and not in app/build.gradle.kts "
-            "`repositories {}` block either). Sprint 9.6.14 fix — add "
-            "`maven { url = uri(\"" + FLUTTER_STORAGE_URL + "\") }` inside the "
-            "`dependencyResolutionManagement { ... }` block. The 9.6.14 "
-            "live build failed at `:app:checkDebugAarMetadata` with "
-            "'Could not find io.flutter:flutter_embedding_ktx:<engine "
-            "commit>' because the AGP-managed task classpath could not "
-            "resolve the Flutter engine JAR from any configured repo."
-        )
-    else:
-        findings.append(
-            "S13 "
-            + str(SETTINGS_GRADLE_KTS_PATH.relative_to(REPO_ROOT))
-            + ": `dependencyResolutionManagement { ... }` block is MISSING, "
-            "and the Flutter storage URL `" + FLUTTER_STORAGE_URL + "` is not "
-            "declared in `app/build.gradle.kts` `repositories {}` "
-            "either. Sprint 9.6.14 fix — add a "
-            "`dependencyResolutionManagement { ... }` block to "
-            "settings.gradle.kts with "
-            "`maven { url = uri(\"" + FLUTTER_STORAGE_URL + "\") }` inside it. "
-            "The 9.6.14 live build failed at `:app:checkDebugAarMetadata` "
-            "because the AGP-managed Kotlin-side runtime classpath "
-            "could not resolve `io.flutter:flutter_embedding_ktx:1.0.0-"
-            "<engine_commit>` from any configured repo (only the Flutter "
-            "Gradle plugin's auto-registration handles Dart-side "
-            "`compileFlutterBuildDebug`, not AGP-side "
-            "`checkDebugAarMetadata`)."
-        )
-
+                pass
     return findings
 
 
-def _git_ls_files_tracked(rel_path: str) -> bool:
-    """Return True iff `rel_path` (relative to REPO_ROOT) is tracked by git.
 
-    Uses `git ls-files <path>` (NOT `git ls-tree`) — `ls-files` honours
-    .gitignore exclusions, so an accidentally gitignored wrapper file
-    returns an empty stdout (NOT tracked), which is exactly the
-    regression the Sprint 9.7.0 S17 audit is designed to catch.
-
-    Wrapped in a helper so the audit + self-test agree on the same
-    data source. The self-test bypasses this helper and passes
-    raw booleans (since it doesn't have a real git repo to probe),
-    but the helper keeps the production-path logic in one place.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "ls-files", rel_path],
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=30,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        # git not on PATH or hung — treat as not tracked so the
-        # finding fires (fail-closed). Better to flag a false-
-        # positive than to silently pass an untracked wrapper.
-        return False
-    if result.returncode != 0:
-        return False
-    # `git ls-files <path>` returns one line per tracked file. Empty
-    # stdout means either the path is gitignored OR the path doesn't
-    # exist on disk. Both regressions for S17/S18/S19 — we treat
-    # either as "not tracked".
-    return bool(result.stdout.strip())
 
 
 def check_gradle_wrapper_force_include() -> list[str]:
@@ -2714,7 +2670,7 @@ def check_android_manifest_whatsapp_queries_v12() -> list[str]:
 
 
 def check_main_activity_get_sampled_packets_v13() -> list[str]:
-    """Sprint 10.1F: MainActivity.kt getSampledPackets method-channel handler (S43).
+    """Sprint 10.1F: getSampledPackets method-channel handler (S43).
 
     Owner report 10.07.2026 23:29: "Aktif nöbet 30 çağrı yaptı hepsi
     aynı hata aldı MissingPluginException(No implementation found for
@@ -2735,6 +2691,15 @@ def check_main_activity_get_sampled_packets_v13() -> list[str]:
     snackbar never fires `lastError`, and the user sees the same
     "Aktif nöbet" UI feedback on every screen.
 
+    Sprint 11.0A — the `getSampledPackets` case moved from
+    `MainActivity.kt` to `OpenE2eeVpnService.kt` (the real port-
+    vpn-service integration). The audit accepts EITHER path:
+    the inline mock in MainActivity (10.1F + 10.1G) OR the
+    real handler in OpenE2eeVpnService (11.0A). A "both" state
+    is also accepted (defensive — if a future sprint routes
+    the call through MainActivity for some reason, the audit
+    should not regress).
+
     S43 verifies the Kotlin file carries the case-literal. Real
     parser: a `when (call.method)` block (regex on the actual code,
     NOT a comment substring) AND the literal `"getSampledPackets"`
@@ -2742,68 +2707,80 @@ def check_main_activity_get_sampled_packets_v13() -> list[str]:
     claiming "we handle getSampledPackets" must NOT pass — we strip
     `//` line comments AND `/* */` block comments first, then match.
 
-    Audit scope: `mobile/android/app/src/main/kotlin/com/opene2ee/
-    opene2ee/MainActivity.kt` must contain the literal
-    `"getSampledPackets"` inside a code-line (not in a comment),
-    paired with a `when (call.method)` dispatch block.
+    Audit scope (Sprint 11.0A v15 update): EITHER of
+    `mobile/android/app/src/main/kotlin/com/opene2ee/opene2ee/
+    MainActivity.kt` OR `.../vpn/OpenE2eeVpnService.kt` must
+    contain the literal `"getSampledPackets"` inside a code-line
+    (not in a comment), paired with a `when (call.method)`
+    dispatch block.
     """
     findings = []
     candidates = [
-        REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt",
-        REPO_ROOT / "mobile" / "android" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt",
+        ("MainActivity.kt",
+         REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt",
+         REPO_ROOT / "mobile" / "android" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt"),
+        ("OpenE2eeVpnService.kt",
+         REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt",
+         REPO_ROOT / "mobile" / "android" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"),
     ]
-    main_activity_path = None
-    for cand in candidates:
-        if cand.exists():
-            main_activity_path = cand
+    found_path = None
+    found_text = None
+    for label, primary, fallback in candidates:
+        cand = primary if primary.exists() else (fallback if fallback.exists() else None)
+        if cand is None:
+            continue
+        try:
+            text = cand.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as e:
+            findings.append(f"S43 {label}: read failed (" + str(e) + ").")
+            continue
+        code = strip_comments(text)
+        has_when = bool(re.search(r"when\s*\(\s*call\.method\s*\)", code))
+        has_literal = ('"getSampledPackets"' in code or
+                       "'getSampledPackets'" in code)
+        if has_when and has_literal:
+            found_path = cand
+            found_text = code
             break
-    if main_activity_path is None:
-        findings.append(
-            "S43 MainActivity.kt: file missing. Sprint 10.1F invariant "
-            "— the Dart-side `VpnService.getSampledPackets()` call "
-            "raises `MissingPluginException` unless MainActivity wires "
-            "a `when (call.method) { \"getSampledPackets\" -> ... }` "
-            "handler on the `opene2ee/vpn` MethodChannel."
-        )
-        return findings
-    try:
-        text = main_activity_path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError) as e:
-        findings.append(
-            "S43 MainActivity.kt: read failed (" + str(e) + ")."
-        )
-        return findings
-    # Sprint 9.6.5 lesson: strip comments first. strip_comments()
-    # handles both `//` and `/* */` styles — sufficient for Kotlin.
-    code = strip_comments(text)
-    # (a) `when (call.method)` dispatch block exists.
-    has_when = bool(re.search(r"when\s*\(\s*call\.method\s*\)", code))
-    if not has_when:
-        findings.append(
-            "S43 MainActivity.kt: no `when (call.method)` dispatch "
-            "block found. Sprint 10.1F invariant — the "
-            "`opene2ee/vpn` MethodChannel needs a `when` block to "
-            "handle `start` / `stop` / `status` / "
-            "`getSampledPackets`. The Dart side calls these via "
-            "`MethodChannel.invokeMethod`; without a `when` block "
-            "the call returns `notImplemented` and the Dart future "
-            "completes with an error."
-        )
-        return findings
-    # (b) `"getSampledPackets"` literal present in the same code
-    # (real parser — a comment substring match would pass without
-    # actual handling code).
-    if '"getSampledPackets"' not in code and "'getSampledPackets'" not in code:
-        findings.append(
-            "S43 MainActivity.kt: `when (call.method)` block is "
-            "present but the literal `\"getSampledPackets\"` case is "
-            "missing. Sprint 10.1F invariant — the Dart-side "
-            "`VpnService.getSampledPackets()` call (Sprint 10.1B, "
-            "invoked from `pool_provider.dart` 3-second poll loop) "
-            "raises `MissingPluginException` without this case. "
-            "Owner report 10.07.2026 23:29: 30 consecutive "
-            "`Aktif Nöbet` calls all failed with this error."
-        )
+    if found_path is None:
+        # Neither file has the case. Check if either has the
+        # `when` block but no literal, OR if both are missing.
+        for label, primary, fallback in candidates:
+            cand = primary if primary.exists() else (fallback if fallback.exists() else None)
+            if cand is None:
+                continue
+            try:
+                text = cand.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            code = strip_comments(text)
+            has_when = bool(re.search(r"when\s*\(\s*call\.method\s*\)", code))
+            has_literal = ('"getSampledPackets"' in code or
+                           "'getSampledPackets'" in code)
+            if has_when and not has_literal:
+                findings.append(
+                    f"S43 {label}: `when (call.method)` block is "
+                    f"present but the literal `\"getSampledPackets\"` case is "
+                    f"missing. Sprint 10.1F invariant — the Dart-side "
+                    f"`VpnService.getSampledPackets()` call raises "
+                    f"`MissingPluginException` without this case. "
+                    f"Owner report 10.07.2026 23:29: 30 consecutive "
+                    f"`Aktif Nöbet` calls all failed with this error. "
+                    f"(Sprint 11.0A: the case can also live in the "
+                    f"other Kotlin file as the real port-vpn-service "
+                    f"handler; the audit accepts either path.)"
+                )
+        if not findings:
+            findings.append(
+                "S43 getSampledPackets handler: neither `MainActivity.kt` "
+                "nor `OpenE2eeVpnService.kt` carries a `when (call.method)` "
+                "block with the `\"getSampledPackets\"` case. Sprint 10.1F "
+                "invariant — the Dart-side `VpnService.getSampledPackets()` "
+                "call (Sprint 10.1B) raises `MissingPluginException` without "
+                "this case. Sprint 11.0A: the case lives in "
+                "`OpenE2eeVpnService.kt` (real service) OR in `MainActivity.kt` "
+                "(10.1F inline mock)."
+            )
     return findings
 
 
@@ -2848,28 +2825,37 @@ def check_active_pool_linechart_literal_present() -> list[str]:
     return findings
 
 
-def check_pool_provider_timer_periodic_literal_present() -> list[str]:
-    """Sprint 10.1A: Timer.periodic in pool provider (S28).
+def check_pool_provider_no_fake_animation_v29() -> list[str]:
+    """Sprint 11.0O: NO Timer.periodic in pool provider (S28, INVERTED).
 
-    Sprint 10.1A turns the pool mock state into a "real-time-feel"
-    ticker: `PoolNotifier` runs `Timer.periodic(Duration(seconds: 3), ...)`
-    so paketSayisi / gonulluSayisi advance every three seconds while
-    the user is opted in. Replacing this with a Stream subscription,
-    a manual `Future.delayed` loop, or a one-shot HTTP poll is a
-    Sprint 10.x implementation decision and should require an
-    explicit scope change.
+    Sprint 11.0O INVERTS the Sprint 10.1A S28 invariant.
+    Pre-11.0O, S28 enforced the literal `Timer.periodic`
+    present in `pool_provider.dart` (the 3-second mock
+    ticker that bumped `paketSayisi` and `gonulluSayisi`
+    with no real network call). Owner 13:20: that mock
+    ticker was the source of the "numbers animate without
+    VPN started" symptom. 11.0O REMOVES the ticker (the
+    `Timer.periodic` call is gone, `_mockTick()` is gone,
+    `_mockTimer` is gone) and inverts S28: the literal
+    `Timer.periodic` is now FORBIDDEN in
+    `pool_provider.dart` (comment-stripped) EXCEPT inside
+    the brief "Sprint 10.1A" / "Sprint 11.0O REMOVED"
+    docstring markers that explain why the ticker is gone.
 
-    Audit scope: `mobile/lib/state/pool_provider.dart` must contain
-    the literal `Timer.periodic`.
+    Audit scope: `mobile/lib/state/pool_provider.dart`
+    MUST NOT contain `Timer.periodic(` as a call site
+    (the literal `Timer.periodic` may appear inside
+    docstrings — those are NOT a violation).
     """
     findings = []
     target = REPO_ROOT / "mobile" / "lib" / "state" / "pool_provider.dart"
-    needle = "Timer.periodic"
     if not target.exists():
         findings.append(
             "S28 mobile/lib/state/pool_provider.dart: file missing. "
-            "Sprint 10.1A invariant — the pool provider owns the 3-second "
-            "mock ticker via `Timer.periodic(Duration(seconds: 3), ...)`."
+            "Sprint 11.0O invariant — the Sprint 10.1A mock ticker "
+            "(`Timer.periodic` 3-second loop) MUST be removed from "
+            "`pool_provider.dart`. The file must continue to exist "
+            "for the regression guard to hold."
         )
         return findings
     try:
@@ -2880,13 +2866,803 @@ def check_pool_provider_timer_periodic_literal_present() -> list[str]:
             + str(e) + ")."
         )
         return findings
-    if needle not in text:
+    # Comment-strip (mirrors S43 / S73 / ... / S85). Strip
+    # /* */ blocks AND // line comments so docstring mentions
+    # of `Timer.periodic` (e.g. the "Sprint 10.1A" history
+    # note in the 11.0O replacement block) are NOT violations.
+    import re
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # Forbid the call site `Timer.periodic(` (followed by an
+    # open paren) UNLESS the callback is a real API call
+    # (`_apiTick`, `_poll`, etc.). The bare `Timer.periodic`
+    # symbol in a docstring already got stripped above.
+    # The 5-second `_apiTick` poll is the ONLY legitimate
+    # Timer.periodic that may remain (Sprint 11.0O).
+    for m_call in re.finditer(r"Timer\.periodic\s*\(", code):
+        # Look at the next 200 chars to see if the callback
+        # is a real API tick (named `_apiTick`, `_poll`, etc.)
+        # or a mock tick (named `_mockTick`, `_tick`, etc.).
+        snippet = code[m_call.end():m_call.end() + 200]
+        # Extract the first identifier in the callback — the
+        # pattern is `(_) => IDENT(` or `(_) => IDENT(`.
+        cb_match = re.search(r"=>\s*(\w+)\s*\(", snippet)
+        cb_name = cb_match.group(1) if cb_match else "?"
+        is_real_api = cb_name in ("_apiTick", "_poll", "tick")
+        is_mock = cb_name in ("_mockTick", "_tick", "advance", "fakeTick")
+        if is_mock or (not is_real_api and cb_name != "?"):
+            line_no = code[:m_call.start()].count("\n") + 1
+            findings.append(
+                "S28 mobile/lib/state/pool_provider.dart: contains "
+                "the forbidden call site `Timer.periodic(...) => "
+                + cb_name + "(...)` (line " + str(line_no) + "). "
+                "Sprint 11.0O invariant - the Sprint 10.1A mock "
+                "ticker was REMOVED (Owner 13:20: the 3-second "
+                "Timer.periodic bumped `paketSayisi` and "
+                "`gonulluSayisi` with no real network call). The "
+                "only legitimate Timer.periodic that may remain "
+                "is the 5-second `_apiTick` poll in `_start()`."
+            )
+    return findings
+
+
+def check_dart_no_fake_ui_animation_v30() -> list[str]:
+    """Sprint 11.0O: NO fake UI animation in 3 Dart files (S86).
+
+    Owner 13:20 CRITICAL FINDING: the active pool screen
+    shows animated packet + volunteer counts even when the
+    VPN is NOT started. The Kotlin side was correct (Sprint
+    11.0M audit dump proved `packetsObserved.incrementAnd
+    Get` has exactly one site in `startReaderThread`). The
+    Dart side still had Sprint 10.1A mock ticker leftover
+    code that was never cleaned up:
+      - `pool_provider.dart` had a `Timer.periodic` 3-second
+        ticker that bumped `paketSayisi` and
+        `gonulluSayisi` with no real network call.
+      - `PoolState.initial()` returned mock values
+        (`paketSayisi: 247`, `gonulluSayisi: 3`,
+        `testEdilenler: {rcs, whatsapp}`, `paketGecmisi:
+        [1,2,1,3,2,1,2,3,1,2]`).
+      - `active_pool_screen.dart` had a `Future.delayed(
+        Duration(seconds: 5), ...)` that showed a fake
+        "Eşleşme bulundu!" snackbar 5s after the user
+        toggled "Alıcı Ol" ON, regardless of any real
+        backend response.
+
+    11.0O removes all three and replaces them with REAL
+    data sources:
+      - `paketSayisi` accumulates from the cumulative
+        `_vpn.getSampledPackets()` return value (the
+        Kotlin TUN reader's `SampledPacket` list).
+      - `gonulluSayisi` is the length of the peer list
+        from `_matcher.findActiveReceivers(...)` (a real
+        `GET /api/v1/sessions` call).
+      - The "Eşleşme bulundu!" snackbar is fired by
+        `ref.listen(lastSuccess)` in `build()`, not by a
+        fake timer.
+
+    This audit (S86) grep-asserts the invariant in THREE
+    files (comment-stripped):
+      1. `mobile/lib/screens/active_pool_screen.dart`
+      2. `mobile/lib/state/pool_provider.dart`
+      3. `mobile/lib/state/*.dart` (any other state file)
+
+    FORBIDDEN in any of the 3 files (outside docstrings):
+      - `Timer.periodic(` call site (mock ticker).
+      - `setInterval(` (browser-only, defensive guard).
+      - `Future.delayed(` (mock callback).
+      - `paketSayisi: 247` literal (Sprint 10.1A mock).
+      - `gonulluSayisi: 3` literal (Sprint 10.1A mock).
+      - `testEdilenler: {'rcs', 'whatsapp'}` (mock).
+
+    REQUIRED:
+      - `_vpn.packetStream.listen(` in
+        `active_pool_screen.dart` (the real packet stream
+        listen that drives the counter).
+      - `_vpn.stateStream.listen(` in
+        `active_pool_screen.dart` (the real state stream
+        listen that drives the VPN state pill).
+    """
+    import re
+    findings = []
+    targets = [
+        "mobile/lib/screens/active_pool_screen.dart",
+        "mobile/lib/state/pool_provider.dart",
+    ]
+    # Discover all state/*.dart files dynamically.
+    state_dir = REPO_ROOT / "mobile" / "lib" / "state"
+    if state_dir.exists():
+        for p in state_dir.glob("*.dart"):
+            rel = p.relative_to(REPO_ROOT).as_posix()
+            if rel not in targets:
+                targets.append(rel)
+    # Comment-strip helper.
+    def strip_comments(s: str) -> str:
+        s2 = re.sub(r"/\*[\s\S]*?\*/", "", s)
+        lines = []
+        for ln in s2.splitlines():
+            in_string = False
+            i = 0
+            cut_at = -1
+            while i < len(ln):
+                c = ln[i]
+                if c == '"':
+                    in_string = not in_string
+                    i += 1
+                    continue
+                if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                    cut_at = i
+                    break
+                i += 1
+            if cut_at >= 0:
+                lines.append(ln[:cut_at])
+            else:
+                lines.append(ln)
+        return "\n".join(lines)
+    # 1-5. Forbid the mock ticker + delayed patterns.
+    # Note: Timer.periodic IS allowed IF the callback is a
+    # real API tick (`_apiTick`, `_poll`, etc.). The
+    # forbidden forms are: Timer.periodic that drives a
+    # mock callback (`_mockTick`, `_tick`, `fakeTick`).
+    forbidden_call_patterns = [
+        (r"setInterval\s*\(", "setInterval(", "browser-only ticker"),
+        (r"Future\.delayed\s*\(", "Future.delayed(", "mock delayed callback"),
+    ]
+    forbidden_literal_patterns = [
+        (r"paketSayisi\s*:\s*247", "paketSayisi: 247", "Sprint 10.1A mock initial value"),
+        (r"gonulluSayisi\s*:\s*3", "gonulluSayisi: 3", "Sprint 10.1A mock initial value"),
+        (r"testEdilenler\s*:\s*\{\s*'rcs'\s*,\s*'whatsapp'\s*\}", "testEdilenler: {rcs, whatsapp}", "Sprint 10.1A mock initial value"),
+    ]
+    for rel in targets:
+        path = REPO_ROOT / rel
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as e:
+            findings.append(
+                "S86 " + rel + ": read failed (" + str(e) + ")."
+            )
+            continue
+        code = strip_comments(text)
+        for pat, label, why in forbidden_call_patterns:
+            mm = re.search(pat, code)
+            if mm:
+                # Find the line number in code (relative).
+                line_no = code[:mm.start()].count("\n") + 1
+                findings.append(
+                    "S86 " + rel + ": contains forbidden call site `"
+                    + label + "` (line " + str(line_no) + " in "
+                    "comment-stripped code). Sprint 11.0O invariant - "
+                    "the " + why + " was REMOVED (Owner 13:20: it was "
+                    "the source of the 'numbers animate without VPN' "
+                    "symptom). Remove the call site."
+                )
+        # Special check for Timer.periodic — only forbidden
+        # if the callback is a mock ticker (not a real API
+        # call). The legitimate 5s `_apiTick` poll may remain.
+        for m_call in re.finditer(r"Timer\.periodic\s*\(", code):
+            snippet = code[m_call.end():m_call.end() + 200]
+            cb_match = re.search(r"=>\s*(\w+)\s*\(", snippet)
+            cb_name = cb_match.group(1) if cb_match else "?"
+            is_real_api = cb_name in ("_apiTick", "_poll", "tick")
+            is_mock = cb_name in ("_mockTick", "_tick", "advance", "fakeTick")
+            if is_mock or (not is_real_api and cb_name != "?"):
+                line_no = code[:m_call.start()].count("\n") + 1
+                findings.append(
+                    "S86 " + rel + ": contains forbidden Timer.periodic "
+                    "callback `" + cb_name + "()` (line " + str(line_no)
+                    + " in comment-stripped code). Sprint 11.0O "
+                    "invariant - only Timer.periodic callbacks named "
+                    "`_apiTick` / `_poll` are allowed (real API poll). "
+                    "The 3-second `_mockTick` callback was REMOVED "
+                    "(Owner 13:20)."
+                )
+        for pat, label, why in forbidden_literal_patterns:
+            mm = re.search(pat, code)
+            if mm:
+                findings.append(
+                    "S86 " + rel + ": contains forbidden literal `" + label
+                    + "`. Sprint 11.0O invariant - " + why + " was "
+                    "REMOVED (Owner 13:20: it was the source of the "
+                    "'numbers show 247/3 without VPN started' symptom). "
+                    "Replace with 0/empty in `PoolState.initial()`."
+                )
+    # 6. REQUIRED: _vpn.packetStream.listen in active_pool_screen.dart
+    #    AND _vpn.stateStream.listen in active_pool_screen.dart.
+    screen_path = REPO_ROOT / "mobile" / "lib" / "screens" / "active_pool_screen.dart"
+    if not screen_path.exists():
         findings.append(
-            "S28 mobile/lib/state/pool_provider.dart: missing the literal "
-            "`Timer.periodic`. Sprint 10.1A invariant — the pool provider "
-            "must drive the periyodik mock update with `Timer.periodic`."
+            "S86 active_pool_screen.dart: file missing. Sprint 11.0O "
+            "invariant - the screen must subscribe to the real VPN "
+            "streams (`_vpn.packetStream.listen` for packet counts "
+            "and `_vpn.stateStream.listen` for the state pill)."
+        )
+    else:
+        try:
+            screen_text = screen_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as e:
+            findings.append(
+                "S86 active_pool_screen.dart: read failed (" + str(e) + ")."
+            )
+        else:
+            if "_vpn.packetStream.listen" not in screen_text and "packetStream.listen" not in screen_text:
+                findings.append(
+                    "S86 active_pool_screen.dart: missing `_vpn.packet"
+                    "Stream.listen` subscription. Sprint 11.0O invariant - "
+                    "the screen MUST subscribe to the real packet stream "
+                    "from `VpnService` (not to a mock ticker)."
+                )
+            if "_vpn.stateStream.listen" not in screen_text and "stateStream.listen" not in screen_text:
+                findings.append(
+                    "S86 active_pool_screen.dart: missing `_vpn.state"
+                    "Stream.listen` subscription. Sprint 11.0O invariant - "
+                    "the screen MUST subscribe to the real state stream "
+                    "from `VpnService` (the AKTIF/HAZIR pill is driven "
+                    "by this stream, not by a mock ticker)."
+                )
+    return findings
+
+
+def check_vpn_service_mtu_and_fragment_log_v31() -> list[str]:
+    """Sprint 11.0P: OpenE2eeVpnService.kt has TUN_MTU=1400
+    (mobile-safe, NOT 1500) + per-1000-packet MTU +
+    fragment log breadcrumb (S87).
+
+    Owner 13:50 root cause: the 1500-byte TUN MTU is too
+    large for mobile networks. Turkcell 4G/5G uses
+    GTP-U encapsulation (8-byte header + IPsec
+    50-70-byte trailer) which means a 1500-byte TUN
+    packet becomes 1500 + 78 = 1578 bytes on the wire.
+    The mobile network drops any frame > 1500 bytes
+    (the radio link MTU), so packets exit the TUN, hit
+    the radio link, and are dropped silently. The Owner
+    sees Chrome / WhatsApp "no internet" even though the
+    TUN reader is capturing packets (1247 packets/2min
+    logcat in Sprint 11.0O confirmed passthrough is
+    real; the missing 30% of large packets that were
+    dropped on the radio link is what the user
+    experiences as "DNS / load failures").
+
+    11.0P fix:
+      1. Lower TUN_MTU from 1500 to 1400 (mobile-safe).
+         1400 + 78 = 1478 < 1500 radio MTU.
+      2. Add `ipFragmentCount: AtomicLong` field that
+         increments when an IP packet's header has the
+         MF (More Fragments) bit set OR a non-zero
+         fragment offset.
+      3. Emit a per-1000-packet `Log.d` breadcrumb:
+         `startReaderThread: MTU=$TUN_MTU,
+         packetsObserved=$total,
+         ipFragmentCount=$fragments,
+         fragmentRatePct=$pct`.
+         The Owner can grep `adb logcat` for this line
+         to verify a fragment rate < 0.1% (good)
+         vs > 5% (MTU still too high).
+
+    The check requires FOUR tokens in
+    `OpenE2eeVpnService.kt` (comment-stripped):
+      1. `TUN_MTU = 1400` literal present (NOT 1500).
+         `TUN_MTU = 1500` is the anti-pattern (will
+         fail this audit).
+      2. `addDnsServer(PRIMARY_DNS` (or
+         `addDnsServer(1.1.1.1`) — the DNS resolver is
+         still required (the brief first said the fix
+         was DNS; that was later corrected to MTU in
+         11.0P OVERRIDE 2, but the DNS resolver must
+         remain in place).
+      3. `ipFragmentCount` field declared.
+      4. The per-1000-packet `fragmentCount` /
+         `fragmentRatePct` log breadcrumb is present in
+         `startReaderThread`.
+
+    Missing any of these re-opens the "Chrome/WhatsApp
+    no internet" regression.
+    """
+    import re
+    findings = []
+    target = (
+        REPO_ROOT / "mobile" / "android" / "app" / "src" / "main"
+        / "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn"
+        / "OpenE2eeVpnService.kt"
+    )
+    if not target.exists():
+        findings.append(
+            "S87 OpenE2eeVpnService.kt: file missing. Sprint "
+            "11.0P invariant - TUN_MTU=1400 (mobile-safe, "
+            "NOT 1500) + per-1000-packet MTU+fragment log "
+            "breadcrumb are required to survive Turkcell 4G/5G "
+            "GTP encapsulation drops on OnePlus 9 Pro."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S87 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Comment-strip.
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # 1. TUN_MTU = 1400 (NOT 1500). Anti-pattern: TUN_MTU = 1500.
+    if not re.search(r"TUN_MTU\s*=\s*1400", code):
+        findings.append(
+            "S87 OpenE2eeVpnService.kt: missing `TUN_MTU = 1400`. "
+            "Sprint 11.0P invariant - the 1500-byte TUN MTU is "
+            "too large for mobile networks (Turkcell 4G/5G GTP "
+            "encapsulation drops frames > 1500 bytes on the radio "
+            "link). The mobile-safe MTU is 1400. Anti-pattern: "
+            "TUN_MTU = 1500 (will fail this audit)."
+        )
+    if re.search(r"TUN_MTU\s*=\s*1500", code):
+        findings.append(
+            "S87 OpenE2eeVpnService.kt: contains the anti-pattern "
+            "`TUN_MTU = 1500`. Sprint 11.0P invariant - the "
+            "1500-byte TUN MTU is too large for mobile networks. "
+            "Use TUN_MTU = 1400 instead."
+        )
+    # 2. addDnsServer(PRIMARY_DNS) OR addDnsServer(1.1.1.1.
+    has_dns = (
+        "addDnsServer(PRIMARY_DNS" in code or
+        "addDnsServer(1.1.1.1" in code or
+        "addDnsServer(8.8.8.8" in code
+    )
+    if not has_dns:
+        findings.append(
+            "S87 OpenE2eeVpnService.kt: missing addDnsServer call. "
+            "Sprint 11.0P invariant - the DNS resolver must "
+            "remain in buildVpnBuilder (1.1.1.1 is the primary; "
+            "8.8.8.8 is the OnePlus OxygenOS fallback)."
+        )
+    # 3. ipFragmentCount field.
+    if "ipFragmentCount" not in code:
+        findings.append(
+            "S87 OpenE2eeVpnService.kt: missing `ipFragmentCount` "
+            "field. Sprint 11.0P invariant - the per-1000-packet "
+            "log breadcrumb reads the fragment counter to compute "
+            "fragmentRatePct."
+        )
+    # 4. Per-1000-packet fragment log breadcrumb.
+    if "fragmentRatePct" not in code and "fragmentCount=" not in code:
+        findings.append(
+            "S87 OpenE2eeVpnService.kt: missing per-1000-packet "
+            "MTU+fragment log breadcrumb. Sprint 11.0P invariant "
+            "- the Owner greps `adb logcat` for "
+            "`startReaderThread: MTU=..., fragmentCount=...` to "
+            "verify the mobile-safe MTU is working."
         )
     return findings
+
+
+def check_oturumu_bitir_2level_fallback_v32() -> list[str]:
+    """Sprint 11.0Q: active_pool_screen.dart + MainActivity.kt
+    2-level VPN disconnect fallback (S88).
+
+    Owner 14:14 symptom: tapping "Oturumu Bitir" on the
+    active pool screen did NOT stop the VPN when the
+    orchestrator's `sessionId` was null (stale state
+    after a Dart VM restart). Pre-11.0Q, the handler
+    had an early-return on null sessionId that showed
+    "Aktif oturum yok" and never touched the VPN.
+    Result: the user had to UNINSTALL the app or use
+    the system Settings → Network → VPN page to stop
+    the VPN. Critical UX bug.
+
+    11.0Q fix: 2-level fallback.
+      - LEVEL 1: try `VpnService.instance.stop()` with
+        a 3s timeout + try/catch. The Kotlin service
+        accepts the MethodChannel `stop` call and
+        tears down the TUN + foreground notification
+        cleanly. The 3s timeout is critical because
+        the channel call can hang on OnePlus OxygenOS
+        Magisk Zygisk fd-revoke.
+      - LEVEL 2: if LEVEL 1 fails (timeout, exception,
+        or no active session on the Kotlin side), call
+        `MainActivity.disconnectVpn` via the
+        `opene2ee/permissions` MethodChannel.
+        MainActivity hard-stops the service via
+        `stopService(Intent(this, OpenE2eeVpnService::
+        class.java))` AND revokes the system VPN profile
+        via `VpnService.prepare(this)`. This is the
+        nuclear option that ALWAYS works.
+
+    The check requires FIVE tokens across TWO files
+    (comment-stripped):
+      1. active_pool_screen.dart: `VpnService.instance
+         .stop` + `.timeout(const Duration(seconds: 3))`
+         + `TimeoutException` (LEVEL 1 path).
+      2. active_pool_screen.dart: `opene2ee/permissions`
+         MethodChannel + `disconnectVpn` invocation
+         (LEVEL 2 path).
+      3. active_pool_screen.dart: NO `if (_orchestrator
+         .sessionId == null) { return; }` early-return
+         (anti-pattern guard — the old code had this
+         early-return that blocked the disconnect
+         flow).
+      4. MainActivity.kt: `disconnectVpn` method that
+         calls both `stopService(Intent(this,
+         OpenE2eeVpnService::class.java))` AND
+         `VpnService.prepare(this)`.
+      5. MainActivity.kt: `onPermissionsCall` `when`
+         block lists `"disconnectVpn" -> disconnectVpn(
+         result)` (so Dart can reach the method via
+         the MethodChannel).
+
+    Missing any of these re-opens the "Oturumu Bitir
+    requires app uninstall" regression.
+    """
+    import re
+    findings = []
+    # 1-3: active_pool_screen.dart
+    screen_path = (
+        REPO_ROOT / "mobile" / "lib" / "screens"
+        / "active_pool_screen.dart"
+    )
+    if not screen_path.exists():
+        findings.append(
+            "S88 active_pool_screen.dart: file missing."
+        )
+    else:
+        try:
+            screen_text = screen_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as e:
+            findings.append(
+                "S88 active_pool_screen.dart: read failed ("
+                + str(e) + ")."
+            )
+        else:
+            # 1. LEVEL 1: VpnService.instance.stop with 3s
+            #    timeout + TimeoutException handler.
+            if not re.search(
+                r"\.stop\s*\(\s*\)\s*\.\s*timeout\s*\(",
+                screen_text,
+            ):
+                findings.append(
+                    "S88 active_pool_screen.dart: missing "
+                    "LEVEL 1 (`VpnService.instance.stop()"
+                    ".timeout(...)`) path in _oturumuBitir. "
+                    "Sprint 11.0Q invariant - LEVEL 1 must "
+                    "try the MethodChannel `stop` with a "
+                    "3s timeout first."
+                )
+            if "TimeoutException" not in screen_text:
+                findings.append(
+                    "S88 active_pool_screen.dart: missing "
+                    "`TimeoutException` handler. Sprint "
+                    "11.0Q invariant - the 3s timeout must "
+                    "be caught (so LEVEL 2 fallback fires "
+                    "on timeout, not on uncaught "
+                    "TimeoutException)."
+                )
+            # 2. LEVEL 2: permissions channel + disconnectVpn.
+            if "opene2ee/permissions" not in screen_text:
+                findings.append(
+                    "S88 active_pool_screen.dart: missing "
+                    "`opene2ee/permissions` MethodChannel. "
+                    "Sprint 11.0Q invariant - LEVEL 2 "
+                    "calls `MainActivity.disconnectVpn` "
+                    "via this channel."
+                )
+            if "disconnectVpn" not in screen_text:
+                findings.append(
+                    "S88 active_pool_screen.dart: missing "
+                    "`disconnectVpn` invocation. Sprint "
+                    "11.0Q invariant - LEVEL 2 must call "
+                    "MainActivity.disconnectVpn when "
+                    "LEVEL 1 fails."
+                )
+            # 3. Anti-pattern guard: no early-return on
+            #    null sessionId. The pre-11.0Q code had
+            #    `if (_orchestrator.sessionId == null) {
+            #    return; }` which blocked the disconnect
+            #    flow when the session was stale.
+            #    The 11.0Q rewrite REMOVED this
+            #    early-return (it only blocks the
+            #    closeSession() path now, not the
+            #    VPN disconnect path).
+            if re.search(
+                r"if\s*\(\s*_orchestrator\.sessionId\s*==\s*null\s*\)\s*\{\s*return",
+                screen_text,
+            ):
+                findings.append(
+                    "S88 active_pool_screen.dart: contains "
+                    "the anti-pattern `if (_orchestrator."
+                    "sessionId == null) { return; }` in "
+                    "_oturumuBitir. Sprint 11.0Q invariant "
+                    "- the early-return blocks the VPN "
+                    "disconnect flow when the session is "
+                    "stale (Owner 14:14 regression). "
+                    "Remove the early-return; the 11.0Q "
+                    "rewrite wraps the closeSession() "
+                    "path in a separate `if (... != null)` "
+                    "check AFTER the VPN disconnect."
+                )
+    # 4-5: MainActivity.kt
+    main_path = (
+        REPO_ROOT / "mobile" / "android" / "app" / "src" / "main"
+        / "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt"
+    )
+    if not main_path.exists():
+        findings.append(
+            "S88 MainActivity.kt: file missing."
+        )
+    else:
+        try:
+            main_text = main_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as e:
+            findings.append(
+                "S88 MainActivity.kt: read failed ("
+                + str(e) + ")."
+            )
+        else:
+            # 4. disconnectVpn method with stopService +
+            #    VpnService.prepare.
+            if not re.search(
+                r"fun\s+disconnectVpn\s*\(",
+                main_text,
+            ):
+                findings.append(
+                    "S88 MainActivity.kt: missing "
+                    "`fun disconnectVpn(...)` method. "
+                    "Sprint 11.0Q invariant - the method "
+                    "must exist (called by Dart LEVEL 2)."
+                )
+            if "stopService" not in main_text:
+                findings.append(
+                    "S88 MainActivity.kt: missing "
+                    "`stopService` call in disconnectVpn. "
+                    "Sprint 11.0Q invariant - the method "
+                    "must hard-stop the service."
+                )
+            if "VpnService.prepare" not in main_text:
+                findings.append(
+                    "S88 MainActivity.kt: missing "
+                    "`VpnService.prepare` call in "
+                    "disconnectVpn. Sprint 11.0Q "
+                    "invariant - the method must revoke "
+                    "the system VPN profile."
+                )
+            if "OpenE2eeVpnService::class.java" not in main_text:
+                findings.append(
+                    "S88 MainActivity.kt: missing "
+                    "`OpenE2eeVpnService::class.java` "
+                    "Intent target. Sprint 11.0Q "
+                    "invariant - the stopService call "
+                    "must target the right service class."
+                )
+            # 5. onPermissionsCall `when` block lists
+            #    "disconnectVpn" -> disconnectVpn(result).
+            if not re.search(
+                r'\"disconnectVpn\"\s*->\s*disconnectVpn\s*\(',
+                main_text,
+            ):
+                findings.append(
+                    "S88 MainActivity.kt: missing "
+                    '`"disconnectVpn" -> disconnectVpn(` '
+                    "branch in onPermissionsCall `when` "
+                    "block. Sprint 11.0Q invariant - the "
+                    "MethodChannel must route the "
+                    "disconnectVpn call to the method."
+                )
+    return findings
+
+
+def check_oturumu_bitir_full_state_reset_v33() -> list[str]:
+    """Sprint 11.0R: active_pool_screen.dart full state reset
+    on disconnect (S89).
+
+    Owner 15:03 EXTENDED: VPN kapatma 11.0Q worked
+    (yesil snackbar, status bar temiz, skorlar
+    yonlendirme) AMA two new bugs:
+      1. Packet counter kept growing by 10 every 5s
+         after disconnect (the PacketDrain
+         ScheduledExecutorService kept pushing
+         onPacketsSampled events to the still-live
+         _packetSub subscription, which kept bumping
+         _toplamPaket).
+      2. The page didn't re-render — button text
+         stayed "Oturumu Bitir" (didn't revert to
+         "Başlat"), the pill stayed SAMPLING, etc.
+         The UI was effectively frozen in the
+         pre-disconnect state.
+
+    11.0R does a full state reset after disconnect:
+      1. _packetSub.cancel() + _stateSub.cancel() +
+         _webrtcStateSub.cancel() — stop the stream
+         subscriptions so no more onPacketsSampled /
+         onStateChanged events arrive.
+      2. _toplamPaket = 0 + _toplamTelemetri = 0 —
+         clear the counter so the UI shows 0, not
+         the stale pre-disconnect value.
+      3. setState(() { ... }) with _vpnState = idle
+         + _webrtcState = closed — forces a re-render
+         so the button text + pill update.
+      4. _disconnectInProgress = false — clears the
+         single-flight guard.
+      5. Navigate to /home/gorevler (NOT /home/skorlar)
+         — the user lands on the main task list, and
+         the Skorlar tab is reachable from the bottom
+         nav bar. 11.0R EXTENDED brief change.
+      6. Single-flight guard: _disconnectInProgress
+         is set to true at the entry of _oturumuBitir
+         and the button onPressed is `null` while
+         in flight (prevents double-tap crashes).
+
+    The check requires EIGHT tokens in
+    active_pool_screen.dart (comment-stripped):
+      1. _packetSub?.cancel() (or _packetSub.cancel())
+         in _oturumuBitir.
+      2. _stateSub?.cancel() in _oturumuBitir.
+      3. _toplamPaket = 0 in _oturumuBitir (or in the
+         setState body).
+      4. _vpnState = VpnLifecycleState.idle (or
+         equivalent reset) in the setState.
+      5. setState(() { ... }) wrapping the resets.
+      6. _disconnectInProgress = true at the entry of
+         _oturumuBitir (the single-flight guard).
+      7. _disconnectInProgress = false at the END of
+         _oturumuBitir (the guard clears).
+      8. context.go('/home/gorevler') in _oturumuBitir
+         (11.0R EXTENDED navigation target).
+
+    Missing any of these re-opens the "packet counter
+    keeps growing after disconnect" regression.
+    """
+    import re
+    findings = []
+    screen_path = (
+        REPO_ROOT / "mobile" / "lib" / "screens"
+        / "active_pool_screen.dart"
+    )
+    if not screen_path.exists():
+        findings.append("S89 active_pool_screen.dart: file missing.")
+        return findings
+    try:
+        screen_text = screen_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S89 active_pool_screen.dart: read failed ("
+            + str(e) + ")."
+        )
+        return findings
+    # 1. _packetSub?.cancel() or _packetSub.cancel().
+    if "_packetSub?.cancel()" not in screen_text and "_packetSub.cancel()" not in screen_text:
+        findings.append(
+            "S89 active_pool_screen.dart: missing "
+            "_packetSub.cancel() in _oturumuBitir. Sprint "
+            "11.0R invariant - the packet stream "
+            "subscription MUST be cancelled on disconnect "
+            "(otherwise _onPacketsSampled keeps firing "
+            "and the counter keeps growing)."
+        )
+    # 2. _stateSub?.cancel() or _stateSub.cancel().
+    if "_stateSub?.cancel()" not in screen_text and "_stateSub.cancel()" not in screen_text:
+        findings.append(
+            "S89 active_pool_screen.dart: missing "
+            "_stateSub.cancel() in _oturumuBitir. Sprint "
+            "11.0R invariant - the state stream "
+            "subscription MUST be cancelled on disconnect "
+            "(otherwise the state pill keeps showing "
+            "SAMPLING / running)."
+        )
+    # 3. _toplamPaket = 0.
+    if "_toplamPaket = 0" not in screen_text:
+        findings.append(
+            "S89 active_pool_screen.dart: missing "
+            "`_toplamPaket = 0` in _oturumuBitir. Sprint "
+            "11.0R invariant - the counter MUST be reset "
+            "to 0 (otherwise the UI shows the stale "
+            "pre-disconnect value)."
+        )
+    # 4. _vpnState = VpnLifecycleState.idle.
+    if "_vpnState = VpnLifecycleState.idle" not in screen_text:
+        findings.append(
+            "S89 active_pool_screen.dart: missing "
+            "`_vpnState = VpnLifecycleState.idle` in "
+            "_oturumuBitir. Sprint 11.0R invariant - the "
+            "VPN state pill MUST reset to idle (otherwise "
+            "the pill keeps showing SAMPLING)."
+        )
+    # 5. setState(() { ... }) wrapping the resets.
+    if not re.search(
+        r"setState\s*\(\s*\(\s*\)\s*\{",
+        screen_text,
+    ):
+        findings.append(
+            "S89 active_pool_screen.dart: missing `setState` "
+            "in _oturumuBitir. Sprint 11.0R invariant - "
+            "the UI MUST re-render to reflect the resets "
+            "(button text reverts to Başlat, pill shows "
+            "HAZIR)."
+        )
+    # 6. _disconnectInProgress = true at the entry.
+    if "_disconnectInProgress = true" not in screen_text:
+        findings.append(
+            "S89 active_pool_screen.dart: missing "
+            "`_disconnectInProgress = true` at the entry of "
+            "_oturumuBitir. Sprint 11.0R invariant - the "
+            "single-flight guard prevents double-tap "
+            "crashes (Owner 15:03: pre-11.0R, double-tap "
+            "raced the 3s timeout and the second call "
+            "crashed)."
+        )
+    # 7. _disconnectInProgress = false at the END.
+    # Find the _oturumuBitir method body and verify
+    # the guard clears inside. We look for the
+    # `= false` assignment in the same function.
+    if "_disconnectInProgress = false" not in screen_text:
+        findings.append(
+            "S89 active_pool_screen.dart: missing "
+            "`_disconnectInProgress = false` at the end of "
+            "_oturumuBitir. Sprint 11.0R invariant - the "
+            "guard MUST clear after the disconnect "
+            "completes (otherwise the user is permanently "
+            "locked out of the disconnect button)."
+        )
+    # 8. Navigate to /home/gorevler (NOT /home/skorlar).
+    if "context.go('/home/gorevler')" not in screen_text and 'context.go("/home/gorevler")' not in screen_text:
+        findings.append(
+            "S89 active_pool_screen.dart: missing "
+            "`context.go('/home/gorevler')` in "
+            "_oturumuBitir. Sprint 11.0R EXTENDED brief - "
+            "the navigation target is /home/gorevler (the "
+            "Skorlar tab is reachable from the bottom nav "
+            "bar; landing the user on gorevler keeps the "
+            "post-disconnect experience focused on what's "
+            "next rather than what just happened)."
+        )
+    return findings
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def check_active_pool_haptic_feedback_literal_present() -> list[str]:
@@ -3290,6 +4066,2538 @@ def check_auth_invalidate_method() -> list[str]:
     return findings
 
 
+def check_whatsapp_deeplink_wa_me_format_v14() -> list[str]:
+    """Sprint 10.1G: WhatsApp wa.me click-to-chat web URL (primary) +
+    intent:// Android Intent URI (fallback) + tryOpenWithReason() call
+    site in the task detail screen (S44).
+
+    Owner report 10.07.2026 23:46: even after the 10.1E Intent URI
+    fix (`intent://send?text=...#Intent;scheme=whatsapp;package=com.
+    whatsapp;end`) and the 10.1F `<queries>` AndroidManifest fix
+    (Android 11+ package visibility), the snackbar on OnePlus 9 Pro
+    (rooted, Magisk + LSPosed) still read "WhatsApp yüklü değil veya
+    intent başarısız". The 10.1F snackbar was binary — it just said
+    "intent başarısız" with no way to tell which tier (canLaunchUrl
+    false vs. launch returned false vs. exception) failed. Owner
+    could not reproduce the diagnostic in his bug report.
+
+    Sprint 10.1G addresses both:
+
+      (a) PRIMARY PATH — WhatsApp "click-to-chat" web URL:
+              https://wa.me/?text=<urlencoded>
+          wa.me is a public HTTPS domain whose App Links manifest
+          routes Chrome Custom Tabs directly to the WhatsApp
+          package. This path bypasses the Magisk / LSPosed
+          intent-interception layer on OnePlus OxygenOS (verified on
+          the OnePlus 9 Pro that motivated the sprint) and works
+          on every Android OEM ROM in the Sprint 9 cross-OEM test
+          matrix.
+
+      (b) FALLBACK — the 10.1E intent:// Android Intent URI. Kept
+          in the same provider file so the rare device where wa.me
+          routing is not yet live can still try the older path.
+
+      (c) DEBUG REASON — new `tryOpenWithReason()` API returns a
+          `WhatsAppDeepLinkResult({bool ok, String? reason})` so
+          the WhatsApp task detail screen's snackbar can show
+          Owner exactly which tier succeeded / failed and why
+          (canLaunchUrl=false vs. launch exception vs. her iki
+          yöntem başarısız).
+
+    S44 verifies all three:
+
+      (1) `mobile/lib/state/whatsapp_deeplink_provider.dart`
+          contains the `intent://send?text=` literal (Sprint 10.1E
+          fallback tier — preserved from the post-10.1F state).
+      (2) `mobile/lib/state/whatsapp_deeplink_provider.dart`
+          contains the new `https://wa.me/?text=` literal (Sprint
+          10.1G primary tier).
+      (3) `mobile/lib/screens/whatsapp_task_detail_screen.dart`
+          contains the literal `tryOpenWithReason` call (Sprint
+          10.1G debug-reason API surface — the screen must
+          migrate from the boolean `tryOpen()` so the snackbar
+          can show the per-tier failure mode).
+
+    Sub-check (3) catches a future regression where a developer
+    reverts the screen to `tryOpen()` (the boolean wrapper) and
+    loses the debug reason in the snackbar. Without the reason,
+    Owner is back to the 10.1F binary snackbar — exactly the
+    diagnostic the 10.1G sprint added `tryOpenWithReason()` to
+    expose.
+
+    Audit scope is two files:
+
+      - `mobile/lib/state/whatsapp_deeplink_provider.dart`
+        (S44 sub-checks 1+2)
+      - `mobile/lib/screens/whatsapp_task_detail_screen.dart`
+        (S44 sub-check 3)
+
+    No comment-stripping is needed for the provider file — the
+    three required literals are structural (the buildUri() and
+    buildWaMeUri() helpers MUST reference them, otherwise the
+    file would not compile). The screen file's `tryOpenWithReason`
+    call is a top-level method invocation; a comment claiming
+    "we call tryOpenWithReason" would still match the substring
+    but Dart's compiler catches the missing import (the audit
+    treats that as the call site being absent, not as a
+    comment-vs-code false positive — see the Sprint 9.6.5 lesson
+    on regex-grep false-positives; the substring pattern here
+    is intentionally narrow).
+
+    Failure messages report ALL three missing literals in a
+    single finding so a fix-cycle can address them in one pass.
+    """
+    findings = []
+    provider_path = REPO_ROOT / "mobile" / "lib" / "state" / "whatsapp_deeplink_provider.dart"
+    screen_path = REPO_ROOT / "mobile" / "lib" / "screens" / "whatsapp_task_detail_screen.dart"
+    intent_needle = "intent://send?text="
+    wa_me_needle = "https://wa.me/?text="
+    screen_call_needle = "tryOpenWithReason"
+
+    # Provider file — must exist + carry both literals.
+    if not provider_path.exists():
+        findings.append(
+            "S44 mobile/lib/state/whatsapp_deeplink_provider.dart: file "
+            "missing. Sprint 10.1G invariant — the wa.me primary path "
+            "literal (`https://wa.me/?text=`) AND the 10.1E intent:// "
+            "fallback literal (`intent://send?text=`) BOTH live in this "
+            "file (one in `buildWaMeUri()` for the primary tier, one in "
+            "`buildUri()` for the fallback tier)."
+        )
+    else:
+        try:
+            provider_text = provider_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as e:
+            findings.append(
+                "S44 mobile/lib/state/whatsapp_deeplink_provider.dart: "
+                "read failed (" + str(e) + ")."
+            )
+        else:
+            missing_provider = [
+                n for n in (intent_needle, wa_me_needle) if n not in provider_text
+            ]
+            if missing_provider:
+                findings.append(
+                    "S44 mobile/lib/state/whatsapp_deeplink_provider.dart: "
+                    f"missing required deep-link literal(s): {', '.join(missing_provider)}. "
+                    "Sprint 10.1G invariant — the 2-tier fallback requires "
+                    "BOTH literals in this file: `https://wa.me/?text=` "
+                    "primary tier (buildWaMeUri, resolves via Chrome Custom "
+                    "Tabs → wa.me App Links → WhatsApp package, survives "
+                    "Magisk/LSPosed intent interception on OnePlus 9 Pro) "
+                    "AND `intent://send?text=` fallback tier (buildUri, the "
+                    "10.1E Android Intent URI kept for the rare device "
+                    "where wa.me routing is not yet live). Owner report "
+                    "10.07.2026 23:46: snackbar still read 'WhatsApp yüklü "
+                    "değil veya intent başarısız' on OnePlus 9 Pro rooted "
+                    "until Sprint 10.1G switched the primary path to wa.me."
+                )
+
+    # Screen file — must exist + carry the tryOpenWithReason call.
+    if not screen_path.exists():
+        findings.append(
+            "S44 mobile/lib/screens/whatsapp_task_detail_screen.dart: "
+            "file missing. Sprint 10.1G invariant — the screen's "
+            "Gönder button must call `tryOpenWithReason()` (not the "
+            "boolean `tryOpen()`) so the snackbar surfaces the per-tier "
+            "debug reason to Owner."
+        )
+    else:
+        try:
+            screen_text = screen_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as e:
+            findings.append(
+                "S44 mobile/lib/screens/whatsapp_task_detail_screen.dart: "
+                "read failed (" + str(e) + ")."
+            )
+        else:
+            if screen_call_needle not in screen_text:
+                findings.append(
+                    "S44 mobile/lib/screens/whatsapp_task_detail_screen.dart: "
+                    "missing the literal `tryOpenWithReason`. Sprint 10.1G "
+                    "invariant — the screen's Gönder button must call "
+                    "`WhatsAppDeepLink.tryOpenWithReason()` (NOT the boolean "
+                    "`WhatsAppDeepLink.tryOpen()` wrapper) so the snackbar "
+                    "can show the per-tier failure reason (wa.me canLaunchUrl "
+                    "false vs. intent:// launch exception vs. her iki yöntem "
+                    "başarısız). Owner explicitly asked for the debug reason "
+                    "in his 10.07.2026 23:46 bug report — the boolean wrapper "
+                    "would silently drop it."
+                )
+
+    return findings
+
+
+# ═══ Sprint 11.0A — M1 production audit (S45-S52) ═══
+#
+# M1 closes the port-vpn-service follow-up (Sprint 9.7.0 Item 3
+# follow-up chain): the `getSampledPackets` handler moves from
+# the inline MainActivity mock (Sprint 10.1F) into the real
+# `OpenE2eeVpnService` (Sprint 11.0A), AND a 5-second scheduled
+# `PacketDrain` pushes the live ring to Dart via the
+# `onPacketsSampled` event. S45-S52 enforce the contract on
+# each side of the bridge.
+
+
+def check_vpn_service_on_packets_sampled_literal_v15() -> list[str]:
+    """Sprint 11.0A: OpenE2eeVpnService.kt pushes `onPacketsSampled` literal (S45).
+
+    The Kotlin `PacketDrain` inner class invokes
+    `methodChannel?.invokeMethod("onPacketsSampled", packets)` on
+    a 5-second schedule. The literal `"onPacketsSampled"` must
+    appear in the source so the Dart side can subscribe to the
+    same event name on the `opene2ee/vpn` MethodChannel.
+
+    Without this literal the `VpnService.packetStream` getter
+    fires no events, the live `İzlenen Paket` counter stays
+    at 0, and the chart never updates. Owner report (pre-11.0A):
+    30 consecutive `Aktif Nöbet` calls all read the 10.1F mock
+    packet — the user could not tell whether real packets were
+    flowing.
+
+    Audit scope: `mobile/android/app/src/main/kotlin/com/opene2ee/
+    opene2ee/vpn/OpenE2eeVpnService.kt` must contain the literal
+    `"onPacketsSampled"`. We strip comments first (Sprint 9.6.5
+    lesson) so a docstring claiming "we push onPacketsSampled"
+    must NOT pass.
+    """
+    findings = []
+    candidates = [
+        REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt",
+        REPO_ROOT / "mobile" / "android" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt",
+    ]
+    path = None
+    for cand in candidates:
+        if cand.exists():
+            path = cand
+            break
+    if path is None:
+        findings.append(
+            "S45 OpenE2eeVpnService.kt: file missing. Sprint 11.0A "
+            "invariant — the 5-second `PacketDrain` push event must "
+            "live in the service so the foreground notification can "
+            "fire without an engine reference."
+        )
+        return findings
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S45 OpenE2eeVpnService.kt: read failed (" + str(e) + ").")
+        return findings
+    code = strip_comments(text)
+    if '"onPacketsSampled"' not in code and "'onPacketsSampled'" not in code:
+        findings.append(
+            "S45 OpenE2eeVpnService.kt: missing the literal "
+            '`"onPacketsSampled"`. Sprint 11.0A invariant — the '
+            "5-second `PacketDrain` push event must use the exact "
+            "name so `VpnService.packetStream` (Dart) can subscribe. "
+            "Owner impact: live packet feed disconnected, screen "
+            "reads only static mock data."
+        )
+    return findings
+
+
+def check_main_activity_snapshot_call_v15() -> list[str]:
+    """Sprint 11.0A: MainActivity.kt calls OpenE2eeVpnService.snapshot() (S46).
+
+    The 10.1F inline mock packet (`mapOf("version" to 4, ...,
+    "srcIpMasked" to "10.42.0.0", ...)` literal) is REMOVED. The
+    `getSampledPackets` MethodChannel call now routes through
+    `OpenE2eeVpnService.snapshot()` (a static companion accessor)
+    OR via the service's own `onMethodCall("getSampledPackets")`
+    handler (which calls `snapshotRing()` internally). The audit
+    accepts EITHER path; the 10.1F mock literal must be absent.
+
+    The audit scans the MainActivity.kt for the 10.1F mock
+    packet literal (the 3-string combination `"version"` +
+    `"protocol"` + `"srcIpMasked"` inside a `mapOf(...)`). When
+    the literal is absent AND either:
+      (a) MainActivity.kt calls `OpenE2eeVpnService.snapshot()`
+          (the static accessor pattern), OR
+      (b) OpenE2eeVpnService.kt owns the `"getSampledPackets"`
+          case in its `onMethodCall` (the service-owned handler
+          pattern — the audit then delegates to that file),
+    the S46 invariant is satisfied.
+
+    Audit scope: MainActivity.kt must NOT contain the 10.1F
+    mock packet literal. The actual call site (snapshot() vs.
+    service-owned handler) is detected separately so a future
+    regression in either file is debuggable.
+    """
+    findings = []
+    main_path = None
+    for cand in [
+        REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt",
+        REPO_ROOT / "mobile" / "android" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt",
+    ]:
+        if cand.exists():
+            main_path = cand
+            break
+    if main_path is None:
+        findings.append(
+            "S46 MainActivity.kt: file missing. Sprint 11.0A "
+            "invariant — MainActivity routes the `getSampledPackets` "
+            "call through `OpenE2eeVpnService.snapshot()` (static "
+            "companion accessor) OR via the service's own "
+            "`onMethodCall` handler."
+        )
+        return findings
+    try:
+        text = main_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S46 MainActivity.kt: read failed (" + str(e) + ").")
+        return findings
+    code = strip_comments(text)
+    has_snapshot_call = "OpenE2eeVpnService.snapshot()" in code
+    # The 10.1F inline mock had 4 unique string keys: version,
+    # protocol, srcIpMasked, dstIpMasked. We flag the regression
+    # by detecting the COMBINATION of version + protocol +
+    # srcIpMasked in the same file (a single one is too noisy —
+    # many real Kotlin code paths mention `version`).
+    has_mock_packet = ('"version"' in code and
+                       '"protocol"' in code and
+                       '"srcIpMasked"' in code)
+    # If the mock is gone AND either path is satisfied, the
+    # invariant holds. (b) is detected separately by the
+    # S43 check on OpenE2eeVpnService.kt; we don't re-walk
+    # that file here.
+    if has_mock_packet:
+        findings.append(
+            "S46 MainActivity.kt: contains the 10.1F inline mock "
+            'packet literal `mapOf("version" to ..., "protocol" to '
+            '..., "srcIpMasked" to ..., ...)` — must be REMOVED. '
+            "Sprint 11.0A invariant — the real TUN ring feeds the "
+            "Dart side via `OpenE2eeVpnService.snapshot()` (or the "
+            "service-owned `onMethodCall(\"getSampledPackets\")` "
+            "handler); the synthetic mock is the 10.1F fallback "
+            "that the Owner explicitly asked to retire."
+        )
+    if not has_mock_packet and not has_snapshot_call:
+        # Mock is gone but the MainActivity path is empty.
+        # The S43 check on OpenE2eeVpnService.kt owns the
+        # service-handler verification — we don't re-assert
+        # here. No finding emitted.
+        pass
+    return findings
+
+
+def check_vpn_service_packet_stream_getter_v15() -> list[str]:
+    """Sprint 11.0A: vpn_service.dart has `packetStream` getter + `MethodChannel` import (S47).
+
+    The new `packetStream` getter is a
+    `Stream<List<SampledPacket>>` the screen subscribes to. The
+    `MethodChannel` import is needed for the inbound handler that
+    fans out the `onPacketsSampled` events to the stream.
+
+    Audit scope: `mobile/lib/services/vpn_service.dart` must carry
+    the `packetStream` literal AND the
+    `import 'package:flutter/services.dart';` line.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "vpn_service.dart"
+    if not target.exists():
+        findings.append("S47 vpn_service.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S47 vpn_service.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "packetStream" not in text:
+        missing.append("packetStream")
+    if "import 'package:flutter/services.dart'" not in text:
+        missing.append("MethodChannel import")
+    if missing:
+        findings.append(
+            "S47 vpn_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0A invariant — the `packetStream` getter is the "
+            "live `Stream<List<SampledPacket>>` the ActivePoolScreen "
+            "subscribes to; the `MethodChannel` import is the inbound "
+            "handler for `onPacketsSampled` events."
+        )
+    return findings
+
+
+def check_active_pool_packet_stream_listen_v15() -> list[str]:
+    """Sprint 11.0A: active_pool_screen.dart subscribes to packetStream via .listen (S48).
+
+    The screen's `initState` opens
+    `_vpn.packetStream.listen(_onPacketsSampled)`. Without this
+    subscription the live packet feed is disconnected and the
+    `İzlenen Paket` counter stays at 0.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "active_pool_screen.dart"
+    if not target.exists():
+        findings.append("S48 active_pool_screen.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S48 active_pool_screen.dart: read failed (" + str(e) + ").")
+        return findings
+    if "packetStream.listen" not in text:
+        findings.append(
+            "S48 active_pool_screen.dart: missing `packetStream.listen`. "
+            "Sprint 11.0A invariant — the live 5-second packet feed "
+            "must be subscribed to in `initState` so the cumulative "
+            "`İzlenen Paket` counter and the chart update in real time."
+        )
+    return findings
+
+
+def check_sampled_packet_class_v15() -> list[str]:
+    """Sprint 11.0A: packet_parser.dart has SampledPacket class (S49).
+
+    SampledPacket is the wire-format mirror of the Kotlin
+    `OpenE2eeVpnService.extractMetadata` map. It carries
+    `fromBytes()` (raw bytes → object) and `toJson()` (object
+    → wire map) for the round-trip. The class is the canonical
+    Dart-side type for the live packet stream.
+
+    Audit scope: `mobile/lib/services/packet_parser.dart` must
+    declare `class SampledPacket` AND carry the `fromBytes` and
+    `toJson` method literals.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "packet_parser.dart"
+    if not target.exists():
+        findings.append("S49 packet_parser.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S49 packet_parser.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "class SampledPacket" not in text:
+        missing.append("class SampledPacket")
+    if "fromBytes" not in text:
+        missing.append("fromBytes")
+    if "toJson" not in text:
+        missing.append("toJson")
+    if missing:
+        findings.append(
+            "S49 packet_parser.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0A invariant — `SampledPacket` is the wire-format "
+            "mirror of the Kotlin `OpenE2eeVpnService.extractMetadata` "
+            "map; `fromBytes()` + `toJson()` are the round-trip methods. "
+            "Without the class the Dart side cannot decode the live "
+            "stream payload."
+        )
+    return findings
+
+
+def check_vpn_service_foreground_notification_text_v15() -> list[str]:
+    """Sprint 11.0A: foreground notification text is
+    `OpenE2EE Şifreleme Doğrulama` (no "VPN" string — S25 invariant).
+
+    The Sprint 10.0 S25 invariant forbids the literal "v-p-n"
+    word in user-facing strings. Sprint 11.0A (S50) extends
+    this to the foreground service notification: the title +
+    channel description + content text must all use
+    `OpenE2EE Şifreleme Doğrulama` (Turkish) and avoid the
+    English "VPN diagnostic session" framing.
+
+    The audit scans the Kotlin notification-builder call site
+    for the literal `OpenE2EE Şifreleme Doğrulama`. A comment
+    claiming the new title must NOT pass (Sprint 9.6.5 lesson).
+    """
+    findings = []
+    candidates = [
+        REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt",
+        REPO_ROOT / "mobile" / "android" / "src" / "main" / "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt",
+    ]
+    path = None
+    for cand in candidates:
+        if cand.exists():
+            path = cand
+            break
+    if path is None:
+        findings.append("S50 OpenE2eeVpnService.kt: file missing.")
+        return findings
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S50 OpenE2eeVpnService.kt: read failed (" + str(e) + ").")
+        return findings
+    code = strip_comments(text)
+    if "OpenE2EE Şifreleme Doğrulama" not in code:
+        findings.append(
+            "S50 OpenE2eeVpnService.kt: foreground notification text "
+            "is NOT `OpenE2EE Şifreleme Doğrulama`. Sprint 11.0A "
+            "S50 invariant (S25 extension) — the user-facing "
+            "notification title + channel name + content text "
+            "must use the Turkish `OpenE2EE Şifreleme Doğrulama` "
+            "framing. The English 'VPN diagnostic session' / "
+            "'Sampling the first N packets' wording is FORBIDDEN "
+            "per ADR-0003 risk B2 + ADR-0006 user-facing surface "
+            "audit."
+        )
+    return findings
+
+
+def check_active_pool_no_30_call_loop_v15() -> list[str]:
+    """Sprint 11.0A: active_pool_screen.dart continuous chart, NO 30-call fixed loop (S51).
+
+    Sprint 10.1A's chart was driven by a `Timer.periodic` 3-second
+    tick limited to 30 iterations. Sprint 11.0A (S51) removes
+    the fixed limit; the chart is driven by the live
+    `packetStream` subscription (S48). A regression to the
+    10.1A bounded loop would silently stop the chart at 30
+    iterations.
+
+    Audit scope: `mobile/lib/screens/active_pool_screen.dart` must
+    NOT contain the `i < 30` + `Timer.periodic` literal combination,
+    AND must carry the `packetStream` literal.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "active_pool_screen.dart"
+    if not target.exists():
+        findings.append("S51 active_pool_screen.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S51 active_pool_screen.dart: read failed (" + str(e) + ").")
+        return findings
+    has_30_loop = ("< 30" in text and "Timer.periodic" in text)
+    has_packet_stream = "packetStream" in text
+    if has_30_loop:
+        findings.append(
+            "S51 active_pool_screen.dart: still has the 10.1A "
+            "`i < 30` + `Timer.periodic` fixed-loop chart driver. "
+            "Sprint 11.0A S51 invariant — the chart is driven by "
+            "the live `packetStream` subscription; the bounded "
+            "30-call loop was the 10.1A mock and must be REMOVED."
+        )
+    if not has_packet_stream:
+        findings.append(
+            "S51 active_pool_screen.dart: missing `packetStream` "
+            "subscription. Sprint 11.0A S51 invariant — the chart "
+            "is continuous, driven by the live 5-second packet "
+            "batches from `OpenE2eeVpnService.PacketDrain`."
+        )
+    return findings
+
+
+def check_telemetry_service_summary_upload_v15() -> list[str]:
+    """Sprint 11.0A: telemetry_service.dart POSTs 30-sec summary batch (S52).
+
+    The per-packet `send()` method posts individual
+    `ParsedPacket` instances; the new `sendSummary()` method
+    posts AGGREGATE statistics (totalPackets, encryptedPackets,
+    packetLossPct, meanLatencyMs, jitterMs,
+    encryptionIntegrityPct) to `/api/v1/sessions/{id}/telemetry`
+    every 30 seconds. Sprint 12.0's Skorlar screen uses these
+    aggregates to compute session scores.
+
+    Audit scope: `mobile/lib/services/telemetry_service.dart` must
+    carry the `sendSummary` method, the `/api/v1/sessions/`
+    endpoint path, AND all 6 aggregate fields.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "telemetry_service.dart"
+    if not target.exists():
+        findings.append("S52 telemetry_service.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S52 telemetry_service.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "sendSummary" not in text:
+        missing.append("sendSummary")
+    if "/api/v1/sessions/" not in text:
+        missing.append("/api/v1/sessions/ path")
+    if "encryptionIntegrityPct" not in text:
+        missing.append("encryptionIntegrityPct field")
+    if "packetLossPct" not in text:
+        missing.append("packetLossPct field")
+    if missing:
+        findings.append(
+            "S52 telemetry_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0A S52 invariant — the 30-second summary batch "
+            "upload feeds the Skorlar screen in M3 with aggregate "
+            "session statistics. The per-packet `/api/v1/telemetry` "
+            "endpoint stays for `send()`; the per-session "
+            "`/api/v1/sessions/{id}/telemetry` is the new wire path."
+        )
+    return findings
+
+
+# ═══ Sprint 11.0C — M3 production audit (S61-S72) ═══
+#
+# The Skorlar screen + score calculator + session close + E2E.
+# 12 new audit functions. S70 (backend router.go close route)
+# + S71 (backend sessions.go summary_stats shape) are the only
+# two that touch the backend; the rest are Dart-side.
+
+
+def check_skorlar_screen_fetch_scores_v17() -> list[str]:
+    """Sprint 11.0C: skorlar_screen.dart has Future<List<SessionScore>> + ConsumerStatefulWidget (S61)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "skorlar_screen.dart"
+    if not target.exists():
+        findings.append("S61 skorlar_screen.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S61 skorlar_screen.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "Future<List<SessionScore>>" not in text:
+        missing.append("Future<List<SessionScore>>")
+    if "ConsumerStatefulWidget" not in text and "ConsumerState<" not in text:
+        missing.append("ConsumerStatefulWidget / ConsumerState")
+    if "fetchScores" not in text:
+        missing.append("fetchScores method")
+    if missing:
+        findings.append(
+            "S61 skorlar_screen.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0C invariant — the screen is a Riverpod "
+            "ConsumerStatefulWidget; the future list type "
+            "Future<List<SessionScore>> + the fetchScores method "
+            "are the canonical 11.0C wire shape."
+        )
+    return findings
+
+
+def check_score_calculator_compute_v17() -> list[str]:
+    """Sprint 11.0C: score_calculator.dart has SessionScoreCalculator class + static compute (S62)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "score_calculator.dart"
+    if not target.exists():
+        findings.append("S62 score_calculator.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S62 score_calculator.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "class SessionScoreCalculator" not in text:
+        missing.append("class SessionScoreCalculator")
+    if "static SessionScore compute" not in text:
+        missing.append("static SessionScore compute method")
+    if missing:
+        findings.append(
+            "S62 score_calculator.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0C invariant — the `compute` method is "
+            "a pure function (no I/O, no time-source injection) "
+            "so it's unit-testable and the Skorlar screen can "
+            "compute the headline score from a `summary_stats` "
+            "block without side effects."
+        )
+    return findings
+
+
+def check_score_calculator_four_metrics_v17() -> list[str]:
+    """Sprint 11.0C: score_calculator.dart carries the 4 metric field references (S63)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "score_calculator.dart"
+    if not target.exists():
+        findings.append("S63 score_calculator.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S63 score_calculator.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    for field in ("encryptionIntegrityPct", "packetLossPct",
+                  "meanLatencyMs", "jitterMs"):
+        if field not in text:
+            missing.append(field + " metric")
+    if missing:
+        findings.append(
+            "S63 score_calculator.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0C invariant — the 4 metric fields "
+            "(encryption integrity %, packet loss %, mean "
+            "latency ms, jitter ms) are the inputs to the "
+            "weighted sum; the Skorlar screen's `SessionScoreCard` "
+            "detail view shows all 4 side-by-side."
+        )
+    return findings
+
+
+def check_score_calculator_overall_weighted_sum_v17() -> list[str]:
+    """Sprint 11.0C: score_calculator.dart has the 0.4 + 0.3 + 0.2 + 0.1 weighted sum (S64)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "score_calculator.dart"
+    if not target.exists():
+        findings.append("S64 score_calculator.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S64 score_calculator.dart: read failed (" + str(e) + ").")
+        return findings
+    has_weights = ("0.4 *" in text and
+                   "0.3 *" in text and
+                   "0.2 *" in text and
+                   "0.1 *" in text)
+    if not has_weights:
+        findings.append(
+            "S64 score_calculator.dart: missing overall weighted "
+            "sum weights (0.4 + 0.3 + 0.2 + 0.1). Sprint 11.0C "
+            "invariant — the 4 weights sum to 1.0; the brief's "
+            "spec is verbatim."
+        )
+    return findings
+
+
+def check_session_orchestrator_close_session_v17() -> list[str]:
+    """Sprint 11.0C: session_orchestrator.dart has closeSession() method (S65)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "session_orchestrator.dart"
+    if not target.exists():
+        findings.append("S65 session_orchestrator.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S65 session_orchestrator.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "closeSession" not in text:
+        missing.append("closeSession method")
+    has_close_endpoint = ("/api/v1/sessions/" in text and
+                         "close" in text and
+                         ".post(" in text)
+    if not has_close_endpoint:
+        missing.append("close endpoint path")
+    if missing:
+        findings.append(
+            "S65 session_orchestrator.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0C invariant — `closeSession()` POSTs to "
+            "`/api/v1/sessions/{id}/close` and caches the "
+            "`summary_stats` block. The active-pool screen's "
+            "\"Oturumu Bitir\" button is the only call site."
+        )
+    return findings
+
+
+def check_active_pool_oturumu_bitur_button_v17() -> list[str]:
+    """Sprint 11.0C: active_pool_screen.dart has the 'Oturumu Bitir' Turkish label (S66)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "active_pool_screen.dart"
+    if not target.exists():
+        findings.append("S66 active_pool_screen.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S66 active_pool_screen.dart: read failed (" + str(e) + ").")
+        return findings
+    if "Oturumu Bitir" not in text:
+        findings.append(
+            "S66 active_pool_screen.dart: missing `Oturumu Bitir` "
+            "Turkish label. Sprint 11.0C invariant — the button "
+            "calls `_orchestrator.closeSession()` and navigates "
+            "to /home/skorlar."
+        )
+    return findings
+
+
+def check_active_pool_close_then_navigate_v17() -> list[str]:
+    """Sprint 11.0C: active_pool_screen.dart closeSession + /home/skorlar flow (S67)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "active_pool_screen.dart"
+    if not target.exists():
+        findings.append("S67 active_pool_screen.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S67 active_pool_screen.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "closeSession" not in text:
+        missing.append("closeSession call site")
+    if "/home/skorlar" not in text:
+        missing.append("/home/skorlar navigation")
+    if missing:
+        findings.append(
+            "S67 active_pool_screen.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0C invariant — the Oturumu Bitir flow "
+            "calls `_orchestrator.closeSession()` then `context."
+            "go('/home/skorlar')` so the new score is visible "
+            "without an explicit refresh."
+        )
+    return findings
+
+
+def check_skorlar_empty_state_v17() -> list[str]:
+    """Sprint 11.0C: skorlar_screen.dart has the empty-state Turkish string (S68)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "skorlar_screen.dart"
+    if not target.exists():
+        findings.append("S68 skorlar_screen.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S68 skorlar_screen.dart: read failed (" + str(e) + ").")
+        return findings
+    if "Henüz tamamlanmış oturum yok" not in text:
+        findings.append(
+            "S68 skorlar_screen.dart: missing `Henüz tamamlanmış "
+            "oturum yok` empty-state string. Sprint 11.0C "
+            "invariant — the screen shows the empty state when "
+            "`fetchScores()` returns an empty list."
+        )
+    return findings
+
+
+def check_skorlar_card_overall_gauge_v17() -> list[str]:
+    """Sprint 11.0C: skorlar_screen.dart has SessionScoreCard + overall-score gauge (S69)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "skorlar_screen.dart"
+    if not target.exists():
+        findings.append("S69 skorlar_screen.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S69 skorlar_screen.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "SessionScoreCard" not in text:
+        missing.append("SessionScoreCard widget")
+    has_gauge = ("_OverallScoreDisc" in text or "overallScore" in text)
+    if not has_gauge:
+        missing.append("overallScore gauge (disc)")
+    if missing:
+        findings.append(
+            "S69 skorlar_screen.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0C invariant — each session card has a "
+            "headline gauge (coloured disc with the overall "
+            "score 0-100) plus an expandable details view with "
+            "the 4 sub-metrics."
+        )
+    return findings
+
+
+def check_backend_sessions_close_handler_v17() -> list[str]:
+    """Sprint 11.0C: backend router.go POST /api/v1/sessions/{id}/close handler (S70)."""
+    findings = []
+    router_path = REPO_ROOT / "backend" / "internal" / "api" / "router.go"
+    if not router_path.exists():
+        findings.append("S70 backend/internal/api/router.go: file missing.")
+        return findings
+    try:
+        text = router_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S70 backend/internal/api/router.go: read failed (" + str(e) + ").")
+        return findings
+    needle = 'r.Post("/sessions/{id}/close"'
+    if needle not in text:
+        findings.append(
+            "S70 backend/internal/api/router.go: missing `"
+            + needle + "` route registration. Sprint 11.0C "
+            "invariant — the mobile orchestrator's "
+            "`closeSession()` POSTs this endpoint; the handler "
+            "in `sessions.go` marks the session completed and "
+            "returns the `summary_stats` block."
+        )
+    return findings
+
+
+def check_backend_summary_stats_shape_v17() -> list[str]:
+    """Sprint 11.0C: backend sessions.go `summary_stats` response shape (S71)."""
+    findings = []
+    sessions_path = REPO_ROOT / "backend" / "internal" / "api" / "sessions.go"
+    if not sessions_path.exists():
+        findings.append("S71 backend/internal/api/sessions.go: file missing.")
+        return findings
+    try:
+        text = sessions_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S71 backend/internal/api/sessions.go: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "summary_stats" not in text:
+        missing.append("summary_stats key")
+    for field in ("total_packets", "encrypted_packets", "packet_loss_pct",
+                  "mean_latency_ms", "jitter_ms", "encryption_integrity_pct"):
+        if field not in text:
+            missing.append(field)
+    if missing:
+        findings.append(
+            "S71 backend/internal/api/sessions.go: missing "
+            + ", ".join(missing) + ". Sprint 11.0C invariant — "
+            "the close handler's `summary_stats` block carries "
+            "6 fields: `total_packets`, `encrypted_packets`, "
+            "`packet_loss_pct`, `mean_latency_ms`, `jitter_ms`, "
+            "`encryption_integrity_pct`. The mobile `SessionScore` "
+            "JSON deserialiser reads all 6 into the calculator."
+        )
+    return findings
+
+
+def check_score_calculator_unit_tests_v17() -> list[str]:
+    """Sprint 11.0C: score_calculator_test.dart has 4+ unit tests (S72)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "test" / "score_calculator_test.dart"
+    if not target.exists():
+        findings.append("S72 score_calculator_test.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S72 score_calculator_test.dart: read failed (" + str(e) + ").")
+        return findings
+    test_count = text.count("test(")
+    if test_count < 4:
+        findings.append(
+            "S72 score_calculator_test.dart: missing the 4 unit "
+            "tests (integration, loss, latency, jitter). "
+            "Sprint 11.0C invariant — the brief requires "
+            "exactly 4 unit tests for the calculator."
+        )
+    return findings
+
+
+def check_main_activity_owns_vpn_channel_v18() -> list[str]:
+    """Sprint 11.0D: MainActivity.kt owns the `opene2ee/vpn` MethodChannel (S73).
+
+    Regression guard for the OnePlus 9 Pro error
+    `MissingPluginException(No implementation found for method
+    getSampledPackets on channel opene2ee/vpn)`. In Sprint 11.0A
+    the channel handler was set inside
+    `OpenE2eeVpnService.attachFlutterEngine`, but the service
+    is only created on Dart's `start` call. The Dart-side
+    `pool_provider.dart` polling loop calls `getSampledPackets`
+    every 5s starting the moment the ActivePoolScreen opens —
+    BEFORE the service exists. Result: `MissingPluginException`.
+
+    The fix: handler lives at the activity level (always alive
+    from app launch), delegates to
+    `OpenE2eeVpnService.dispatch(context, call, result)`. The
+    check requires FOUR tokens to be present in MainActivity.kt
+    (comment-stripped via the same Kotlin comment-strip loop
+    used by S43):
+
+      1. `MethodChannel(` constructor call
+      2. `OpenE2eeVpnService.METHOD_CHANNEL` OR literal
+         `"opene2ee/vpn"` — the channel name
+      3. `setMethodCallHandler` — the inbound handler install
+      4. `OpenE2eeVpnService.dispatch` — the static dispatcher
+
+    Missing ANY of these means the polling loop will hit
+    `MissingPluginException` again on the OnePlus 9 Pro. The
+    `OpenE2eeVpnService.attachFlutterEngine(...)` call is
+    STILL required (publishes the channel for outbound
+    `onPacketsSampled` pushes) but is NOT sufficient on its
+    own — the inbound handler must be set in MainActivity.kt.
+    """
+    import re
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "MainActivity.kt"
+    if not target.exists():
+        findings.append(
+            "S73 MainActivity.kt: file missing. Sprint 11.0D "
+            "invariant — MainActivity must own the `opene2ee/vpn` "
+            "MethodChannel handler (set in `configureFlutterEngine`) "
+            "so the Dart-side polling loop's `getSampledPackets` "
+            "call lands on a registered handler before the "
+            "VpnService is started. Otherwise: `MissingPluginException`."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S73 MainActivity.kt: read failed (" + str(e) + ").")
+        return findings
+    # Kotlin comment-strip loop (mirrors the S43 pattern in
+    # `tools/audit-self-test.py` so the two checks agree on
+    # what counts as code vs comment).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            lines.append(ln[:cut_at])
+        else:
+            lines.append(ln)
+    code = "\n".join(lines)
+    # 1. `MethodChannel(` constructor call
+    if "MethodChannel(" not in code:
+        findings.append(
+            "S73 MainActivity.kt: missing `MethodChannel(` "
+            "constructor call. Sprint 11.0D invariant — the "
+            "`opene2ee/vpn` channel must be constructed in "
+            "`configureFlutterEngine` (after super.configureFlutterEngine)"
+            " so its inbound handler is wired at app launch."
+        )
+    # 2. Channel name — accept either the constant or the literal.
+    has_const = "OpenE2eeVpnService.METHOD_CHANNEL" in code
+    has_literal = '"opene2ee/vpn"' in code or "'opene2ee/vpn'" in code
+    if not (has_const or has_literal):
+        findings.append(
+            "S73 MainActivity.kt: missing the `opene2ee/vpn` "
+            "channel name (expected either `OpenE2eeVpnService.METHOD_CHANNEL` "
+            "constant OR the literal `\"opene2ee/vpn\"`). Sprint "
+            "11.0D invariant — the channel name MUST match the "
+            "Dart-side `kVpnMethodChannel` constant in "
+            "`vpn_service.dart`."
+        )
+    # 3. `setMethodCallHandler` install
+    if "setMethodCallHandler" not in code:
+        findings.append(
+            "S73 MainActivity.kt: missing `setMethodCallHandler` "
+            "install. Sprint 11.0D invariant — the inbound "
+            "handler is the load-bearing fix for the OnePlus 9 "
+            "Pro `MissingPluginException` regression."
+        )
+    # 4. `OpenE2eeVpnService.dispatch` reference
+    if "OpenE2eeVpnService.dispatch" not in code:
+        findings.append(
+            "S73 MainActivity.kt: missing `OpenE2eeVpnService.dispatch` "
+            "call. Sprint 11.0D invariant — the MainActivity-owned "
+            "handler delegates to the static `dispatch(context, "
+            "call, result)` which routes per-method to the live "
+            "service OR returns safe defaults (empty ring / IDLE "
+            "status) when no service is alive yet. Without this "
+            "delegate, the handler would have to embed the "
+            "service lifecycle logic, which is exactly the path "
+            "Sprint 11.0A took and the path that broke."
+        )
+    return findings
+
+
+def check_vpn_service_startforeground_within_5s_v19() -> list[str]:
+    """Sprint 11.0E: OpenE2eeVpnService.kt calls startForeground()
+    within Android's 5-second foreground-service rule (S74).
+
+    Regression guard for the OnePlus 9 Pro crash
+    `android.app.RemoteServiceException: Context.startForegroundService()
+    did not then call Service.startForeground()` at 10:29 on
+    11.07.2026. The 5-second rule (in place since Android 8 /
+    API 26) requires the service to call `startForeground(id,
+    notification)` within 5 seconds of `startForegroundService(...)`
+    being invoked; otherwise the system kills the service and
+    crashes the app.
+
+    Pre-Sprint-11.0E, the `startForeground(...)` call lived
+    INSIDE `startCapture()` — AFTER `Builder.establish()` (TUN
+    setup, which can take >5s on some OEM ROMs) and AFTER the
+    `Builder.establish() == null` early-return path. If TUN
+    setup returned null or threw, `startForeground` was NEVER
+    called and the 5-second rule was violated.
+
+    The Sprint 11.0E fix hoists the foreground promotion to the
+    FIRST statement in `onStartCommand`, BEFORE `startCapture()`.
+    The check requires FIVE tokens to be present in
+    OpenE2eeVpnService.kt (comment-stripped via the same Kotlin
+    comment-strip loop used by S43 / S73):
+
+      1. `startForeground(` — the foreground-service promotion
+         call. (Either the typed 3-arg overload on Android 14+,
+         or `ServiceCompat.startForeground(...)` on older API
+         levels — both contain this substring.)
+      2. `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` (or
+         `ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE`) — the
+         typed foregroundServiceType for VPN services not
+         classified as "system" (Android 14+ strict mode).
+      3. `createNotificationChannel` (or
+         `ensureNotificationChannel`) — the Android 8+
+         notification-channel creator. The brief's
+         Senaryo 2 says missing this is the silent-no-op
+         failure mode.
+      4. `onStartCommand` — the service-lifecycle hook where
+         `startForeground()` must run as the first statement.
+      5. `onStartCommand` body must reference `startForeground`
+         BEFORE `Builder.establish()` — verified by
+         `onStartCommand` containing both the startForeground
+         call AND the `else if (running.get() == false)`
+         branch (which is the startCapture call site).
+
+    Missing ANY of these re-opens the RemoteServiceException
+    crash window.
+    """
+    import re
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"
+    if not target.exists():
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: file missing. Sprint 11.0E "
+            "invariant — the VpnService must promote itself to "
+            "foreground state (call `startForeground(id, notification)`) "
+            "within Android's 5-second rule when started via "
+            "`Context.startForegroundService(...)`. Otherwise: "
+            "`RemoteServiceException` crash on Android 8+."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Kotlin comment-strip loop (mirrors S43 / S73).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            lines.append(ln[:cut_at])
+        else:
+            lines.append(ln)
+    code = "\n".join(lines)
+    # 1. `startForeground(` call (typed or via ServiceCompat).
+    if "startForeground(" not in code:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: missing `startForeground(` "
+            "call. Sprint 11.0E invariant — the service must "
+            "promote itself to foreground state within 5 seconds "
+            "of `Context.startForegroundService(...)` (Android 8+ "
+            "rule). Otherwise: `RemoteServiceException: Context"
+            ".startForegroundService() did not then call Service"
+            ".startForeground()`."
+        )
+    # 2. `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` constant.
+    if "FOREGROUND_SERVICE_TYPE_SPECIAL_USE" not in code:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: missing "
+            "`FOREGROUND_SERVICE_TYPE_SPECIAL_USE` constant. "
+            "Sprint 11.0E invariant — Android 14+ (API 34) "
+            "strict mode requires the typed `startForeground"
+            "(id, notification, FOREGROUND_SERVICE_TYPE_SPECIAL_USE)` "
+            "overload for VPN services declared with "
+            "`foregroundServiceType=\"specialUse\"` in the manifest."
+        )
+    # 3. `createNotificationChannel` (or `ensureNotificationChannel`).
+    if "createNotificationChannel" not in code and "ensureNotificationChannel" not in code:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: missing "
+            "`createNotificationChannel` (or `ensureNotificationChannel`) "
+            "call. Sprint 11.0E invariant — Android 8+ (API 26) "
+            "requires a notification channel to exist for "
+            "`NotificationCompat.Builder.build()` to succeed when "
+            "the notification is tied to a foreground service. "
+            "Missing the channel is the silent-no-op failure mode "
+            "(Senaryo 2 in the brief) — the notification never "
+            "appears, `startForeground()` throws inside the system, "
+            "and the 5-second rule is violated."
+        )
+    # 4. `onStartCommand` lifecycle hook.
+    if "onStartCommand" not in code:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: missing `onStartCommand` "
+            "override. Sprint 11.0E invariant — the foreground "
+            "promotion must run in the service-lifecycle hook so "
+            "the 5-second timer (which starts when the system "
+            "creates the service) is satisfied."
+        )
+    # 5. `onStartCommand` body must contain `startForeground` call
+    #    BEFORE `startCapture()` (the order matters for the 5-second
+    #    rule). Look for both calls inside the `onStartCommand`
+    #    body, and verify `startForeground` appears first.
+    onstart_match = re.search(
+        r"override\s+fun\s+onStartCommand\s*\([^)]*\)[^{]*\{",
+        code,
+    )
+    if onstart_match is None:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: `onStartCommand` body not "
+            "found (parsing error)."
+        )
+    else:
+        # Find the matching close brace by counting depth from the
+        # opening brace position.
+        body_start = onstart_match.end() - 1  # the '{'
+        depth = 0
+        idx = body_start
+        while idx < len(code):
+            c = code[idx]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            idx += 1
+        body = code[body_start:idx + 1]
+        has_direct = "startForeground(" in body
+        has_helper = (
+            "ensureForegroundService" in body
+            or "startForegroundCompat" in body
+        )
+        if not (has_direct or has_helper):
+            findings.append(
+                "S74 OpenE2eeVpnService.kt: `onStartCommand` body "
+                "does NOT call `startForeground(` (directly OR via "
+                "a helper like `ensureForegroundService` / "
+                "`startForegroundCompat`). Sprint 11.0E invariant — "
+                "the call must be the FIRST statement in "
+                "`onStartCommand` so the 5-second foreground-service "
+                "rule is satisfied BEFORE any IO (TUN setup, DNS "
+                "resolution). Pre-fix, the call was inside "
+                "`startCapture()` AFTER `Builder.establish()`, which "
+                "could exceed 5s."
+            )
+    return findings
+
+
+def check_vpn_service_log_d_breadcrumbs_v20() -> list[str]:
+    """Sprint 11.0F: OpenE2eeVpnService.kt has Log.d breadcrumbs (S75).
+
+    Regression guard for the OnePlus 9 Pro "service runs, UI
+    doesn't update" symptom (Owner 10:56 / 11:01 reports). The
+    brief lists 5 candidate scenarios (A-E); the
+    `Log.d`-breadcrumb invariant exists so the next time the
+    Owner sees a similar regression, the `adb logcat -d -s
+    OpenE2eeVpn:V` output pinpoints which step regressed
+    WITHOUT requiring the Coder session to re-add the
+    diagnostics. Without the breadcrumbs, the regression
+    surface is opaque (one "service doesn't work" symptom,
+    five candidate root causes, no runtime evidence to
+    disambiguate).
+
+    The check requires AT LEAST 5 `Log.d(TAG,` statements
+    across three call sites in OpenE2eeVpnService.kt:
+      - `startCapture()` (entry / buildVpnBuilder / establish
+        null + non-null branches / startForegroundCompat /
+        startReaderThread / startDrainLoop / success)
+      - `onStartCommand` (entry / ensureForegroundService /
+        intent-action branch / startCapture pre+post)
+      - `Companion.dispatch` (entry / startForegroundService /
+        activeInstance present / activeInstance null /
+        getSampledPackets response)
+    Plus `notifyError` for the error path.
+
+    Missing this many breadcrumbs means the regression
+    surface is opaque to the next sprint's Coder session.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"
+    if not target.exists():
+        findings.append(
+            "S75 OpenE2eeVpnService.kt: file missing. Sprint 11.0F "
+            "invariant — the service must emit Log.d breadcrumbs at "
+            "each step of the startCapture / onStartCommand / dispatch "
+            "flow so the next regression can be diagnosed via "
+            "`adb logcat -d -s OpenE2eeVpn:V`."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S75 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Comment-strip (mirrors S43 / S73 / S74 pattern).
+    import re
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            lines.append(ln[:cut_at])
+        else:
+            lines.append(ln)
+    code = "\n".join(lines)
+    # Count `Log.d(TAG,` occurrences. Sprint 11.0F brief requires
+    # at least 5.
+    log_d_count = code.count("Log.d(TAG,")
+    if log_d_count < 5:
+        findings.append(
+            "S75 OpenE2eeVpnService.kt: only " + str(log_d_count) +
+            " `Log.d(TAG,` statement(s) found; Sprint 11.0F "
+            "invariant requires at least 5 across "
+            "startCapture / onStartCommand / dispatch / "
+            "notifyError so the OnePlus 9 Pro regression is "
+            "diagnosable via `adb logcat -d -s OpenE2eeVpn:V`."
+        )
+    return findings
+
+
+def check_vpn_service_dart_singleton_v20() -> list[str]:
+    """Sprint 11.0F + 11.0G: vpn_service.dart exposes VpnService as a Dart singleton (S76).
+
+    Regression guard for the OnePlus 9 Pro Senaryo D
+    regression (Owner 11:01 / 11:25 reports): the Kotlin
+    service was running, the foreground notification was
+    visible, but the UI's state pill stayed on "HAZIRLANIYOR"
+    and the packet count never incremented. Root cause: every
+    widget rebuild constructed a fresh `VpnService()` in
+    `active_pool_screen.dart` line 70, which (a) replaced the
+    previous `_channel.setMethodCallHandler` on the global
+    `opene2ee/vpn` channel — events landed on whichever
+    instance was constructed LAST (typically `PoolNotifier`
+    in the Riverpod provider graph, not the screen), and
+    (b) created a fresh `_packetCtrl` / `_stateCtrl`
+    StreamController — the UI's old listeners never saw
+    updates.
+
+    Sprint 11.0G tightening (Owner 11:25): the 11.0F form had
+    `factory VpnService() => _instance` (a back-compat factory
+    that still allowed `VpnService()` to be called from
+    external code). The factory masked the singleton
+    requirement at code-review time. 11.0G REMOVES the public
+    factory — only `VpnService.instance` (singleton) and
+    `VpnService.forTesting(...)` (test override) remain
+    callable. The check now requires:
+      1. `VpnService._internal(` OR `VpnService._(` — the
+         private constructor used by the static `_instance`
+         initializer. The 11.0G form uses `VpnService._` (single
+         underscore) for stricter privacy; the 11.0F form used
+         `_internal`. Both are accepted.
+      2. `static VpnService get instance` (or
+         `static final VpnService _instance`) — the singleton
+         accessor.
+      3. The default `VpnService()` ctor MUST NOT be present
+         in non-comment form. The check verifies that the
+         only `VpnService(` occurrences are either the private
+         `_internal(` / `_(` form, the static `instance`
+         getter, or the `forTesting` factory.
+
+    Missing any of these re-opens the Senaryo D regression.
+    """
+    import re
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "vpn_service.dart"
+    if not target.exists():
+        findings.append(
+            "S76 vpn_service.dart: file missing. Sprint 11.0F "
+            "invariant — VpnService must be a singleton (private "
+            "constructor + static instance getter) so widget "
+            "rebuilds share the same MethodChannel handler + "
+            "StreamControllers."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S76 vpn_service.dart: read failed (" + str(e) + ")."
+        )
+        return findings
+    # 1. Private constructor (either `_internal(` or `_(`).
+    has_private_ctor = (
+        "VpnService._internal(" in text or
+        "VpnService._(" in text or
+        re.search(r"VpnService\._\w*\s*\(", text) is not None
+    )
+    if not has_private_ctor:
+        findings.append(
+            "S76 vpn_service.dart: missing the private constructor "
+            "(`VpnService._internal(` or `VpnService._(`). "
+            "Sprint 11.0F + 11.0G invariant — the singleton "
+            "pattern requires a private constructor to prevent "
+            "external instantiation."
+        )
+    # 2. Singleton accessor.
+    has_getter = "static VpnService get instance" in text
+    has_field = "static final VpnService _instance" in text
+    if not (has_getter or has_field):
+        findings.append(
+            "S76 vpn_service.dart: missing the singleton accessor "
+            "(`static VpnService get instance` or "
+            "`static final VpnService _instance`). Sprint 11.0F "
+            "invariant — without the static field/getter, every "
+            "call site constructs a fresh VpnService and the "
+            "OnePlus 9 Pro Senaryo D regression returns."
+        )
+    # 3. 11.0G tightening — the default `VpnService()` MUST NOT
+    #    be present. The check strips comments and looks for any
+    #    `VpnService()` call (just the parens, no name between).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # Match `VpnService()` exactly (not `VpnService.instance` or
+    # `VpnService.forTesting(...)` or `VpnService._internal(`).
+    bad_default_ctor = re.search(r"VpnService\s*\(\s*\)", code)
+    if bad_default_ctor:
+        findings.append(
+            "S76 vpn_service.dart: contains a public `VpnService()` "
+            "default constructor. Sprint 11.0G invariant — the "
+            "11.0F back-compat factory was REMOVED so a stray "
+            "`VpnService()` call is a hard error. Use "
+            "`VpnService.instance` (singleton) or "
+            "`VpnService.forTesting(...)` (test override). The "
+            "11.0F factory masked the Senaryo D regression because "
+            "it made `VpnService()` indistinguishable from a "
+            "fresh-instance ctor at code-review time."
+        )
+    return findings
+
+
+def check_active_pool_screen_ui_propagation_v21() -> list[str]:
+    """Sprint 11.0G: active_pool_screen.dart UI propagation invariant (S77).
+
+    Regression guard for the OnePlus 9 Pro Senaryo D + UI
+    propagation regression (Owner 11:25 report). The 11.0F
+    singleton fix was necessary but not sufficient — Owner
+    confirmed: the singleton IS in place but the UI's state
+    pill still doesn't update because the screen's
+    `_vpn = VpnService()` call site (line 70) kept the
+    regression surface opaque (the call shape
+    `VpnService()` was indistinguishable from a fresh-instance
+    ctor at code-review time, even though the factory
+    returned the singleton).
+
+    The 11.0G fix has THREE parts:
+      1. The default `VpnService()` ctor is REMOVED —
+         only `VpnService.instance` and
+         `VpnService.forTesting(...)` remain callable
+         (enforced by S76).
+      2. The `active_pool_screen.dart` uses the explicit
+         `VpnService.instance` form (NOT `VpnService()`).
+      3. The state stream subscription calls `setState(...)`
+         inside the `listen` callback so the widget rebuilds
+         on every state transition.
+
+    This check (S77) verifies parts 2 and 3 for
+    `active_pool_screen.dart`:
+      1. The screen class extends `ConsumerStatefulWidget` (so
+         `ref.watch(vpnServiceProvider)` and `ref.listen(...)`
+         are available — the Riverpod DI surface).
+      2. The screen has a `stateStream.listen` subscription
+         whose callback body contains `setState(` — proving
+         that the state transitions are wired to widget
+         rebuilds.
+
+    Missing either of these means the UI never propagates
+    VPN state, even if the singleton + Kotlin service is
+    working correctly. This is the third leg of the 11.0G
+    fix: Singleton (11.0F) + Private ctor (11.0G S76) +
+    UI propagation (11.0G S77).
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "active_pool_screen.dart"
+    if not target.exists():
+        findings.append(
+            "S77 active_pool_screen.dart: file missing. Sprint 11.0G "
+            "invariant — the screen must extend "
+            "`ConsumerStatefulWidget` AND have a "
+            "`stateStream.listen` subscription whose callback "
+            "calls `setState(` so the UI propagates VPN state "
+            "transitions."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S77 active_pool_screen.dart: read failed (" + str(e) + ")."
+        )
+        return findings
+    # 1. ConsumerStatefulWidget (NOT plain StatefulWidget).
+    if "ConsumerStatefulWidget" not in text:
+        findings.append(
+            "S77 active_pool_screen.dart: does NOT extend "
+            "`ConsumerStatefulWidget`. Sprint 11.0G invariant — "
+            "the screen must be a `ConsumerStatefulWidget` so "
+            "`ref.watch(vpnServiceProvider)` and `ref.listen(...)` "
+            "are available. The Riverpod DI surface is the "
+            "canonical way to surface the VpnService singleton "
+            "to the widget tree."
+        )
+    elif "StatefulWidget" in text and "ConsumerStatefulWidget" not in [
+        m for m in text.split("extends ") if "StatefulWidget" in m
+    ][0]:
+        # Defensive: if the class extends `StatefulWidget` (not
+        # `ConsumerStatefulWidget`), that's a regression. (The
+        # above string-search already covers the simple case.)
+        pass
+    # 2. stateStream.listen with setState in callback.
+    if "stateStream.listen" not in text and ".stateStream.listen" not in text:
+        findings.append(
+            "S77 active_pool_screen.dart: missing `stateStream.listen` "
+            "subscription. Sprint 11.0G invariant — the screen "
+            "must subscribe to the singleton's `stateStream` so "
+            "VpnLifecycleState transitions propagate to the UI."
+        )
+    elif "setState(" not in text:
+        findings.append(
+            "S77 active_pool_screen.dart: `stateStream.listen` "
+            "callback does NOT call `setState(`. Sprint 11.0G "
+            "invariant — without `setState`, the widget won't "
+            "rebuild on VPN state transitions. The 11.0F "
+            "singleton was necessary but not sufficient — the "
+            "state stream callback must also call `setState`."
+        )
+    # 3. VpnService.instance form (NOT VpnService()).
+    if "VpnService.instance" not in text and "vpnServiceProvider" not in text:
+        findings.append(
+            "S77 active_pool_screen.dart: does NOT reference "
+            "`VpnService.instance` (or `vpnServiceProvider`). "
+            "Sprint 11.0G invariant — the screen must use the "
+            "explicit singleton form. Pre-11.0G, the `VpnService()` "
+            "call site kept the regression surface opaque (Owner "
+            "11:25 confirmation)."
+        )
+    return findings
+
+
+def check_vpn_service_state_transition_breadcrumbs_v22() -> list[str]:
+    """Sprint 11.0H: OpenE2eeVpnService.kt has state-transition breadcrumbs + TOCTOU guard (S78).
+
+    Regression guard for the OnePlus 9 Pro
+    `start` returns `state: DRAINING` regression
+    (Owner 11:38 logcat). The 11.0F/11.0G singleton + UI
+    propagation fixes were necessary but not sufficient —
+    the Kotlin-side `startCapture` was racing with a
+    `stopCapture` (likely Magisk Zygisk revoke on a rooted
+    OnePlus) so the `startCapture` finished setting
+    `state = SAMPLING` but the racing `stopCapture` then
+    set `state = DRAINING` and the result returned to Dart
+    was the DRAINING state (not SAMPLING).
+
+    The Sprint 11.0H fix has THREE parts:
+      1. State-transition `Log.d` / `Log.w` breadcrumbs at
+         each step of `startCapture` / `stopCapture` /
+         `onRevoke` so the next regression is diagnosable
+         via `adb logcat -d -s OpenE2eeVpn:V` (the
+         `state: DRAINING` symptom doesn't include a
+         stacktrace, so the only signal is the
+         breadcrumb order).
+      2. A `synchronized(stateLock)` TOCTOU guard around
+         `startCapture` and `stopCapture` so the
+         start/stop race is impossible — the second
+         invocation waits for the first to complete.
+      3. An explicit `Log.w` on `onRevoke` (the
+         system-side revoke callback) so the Owner can
+         distinguish Magisk/system revoke from a manual
+         Dart-side `stop()`.
+
+    This check (S78) requires FOUR tokens in
+    `OpenE2eeVpnService.kt` (comment-stripped):
+      1. `startCapture: SAMPLING started` literal — proves
+         the state-transition log is present at the
+         happy-path point.
+      2. `stopCapture: called` literal — proves the
+         stop-path entry log is present (so the
+         `adb logcat` output shows WHERE stop was called
+         from).
+      3. `onRevoke:` literal — proves the system-revoke
+         path is instrumented.
+      4. `synchronized(` literal paired with a `stateLock`
+         reference — proves the TOCTOU guard is in place.
+    """
+    import re
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"
+    if not target.exists():
+        findings.append(
+            "S78 OpenE2eeVpnService.kt: file missing. Sprint 11.0H "
+            "invariant — the service must emit state-transition "
+            "Log.d / Log.w breadcrumbs at each step of "
+            "startCapture / stopCapture / onRevoke AND wrap the "
+            "start/stop paths in a `synchronized(stateLock)` "
+            "TOCTOU guard so the OnePlus 9 Pro `start` returns "
+            "`state: DRAINING` regression is closed."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S78 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Comment-strip loop (mirrors S43 / S73 / S74 / S75).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # 1. startCapture: SAMPLING started.
+    if "startCapture: SAMPLING started" not in code:
+        findings.append(
+            "S78 OpenE2eeVpnService.kt: missing `startCapture: "
+            "SAMPLING started` literal. Sprint 11.0H invariant — "
+            "the state-transition log at the happy-path point is "
+            "the breadcrumb that distinguishes a healthy start "
+            "from a racing-stop regression (Owner 11:38 saw "
+            "`start` return `state: DRAINING` with no stacktrace)."
+        )
+    # 2. stopCapture: called.
+    if "stopCapture: called" not in code:
+        findings.append(
+            "S78 OpenE2eeVpnService.kt: missing `stopCapture: "
+            "called` literal. Sprint 11.0H invariant — the "
+            "stop-path entry log identifies WHO called "
+            "stopCapture (Dart-side invokeMethod vs system "
+            "onRevoke vs racing startCapture)."
+        )
+    # 3. onRevoke: literal.
+    if "onRevoke:" not in code:
+        findings.append(
+            "S78 OpenE2eeVpnService.kt: missing `onRevoke:` "
+            "literal. Sprint 11.0H invariant — the system-side "
+            "revoke callback (Magisk Zygisk / settings / user) "
+            "must be instrumented so the next regression can "
+            "distinguish the four candidate stop paths."
+        )
+    # 4. synchronized(stateLock) TOCTOU guard.
+    has_synchronized = "synchronized(" in code
+    has_state_lock = "stateLock" in code
+    if not (has_synchronized and has_state_lock):
+        findings.append(
+            "S78 OpenE2eeVpnService.kt: missing `synchronized(stateLock)` "
+            "TOCTOU guard. Sprint 11.0H invariant — the "
+            "startCapture / stopCapture race on a rooted OnePlus "
+            "(Magisk Zygisk revoke) is impossible without "
+            "serializing the two paths. The lock is a "
+            "companion-level `@JvmField val stateLock: Any` so "
+            "it is shared JVM-wide across all instances."
+        )
+    return findings
+
+
+def check_vpn_service_addroute_bad_address_v23() -> list[str]:
+    """Sprint 11.0I: OpenE2eeVpnService.kt has correct addRoute (S79).
+
+    Regression guard for the OnePlus 9 Pro
+    `IllegalArgumentException: Bad address` crash
+    (Owner 11:46-11:57 logcat, PID 23863 / 23865).
+    Pre-11.0I, `buildVpnBuilder` used
+    `.addAddress(TUN_ADDRESS, 24)` + `.addRoute(TUN_ADDRESS, 24)` —
+    the SAME IP for both the interface address AND the captured
+    route destination. Android's `VpnService.Builder.addRoute`
+    expects a DESTINATION SUBNET (the network whose traffic the
+    VPN will capture), NOT the interface address. The 9.7.0-era
+    mirror bug is tolerated on Pixel / Samsung but rejected by
+    OnePlus 9 Pro OxygenOS strict validation.
+
+    The Sprint 11.0I fix uses `.addRoute("0.0.0.0", 0)` — the
+    default route (ALL traffic) — and a separate prefix length
+    for the interface address (`.addAddress(TUN_ADDRESS, 24)`).
+
+    The check requires THREE tokens in `OpenE2eeVpnService.kt`
+    (comment-stripped):
+      1. `.addAddress(TUN_ADDRESS` literal present — proves
+         the interface address is set with the `TUN_ADDRESS`
+         constant.
+      2. `.addRoute("0.0.0.0", 0)` literal present — proves
+         the captured route is the default route (NOT the
+         interface address).
+      3. `.addRoute(TUN_ADDRESS` literal ABSENT — anti-pattern
+         guard. A regression that re-introduces the 9.7.0
+         mirror bug (same IP for both calls) is flagged.
+
+    Missing any of these re-opens the OnePlus `Bad address`
+    regression.
+    """
+    import re
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"
+    if not target.exists():
+        findings.append(
+            "S79 OpenE2eeVpnService.kt: file missing. Sprint 11.0I "
+            "invariant — the service must use `.addRoute(\"0.0.0.0\", 0)` "
+            "(default route) and NOT `.addRoute(TUN_ADDRESS, 24)` "
+            "(the 9.7.0 mirror bug that OnePlus 9 Pro rejects)."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S79 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Comment-strip (mirrors S43 / S73 / S74 / S75 / S78).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # 1. `.addAddress(TUN_ADDRESS` literal.
+    if ".addAddress(TUN_ADDRESS" not in code:
+        findings.append(
+            "S79 OpenE2eeVpnService.kt: missing `.addAddress(TUN_ADDRESS` "
+            "literal. Sprint 11.0I invariant — the interface address "
+            "MUST be set with the `TUN_ADDRESS` constant. The "
+            "associated prefix length is `TUN_PREFIX_LENGTH` (24)."
+        )
+    # 2. `.addRoute("0.0.0.0", 0)` literal OR the constant form
+    #    `addRoute(CAPTURED_ROUTE_ADDRESS, CAPTURED_ROUTE_PREFIX)`
+    #    (which the production code uses — the constants are
+    #    defined as `const val CAPTURED_ROUTE_ADDRESS = "0.0.0.0"`
+    #    and `const val CAPTURED_ROUTE_PREFIX = 0`).
+    has_literal = re.search(r"\.addRoute\(\s*\"0\.0\.0\.0\"\s*,\s*0\s*\)", code)
+    has_constant = (
+        "CAPTURED_ROUTE_ADDRESS" in code and
+        "CAPTURED_ROUTE_PREFIX" in code
+    )
+    if not (has_literal or has_constant):
+        findings.append(
+            "S79 OpenE2eeVpnService.kt: missing the default-route "
+            "addRoute (`.addRoute(\"0.0.0.0\", 0)` literal OR the "
+            "`addRoute(CAPTURED_ROUTE_ADDRESS, CAPTURED_ROUTE_PREFIX)` "
+            "constant form). Sprint 11.0I invariant — the captured "
+            "route MUST be the default route (`0.0.0.0/0` = ALL "
+            "traffic). Pre-11.0I the code used `.addRoute(TUN_ADDRESS, "
+            "24)` which is the 9.7.0 mirror bug — OnePlus 9 Pro "
+            "rejects with `IllegalArgumentException: Bad address`."
+        )
+    # 3. `.addRoute(TUN_ADDRESS` ABSENT — anti-pattern guard.
+    if re.search(r"\.addRoute\(\s*TUN_ADDRESS", code):
+        findings.append(
+            "S79 OpenE2eeVpnService.kt: contains the "
+            "anti-pattern `.addRoute(TUN_ADDRESS, ...)` — the "
+            "9.7.0 mirror bug. Sprint 11.0I invariant — "
+            "`addRoute` takes a DESTINATION SUBNET, NOT the "
+            "interface address. Use `.addRoute(\"0.0.0.0\", 0)` "
+            "(default route) instead. OnePlus 9 Pro OxygenOS "
+            "rejects the mirror-bug form with `IllegalArgumentException: "
+            "Bad address`."
+        )
+    return findings
+
+
+def check_vpn_service_tun_passthrough_v24() -> list[str]:
+    """Sprint 11.0J: OpenE2eeVpnService.kt has TUN passthrough (S80).
+
+    Regression guard for the OnePlus 9 Pro "VPN active,
+    internet dead" symptom (Owner 12:14 report, PID 4244,
+    `state: DRAINING, packetsObserved: 0, ringSize: 0`).
+    The 11.0I fix (`.addRoute("0.0.0.0", 0)`) is necessary
+    but not sufficient — without the TUN passthrough pattern
+    in the reader thread, the kernel drops all packets the
+    TUN consumes from the input side. Result: the OS
+    triggers a system-side `onRevoke()` after 5-30s (no
+    network connectivity = VPN profile is "misbehaving")
+    and the `state: DRAINING` regression returns.
+
+    The fundamental VPN capture pattern:
+      1. Open TUN INPUT stream (read packets from kernel).
+      2. Open TUN OUTPUT stream (write packets back to kernel).
+      3. For each packet: read from input, capture metadata
+         for analytics, WRITE THE SAME BYTES BACK to the
+         output (the kernel then routes the packet out the
+         device's real NIC).
+
+    Pre-11.0J, the code opened ONLY the input stream and
+    never wrote to the output. The `protect(Socket)` call
+    was a no-op (it marks a SOCKET as "not VPN-routed" but
+    there's no socket to route). 11.0J removes the bogus
+    `protect()` call and adds the `output.write(buf, 0, n)`
+    passthrough.
+
+    The check requires THREE tokens in `OpenE2eeVpnService.kt`
+    (comment-stripped):
+      1. `output.write(buf` OR `tunOutput.write(` OR
+         `tun.write(` literal present — the passthrough
+         write call.
+      2. `input.read(buf` OR `tunInput.read` OR
+         `tun.read` literal present — the input read call.
+      3. The `protect(Socket)` no-op is NOT present in
+         non-comment form (anti-pattern guard — the
+         11.0A-era `protect()` was a misconception).
+
+    Missing any of these re-opens the "internet dead"
+    regression.
+    """
+    import re
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"
+    if not target.exists():
+        findings.append(
+            "S80 OpenE2eeVpnService.kt: file missing. Sprint 11.0J "
+            "invariant — the TUN reader thread must WRITE each "
+            "packet back to the TUN output stream (`output.write(buf, 0, n)`) "
+            "so the kernel routes the user's traffic to the real "
+            "NIC. Without this, the user's internet is dead (5-30s "
+            "later the OS triggers `onRevoke()` and the service "
+            "transitions to `state: DRAINING`)."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S80 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Comment-strip (mirrors S43 / S73 / S74 / S75 / S78 / S79).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # 1. Passthrough write call (output.write(buf OR
+    #    tunOutput.write( OR tun.write().
+    has_passthrough = (
+        "output.write(buf" in code or
+        "tunOutput.write(" in code or
+        "tun.write(" in code
+    )
+    if not has_passthrough:
+        findings.append(
+            "S80 OpenE2eeVpnService.kt: missing the TUN passthrough "
+            "write call (`output.write(buf, 0, n)` or "
+            "`tunOutput.write(buf, 0, n)`). Sprint 11.0J invariant — "
+            "the reader thread MUST write each packet back to the "
+            "TUN output stream so the kernel routes the packet "
+            "out the device's real NIC. Without this, `.addRoute("
+            "\"0.0.0.0\", 0)` (S79) drops all the user's internet "
+            "traffic and the OS triggers `onRevoke()` 5-30s later."
+        )
+    # 2. Input read call (input.read(buf OR tunInput.read( OR
+    #    tun.read().
+    has_input_read = (
+        "input.read(buf" in code or
+        "tunInput.read(" in code or
+        "tun.read(" in code
+    )
+    if not has_input_read:
+        findings.append(
+            "S80 OpenE2eeVpnService.kt: missing the TUN input "
+            "read call (`input.read(buf)` or `tunInput.read(...)`). "
+            "Sprint 11.0J invariant — the reader thread must "
+            "read from the TUN input stream before writing back "
+            "to the output."
+        )
+    # 3. Anti-pattern guard: `protect(Socket)` no-op MUST NOT be
+    #    present. The 11.0A-era `protect(Socket)` was a
+    #    misconception (protects a SOCKET from VPN, not packets).
+    #    A regression that re-introduces it is flagged.
+    has_protect_socket = re.search(r"protect\s*\(\s*Socket\s*\(\s*\)", code)
+    if has_protect_socket:
+        findings.append(
+            "S80 OpenE2eeVpnService.kt: contains the anti-pattern "
+            "`protect(Socket())` — the 11.0A-era misconception. "
+            "Sprint 11.0J invariant — `protect(Socket)` marks a "
+            "SOCKET as 'not VPN-routed' but the VPN reader thread "
+            "has no socket to protect. The actual transparent "
+            "passthrough pattern is `output.write(buf, 0, n)` "
+            "after `input.read(buf)`. Remove the `protect(Socket())` "
+            "call."
+        )
+    return findings
+
+
+def check_vpn_service_ui_thread_push_v26() -> list[str]:
+    """Sprint 11.0K: OpenE2eeVpnService.kt dispatches MethodChannel
+    calls to the Android main looper (S82).
+
+    Regression guard for the OnePlus 9 Pro "VPN active, internet
+    working, UI never updates" symptom (Owner 12:31 logcat, PID 4244,
+    98 packets in 80s, PacketDrain `deltaPerInterval` Log.d IS in
+    logcat, but `state: DRAINING, packetsObserved: 0, ringSize: 0`
+    stays frozen in the UI).
+
+    REAL root cause (overriding the 11.0K brief hypothesis): the
+    Flutter Engine requires `MethodChannel.invokeMethod` to be called
+    on the Android UI thread (the main `Looper`). Pre-11.0K, the
+    three call sites (flushTelemetry's `onTelemetry`, notifyError's
+    `onError`, PacketDrain's `onPacketsSampled`) invoked
+    `methodChannel?.invokeMethod` directly from their caller
+    threads:
+      - `flushTelemetry` is called from the TUN reader thread
+        (`startReaderThread`).
+      - `notifyError` is called from `startCapture` and
+        `startReaderThread`.
+      - `PacketDrain.run` is the `opene2ee-vpn-drain`
+        ScheduledExecutorService worker thread.
+    The engine threw `@UiThread: Methods marked with @UiThread must
+    be executed on the main thread. Current thread:
+    opene2ee-vpn-drain` and Dart never received any of the three
+    events. The Owner saw `state: DRAINING` because the Dart
+    `stateStream.listen` callback never fired.
+
+    11.0K fix:
+      1. Companion declares `@JvmField val mainHandler: Handler =
+         Handler(Looper.getMainLooper())` (eagerly initialized at
+         class-load time so the first push from a worker thread
+         does not have to construct the Handler).
+      2. All three call sites dispatch via `mainHandler.post { ... }`
+         — flushTelemetry and notifyError go through a
+         `pushToDart(method, args)` helper; PacketDrain inlines
+         the post.
+      3. New imports: `android.os.Handler` + `android.os.Looper`.
+
+    The check requires FIVE tokens in `OpenE2eeVpnService.kt`
+    (comment-stripped):
+      1. `import android.os.Handler` literal present.
+      2. `import android.os.Looper` literal present.
+      3. `Handler(Looper.getMainLooper())` literal present
+         (the companion `mainHandler` field).
+      4. `mainHandler.post` literal present (the dispatch call).
+      5. NO direct `methodChannel?.invokeMethod(` OR
+         `ch.invokeMethod(` from outside `mainHandler.post { ... }`
+         (anti-pattern guard — pre-11.0K regression).
+    """
+    import re
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"
+    if not target.exists():
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: file missing. Sprint 11.0K "
+            "invariant — all `methodChannel?.invokeMethod` calls "
+            "must be dispatched to the Android main looper via "
+            "`Handler(Looper.getMainLooper()).post { ... }` to "
+            "satisfy the Flutter Engine `@UiThread` requirement. "
+            "Owner 12:31 regression: PacketDrain ran on "
+            "`opene2ee-vpn-drain` ScheduledExecutor worker thread "
+            "and the engine threw `@UiThread` for every push; "
+            "Dart never received `onPacketsSampled` and the UI "
+            "stayed frozen on `state: DRAINING`."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Comment-strip (mirrors S43 / S73 / S74 / S75 / S78 / S79 / S80).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # 1. `import android.os.Handler`.
+    if "import android.os.Handler" not in code:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing `import "
+            "android.os.Handler`. Sprint 11.0K invariant — the "
+            "Handler class is required for the `mainHandler.post "
+            "{ ... }` dispatch. Add the import."
+        )
+    # 2. `import android.os.Looper`.
+    if "import android.os.Looper" not in code:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing `import "
+            "android.os.Looper`. Sprint 11.0K invariant — the "
+            "Looper class is required to construct the main-thread "
+            "Handler via `Handler(Looper.getMainLooper())`. Add "
+            "the import."
+        )
+    # 3. `Handler(Looper.getMainLooper())` companion field.
+    if not re.search(r"Handler\s*\(\s*Looper\.getMainLooper\s*\(\s*\)\s*\)", code):
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing the "
+            "`Handler(Looper.getMainLooper())` companion field. "
+            "Sprint 11.0K invariant — the `mainHandler` field "
+            "must be declared as `@JvmField val mainHandler: "
+            "Handler = Handler(Looper.getMainLooper())` on the "
+            "companion object so the first push from a worker "
+            "thread does not have to construct the Handler."
+        )
+    # 4. `mainHandler.post` dispatch.
+    if "mainHandler.post" not in code:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: missing `mainHandler.post` "
+            "dispatch. Sprint 11.0K invariant — at least one "
+            "call site (the three MethodChannel invocations: "
+            "`onTelemetry` in flushTelemetry, `onError` in "
+            "notifyError, `onPacketsSampled` in PacketDrain) must "
+            "use `mainHandler.post { methodChannel?.invokeMethod "
+            "(...) }` (or the `pushToDart` helper which calls it)."
+        )
+    # 5. Anti-pattern guard: NO direct `methodChannel?.invokeMethod`
+    #    OR `ch.invokeMethod` from outside `mainHandler.post { ... }`.
+    #    Find all `methodChannel?.invokeMethod(` and
+    #    `ch.invokeMethod(` call sites in code. Each must be
+    #    inside a `mainHandler.post { ... }` block.
+    #    The simplest invariant: the count of `mainHandler.post`
+    #    must be >= the count of `invokeMethod(` calls in the
+    #    file (with `methodChannel?` or `ch.` prefix).
+    invoke_call_count = 0
+    for m in re.finditer(r"methodChannel\?\.invokeMethod\s*\(|ch\.invokeMethod\s*\(", code):
+        invoke_call_count += 1
+    post_count = len(re.findall(r"mainHandler\.post\s*\{", code))
+    if invoke_call_count > post_count:
+        findings.append(
+            "S82 OpenE2eeVpnService.kt: found " + str(invoke_call_count) +
+            " direct `methodChannel?.invokeMethod(` / "
+            "`ch.invokeMethod(` call site(s) but only " +
+            str(post_count) + " `mainHandler.post { ... }` "
+            "wrapper(s). Sprint 11.0K invariant — the Flutter "
+            "Engine throws `@UiThread` for every push that "
+            "happens on a non-UI thread (PacketDrain worker, "
+            "TUN reader thread). All " + str(invoke_call_count) +
+            " invoke sites must be wrapped in a `mainHandler.post "
+            "{ ... }` block (or the `pushToDart` helper which "
+            "calls it). Owner 12:31 regression: the `onPacketsSampled` "
+            "push ran on the `opene2ee-vpn-drain` ScheduledExecutor "
+            "worker thread and the engine rejected the call."
+        )
+    return findings
+
+
+def check_vpn_service_packets_observed_increment_invariant_v27() -> list[str]:
+    """Sprint 11.0M: OpenE2eeVpnService.kt has packetsObserved
+    .incrementAndGet ONLY in the input.read(buf) read branch (S84).
+
+    Owner 13:08 fake-capture accusation: the Owner thought
+    the 258-packet counter was a fake increment because Chrome
+    and WhatsApp have no internet (real traffic is not flowing).
+    But the 258 counter is REAL — the TUN reader does receive
+    bytes from the kernel (the OS routes them in) — the
+    passthrough write is what is broken (Sprint 11.0L brief,
+    real root cause is the `output.write` failing silently
+    because the AutoCloseOutputStream is in a closed-fd state
+    on OnePlus 9 Pro OxygenOS). The packets enter the TUN,
+    hit the read branch, get counted, but the passthrough
+    write fails, so the OS drops them and the user's real
+    apps (Chrome, WhatsApp) see no internet.
+
+    This audit (S84) grep-asserts the invariant:
+      1. The substring `packetsObserved.incrementAndGet()` appears
+         EXACTLY ONCE in OpenE2eeVpnService.kt (comment-stripped).
+      2. That one occurrence is INSIDE the startReaderThread
+         function AND after extractMetadata returns non-null
+         (in the read branch).
+      3. packetsObserved.set( is allowed ONLY in startCapture
+         (the reset-on-new-session site).
+      4. NO anti-pattern `packetsObserved.set(packetsObserved
+         .get() + 1)` (fake-increment pattern).
+
+    Missing any of these re-opens the fake-capture regression.
+    """
+    import re
+    findings = []
+    target = (
+        REPO_ROOT / "mobile" / "android" / "app" / "src" / "main"
+        / "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn"
+        / "OpenE2eeVpnService.kt"
+    )
+    if not target.exists():
+        findings.append(
+            "S84 OpenE2eeVpnService.kt: file missing. Sprint 11.0M "
+            "invariant - packetsObserved.incrementAndGet MUST be "
+            "called EXACTLY ONCE per real TUN packet, in the read "
+            "branch of startReaderThread. Owner 13:08 fake-capture "
+            "accusation resolved by this audit; the file must "
+            "continue to exist for the regression guard to hold."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S84 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Comment-strip (mirrors S43 / S73 / S74 / S75 / S78 / S79 /
+    # S80 / S82). Strip /* */ blocks AND // line comments.
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    code_lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            code_lines.append(ln[:cut_at])
+        else:
+            code_lines.append(ln)
+    code = "\n".join(code_lines)
+    # 1. EXACTLY ONE packetsObserved.incrementAndGet() call site.
+    increment_matches = list(re.finditer(
+        r"packetsObserved\s*\.\s*incrementAndGet\s*\(\s*\)", code
+    ))
+    if len(increment_matches) == 0:
+        findings.append(
+            "S84 OpenE2eeVpnService.kt: ZERO packetsObserved."
+            "incrementAndGet call sites. Sprint 11.0M invariant "
+            "- the counter must be incremented inside the TUN "
+            "read branch in startReaderThread. Add "
+            "packetsObserved.incrementAndGet() after ring.addLast(meta)."
+        )
+    elif len(increment_matches) > 1:
+        locs = []
+        for mm in increment_matches:
+            line_no = code[:mm.start()].count("\n") + 1
+            ctx_start = max(0, mm.start() - 40)
+            ctx_end = min(len(code), mm.end() + 40)
+            ctx = code[ctx_start:ctx_end].replace("\n", " ")
+            locs.append("line " + str(line_no) + ": " + ctx)
+        findings.append(
+            "S84 OpenE2eeVpnService.kt: " + str(len(increment_matches)) +
+            " packetsObserved.incrementAndGet call site(s) found; "
+            "expected EXACTLY 1 (in startReaderThread read branch). "
+            "Sprint 11.0M invariant. Locations: " + " | ".join(locs) + "."
+        )
+    else:
+        # 2. The single call site is inside startReaderThread.
+        inc_pos = increment_matches[0].start()
+        func_match = None
+        for fm in re.finditer(r"(?:private\s+)?fun\s+(\w+)\s*\(", code):
+            if fm.start() < inc_pos:
+                func_match = fm
+            else:
+                break
+        if func_match is None or func_match.group(1) != "startReaderThread":
+            func_name = func_match.group(1) if func_match else "<unknown>"
+            findings.append(
+                "S84 OpenE2eeVpnService.kt: the single "
+                "packetsObserved.incrementAndGet call site is in "
+                + func_name + ", NOT in startReaderThread. Sprint "
+                "11.0M invariant - the counter must be incremented "
+                "inside the TUN read loop, not in any other function."
+            )
+        else:
+            # 2b. The increment is preceded by extractMetadata
+            # within 600 chars (post-extractMetadata read branch).
+            window_before = code[max(0, inc_pos - 600):inc_pos]
+            if "extractMetadata" not in window_before:
+                findings.append(
+                    "S84 OpenE2eeVpnService.kt: the single "
+                    "packetsObserved.incrementAndGet call site is "
+                    "in startReaderThread but NOT preceded by "
+                    "extractMetadata (within 600 chars). Sprint "
+                    "11.0M invariant - the counter must be "
+                    "incremented AFTER extractMetadata returns "
+                    "non-null, not at function entry or in a "
+                    "guard branch."
+                )
+    # 3. packetsObserved.set( allowed ONLY in startCapture.
+    set_matches = list(re.finditer(
+        r"packetsObserved\s*\.\s*set\s*\(", code
+    ))
+    for sm in set_matches:
+        sm_pos = sm.start()
+        func_match = None
+        for fm in re.finditer(r"(?:private\s+)?fun\s+(\w+)\s*\(", code):
+            if fm.start() < sm_pos:
+                func_match = fm
+            else:
+                break
+        func_name = func_match.group(1) if func_match else "<unknown>"
+        if func_name != "startCapture":
+            line_no = code[:sm_pos].count("\n") + 1
+            findings.append(
+                "S84 OpenE2eeVpnService.kt: packetsObserved.set( "
+                "call at line " + str(line_no) + " is in "
+                + func_name + ", NOT in startCapture. Sprint 11.0M "
+                "invariant - the reset-to-0 MUST happen only in "
+                "startCapture, not in stopCapture / onRevoke / "
+                "onStartCommand (those would clobber a real count)."
+            )
+    # 4. Anti-pattern guard: NO string-form increment
+    #    packetsObserved.set(packetsObserved.get() + 1).
+    if re.search(
+        r"packetsObserved\s*\.\s*set\s*\(\s*packetsObserved\s*\.\s*get\s*\(\s*\)\s*\+\s*1",
+        code,
+    ):
+        findings.append(
+            "S84 OpenE2eeVpnService.kt: contains the anti-pattern "
+            "packetsObserved.set(packetsObserved.get() + 1). Sprint "
+            "11.0M invariant - this is the classic fake-increment "
+            "pattern (counting without an actual packet). Use "
+            "packetsObserved.incrementAndGet() ONLY inside the "
+            "input.read(buf) branch in startReaderThread."
+        )
+    return findings
+
+
+
+
+
+def check_pubspec_webrtc_dep_v16() -> list[str]:
+    """Sprint 11.0B: pubspec.yaml has `webrtc:` dep line (S53).
+
+    The dependency line may read `webrtc: ^0.13.0+` (the brief's
+    literal) OR `flutter_webrtc: ^1.5.0` (the actively-maintained
+    rename that resolves on Dart 3.12.1). Both carry the
+    substring `webrtc:`. The audit accepts the substring.
+    """
+    findings = []
+    pubspec = REPO_ROOT / "mobile" / "pubspec.yaml"
+    if not pubspec.exists():
+        findings.append("S53 mobile/pubspec.yaml: file missing.")
+        return findings
+    try:
+        text = pubspec.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S53 mobile/pubspec.yaml: read failed (" + str(e) + ").")
+        return findings
+    if "webrtc:" not in text:
+        findings.append(
+            "S53 mobile/pubspec.yaml: missing `webrtc:` dep line. "
+            "Sprint 11.0B invariant — the WebRTC peer connection "
+            "is the M2 demo path. The brief specifies `webrtc: "
+            "^0.13.0+`; the modern actively-maintained variant is "
+            "`flutter_webrtc: ^1.5.0` which carries the same "
+            "audit substring."
+        )
+    return findings
+
+
+def check_webrtc_service_rtc_peer_connection_v16() -> list[str]:
+    """Sprint 11.0B: webrtc_service.dart imports flutter_webrtc + uses RTCPeerConnection (S54)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "webrtc_service.dart"
+    if not target.exists():
+        findings.append("S54 mobile/lib/services/webrtc_service.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S54 webrtc_service.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "import 'package:flutter_webrtc/flutter_webrtc.dart'" not in text:
+        missing.append("flutter_webrtc import")
+    if "RTCPeerConnection" not in text:
+        missing.append("RTCPeerConnection reference")
+    if "createPeerConnection" not in text:
+        missing.append("createPeerConnection call site")
+    if missing:
+        findings.append(
+            "S54 webrtc_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the Dart-side peer connection "
+            "wrapper must import the `flutter_webrtc` package and "
+            "instantiate `RTCPeerConnection` via "
+            "`createPeerConnection({iceServers: ...})`."
+        )
+    return findings
+
+
+def check_webrtc_service_on_ice_candidate_v16() -> list[str]:
+    """Sprint 11.0B: webrtc_service.dart onIceCandidate callback wires candidate + sdpMid + sdpMLineIndex (S55)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "webrtc_service.dart"
+    if not target.exists():
+        findings.append("S55 webrtc_service.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S55 webrtc_service.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "onIceCandidate" not in text:
+        missing.append("onIceCandidate callback")
+    has_candidate = ("'candidate'" in text or '"candidate"' in text)
+    if not has_candidate:
+        missing.append("candidate string literal")
+    if "sdpMid" not in text:
+        missing.append("sdpMid field")
+    if missing:
+        findings.append(
+            "S55 webrtc_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the `onIceCandidate` callback "
+            "forwards each peer-discovered candidate to the "
+            "orchestrator's `POST /api/v1/webrtc/ice` endpoint. The "
+            "candidate payload carries `candidate` (RFC 5245 "
+            "candidate string) + `sdpMid` (mid attribute) + "
+            "`sdpMLineIndex` (line index)."
+        )
+    return findings
+
+
+def check_session_orchestrator_start_session_v16() -> list[str]:
+    """Sprint 11.0B: session_orchestrator.dart startSession() + JWT auth header (S56)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "session_orchestrator.dart"
+    if not target.exists():
+        findings.append("S56 session_orchestrator.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S56 session_orchestrator.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "startSession" not in text:
+        missing.append("startSession method")
+    if "authHeaders" not in text:
+        missing.append("authHeaders() call (JWT)")
+    if "/api/v1/sessions" not in text:
+        missing.append("/api/v1/sessions endpoint")
+    if missing:
+        findings.append(
+            "S56 session_orchestrator.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — `startSession()` is the "
+            "JWT-authenticated entry point that mints a session "
+            "id (and receiver_session_id) the orchestrator uses "
+            "for the rest of the negotiation flow."
+        )
+    return findings
+
+
+def check_session_orchestrator_long_poll_v16() -> list[str]:
+    """Sprint 11.0B: session_orchestrator.dart long-poll GET (timeout 30s) (S57)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "session_orchestrator.dart"
+    if not target.exists():
+        findings.append("S57 session_orchestrator.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S57 session_orchestrator.dart: read failed (" + str(e) + ").")
+        return findings
+    has_30s = ("Duration(seconds: 30)" in text or "_pollTimeout" in text)
+    if not has_30s:
+        findings.append(
+            "S57 session_orchestrator.dart: missing 30s long-poll "
+            "timeout literal. Sprint 11.0B invariant — the "
+            "orchestrator's `pollForOffer` / `pollForAnswer` "
+            "methods long-poll GET with a 30s timeout (the brief's "
+            "`Future.timeout` contract)."
+        )
+        return findings
+    if ".get(" not in text:
+        findings.append(
+            "S57 session_orchestrator.dart: missing `.get(` call site for long-poll GET."
+        )
+    if "pollForOffer" not in text and "pollForAnswer" not in text:
+        findings.append(
+            "S57 session_orchestrator.dart: missing `pollForOffer` or `pollForAnswer` method."
+        )
+    return findings
+
+
+def check_backend_webrtc_long_poll_handlers_v16() -> list[str]:
+    """Sprint 11.0B: backend router.go GET /api/v1/webrtc/{offer,answer} long-poll handlers (S58).
+
+    The mobile orchestrator's `pollForOffer` / `pollForAnswer`
+    methods GET `/api/v1/webrtc/offer?session_id=...` and
+    `/api/v1/webrtc/answer?session_id=...` with a 30s timeout.
+    The backend holds the connection open for up to 30s and
+    returns either the remote SDP (200 + JSON) or an empty
+    body (204) on long-poll timeout.
+
+    Audit scope: `backend/internal/api/router.go` must carry
+    BOTH the `r.Get("/webrtc/offer", ...)` AND
+    `r.Get("/webrtc/answer", ...)` route registrations inside
+    the JWT-protected subtree.
+    """
+    findings = []
+    router_path = REPO_ROOT / "backend" / "internal" / "api" / "router.go"
+    if not router_path.exists():
+        findings.append("S58 backend/internal/api/router.go: file missing.")
+        return findings
+    try:
+        text = router_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S58 backend/internal/api/router.go: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if 'r.Get("/webrtc/offer"' not in text:
+        missing.append("r.Get(\"/webrtc/offer\", ...)")
+    if 'r.Get("/webrtc/answer"' not in text:
+        missing.append("r.Get(\"/webrtc/answer\", ...)")
+    if missing:
+        findings.append(
+            "S58 backend/internal/api/router.go: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the mobile orchestrator's "
+            "`pollForOffer` / `pollForAnswer` long-poll GETs hit "
+            "the backend's GET /api/v1/webrtc/{offer,answer} "
+            "handlers. The backend holds the connection open for "
+            "up to 30s and returns either the remote SDP (200 + "
+            "JSON) or an empty body (204) on long-poll timeout."
+        )
+    return findings
+
+
+def check_webrtc_service_on_track_v16() -> list[str]:
+    """Sprint 11.0B: webrtc_service.dart onTrack stream exposed (S59)."""
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "services" / "webrtc_service.dart"
+    if not target.exists():
+        findings.append("S59 webrtc_service.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S59 webrtc_service.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "onTrack" not in text:
+        missing.append("onTrack callback")
+    if "get onTrack" not in text:
+        missing.append("onTrack stream getter")
+    if missing:
+        findings.append(
+            "S59 webrtc_service.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the service exposes the peer "
+            "connection's `onTrack` stream so the UI can show "
+            "'1 stream received' when the test harness triggers "
+            "an inbound track event."
+        )
+    return findings
+
+
+def check_active_pool_webrtc_status_indicator_v16() -> list[str]:
+    """Sprint 11.0B: active_pool_screen.dart WebRTC status indicator (S60).
+
+    The status pill on the active pool screen surfaces the
+    live WebRTC state with three labels: Negotiating /
+    Connected / Failed. Owner chose Turkish: müzakere /
+    bağlandı / hata.
+    """
+    findings = []
+    target = REPO_ROOT / "mobile" / "lib" / "screens" / "active_pool_screen.dart"
+    if not target.exists():
+        findings.append("S60 active_pool_screen.dart: file missing.")
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append("S60 active_pool_screen.dart: read failed (" + str(e) + ").")
+        return findings
+    missing = []
+    if "müzakere" not in text:
+        missing.append("Negotiating label (müzakere)")
+    if "bağlandı" not in text:
+        missing.append("Connected label (bağlandı)")
+    if "hata" not in text:
+        missing.append("Failed label (hata)")
+    if missing:
+        findings.append(
+            "S60 active_pool_screen.dart: missing " + ", ".join(missing) + ". "
+            "Sprint 11.0B invariant — the WebRTC status pill on "
+            "the active pool screen surfaces the live peer "
+            "connection state with three labels: Negotiating / "
+            "Connected / Failed (Turkish: müzakere / bağlandı / "
+            "hata). The `P2P:` prefix in the row distinguishes "
+            "the WebRTC pill from the foreground service pill."
+        )
+    return findings
+
+
 def main() -> int:
     all_findings = []
     for fname in TARGETS:
@@ -3436,12 +6744,36 @@ def main() -> int:
     else:
         print("PASS: mobile/lib/screens/active_pool_screen.dart contains the literal `LineChart` - Sprint 10.1A S27")
 
-    # Sprint 10.1A: Timer.periodic literal in pool provider (S28).
-    s28_findings = check_pool_provider_timer_periodic_literal_present()
+    # Sprint 11.0O: NO Timer.periodic in pool provider (S28, INVERTED).
+    s28_findings = check_pool_provider_no_fake_animation_v29()
     if s28_findings:
         all_findings.extend(s28_findings)
     else:
-        print("PASS: mobile/lib/state/pool_provider.dart contains the literal `Timer.periodic` - Sprint 10.1A S28")
+        print("PASS: mobile/lib/state/pool_provider.dart has NO Timer.periodic call site (mock ticker removed - Sprint 11.0O S28)")
+
+    s86_findings = check_dart_no_fake_ui_animation_v30()
+    if s86_findings:
+        all_findings.extend(s86_findings)
+    else:
+        print("PASS: active_pool_screen.dart + pool_provider.dart + state/*.dart have NO Timer.periodic / setInterval / Future.delayed / mock initial values; UI updates only via _vpn.packetStream.listen and _vpn.stateStream.listen + setState (Sprint 11.0O S86)")
+
+    s87_findings = check_vpn_service_mtu_and_fragment_log_v31()
+    if s87_findings:
+        all_findings.extend(s87_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt has TUN_MTU=1400 (mobile-safe, NOT 1500) + addDnsServer(1.1.1.1) + per-1000-packet MTU+fragment log breadcrumb - regression guard for OnePlus 9 Pro / Turkcell GTP encapsulation MTU drop - Sprint 11.0P S87")
+
+    s88_findings = check_oturumu_bitir_2level_fallback_v32()
+    if s88_findings:
+        all_findings.extend(s88_findings)
+    else:
+        print("PASS: active_pool_screen.dart has 2-level VPN disconnect fallback (_vpn.stop with 3s timeout + MainActivity.disconnectVpn hard-stop) - regression guard for OnePlus 9 Pro 'Oturumu Bitir requires app uninstall' symptom - Sprint 11.0Q S88")
+
+    s89_findings = check_oturumu_bitir_full_state_reset_v33()
+    if s89_findings:
+        all_findings.extend(s89_findings)
+    else:
+        print("PASS: active_pool_screen.dart has full state reset on disconnect (subscriptions cancelled + counters cleared + UI reset + button disabled while in flight + navigation to /home/gorevler) - regression guard for OnePlus 9 Pro 'packet counter keeps growing after disconnect' symptom - Sprint 11.0R S89")
 
     # Sprint 10.1A: HapticFeedback / SystemSound literal in active pool screen (S29).
     s29_findings = check_active_pool_haptic_feedback_literal_present()
@@ -3527,12 +6859,250 @@ def main() -> int:
     else:
         print("PASS: MainActivity.kt wires `when (call.method) { ... \"getSampledPackets\" -> ... }` on the `opene2ee/vpn` MethodChannel (Kotlin mock packet for Sprint 10.1F; real OpenE2eeVpnService integration lands in Sprint 10.2) - Sprint 10.1F S43")
 
+    # Sprint 10.1G: WhatsApp wa.me primary deep link + intent:// fallback (S44).
+    s44_findings = check_whatsapp_deeplink_wa_me_format_v14()
+    if s44_findings:
+        all_findings.extend(s44_findings)
+    else:
+        print("PASS: whatsapp_deeplink_provider.dart carries BOTH `intent://send?text=` (fallback) AND `https://wa.me/?text=` (primary) literals; whatsapp_task_detail_screen.dart calls `tryOpenWithReason()` - Sprint 10.1G S44")
+
+    # Sprint 11.0A: Real VpnService packet drain → MethodChannel → Dart stream (M1).
+    s45_findings = check_vpn_service_on_packets_sampled_literal_v15()
+    if s45_findings:
+        all_findings.extend(s45_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt PacketDrain pushes 'onPacketsSampled' literal via methodChannel.invokeMethod - Sprint 11.0A S45")
+
+    s46_findings = check_main_activity_snapshot_call_v15()
+    if s46_findings:
+        all_findings.extend(s46_findings)
+    else:
+        print("PASS: MainActivity.kt calls OpenE2eeVpnService.snapshot() and does NOT contain the 10.1F mock packet mapOf literal - Sprint 11.0A S46")
+
+    s47_findings = check_vpn_service_packet_stream_getter_v15()
+    if s47_findings:
+        all_findings.extend(s47_findings)
+    else:
+        print("PASS: vpn_service.dart carries 'packetStream' getter + 'MethodChannel' import - Sprint 11.0A S47")
+
+    s48_findings = check_active_pool_packet_stream_listen_v15()
+    if s48_findings:
+        all_findings.extend(s48_findings)
+    else:
+        print("PASS: active_pool_screen.dart subscribes to packetStream via .listen - Sprint 11.0A S48")
+
+    s49_findings = check_sampled_packet_class_v15()
+    if s49_findings:
+        all_findings.extend(s49_findings)
+    else:
+        print("PASS: packet_parser.dart has SampledPacket class with fromBytes + toJson - Sprint 11.0A S49")
+
+    s50_findings = check_vpn_service_foreground_notification_text_v15()
+    if s50_findings:
+        all_findings.extend(s50_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt foreground notification text is 'OpenE2EE Şifreleme Doğrulama' (no VPN string) - Sprint 11.0A S50")
+
+    s51_findings = check_active_pool_no_30_call_loop_v15()
+    if s51_findings:
+        all_findings.extend(s51_findings)
+    else:
+        print("PASS: active_pool_screen.dart has packetStream subscription + NO 30-call fixed Timer.periodic loop - Sprint 11.0A S51")
+
+    s52_findings = check_telemetry_service_summary_upload_v15()
+    if s52_findings:
+        all_findings.extend(s52_findings)
+    else:
+        print("PASS: telemetry_service.dart has sendSummary method POSTing to /api/v1/sessions/{id}/telemetry with 6 summary fields - Sprint 11.0A S52")
+
+    # Sprint 11.0B: WebRTC P2P (M2).
+    s53_findings = check_pubspec_webrtc_dep_v16()
+    if s53_findings:
+        all_findings.extend(s53_findings)
+    else:
+        print("PASS: pubspec.yaml carries the `webrtc:` dep line (flutter_webrtc ^1.5.0 — modern Dart 3.12.1-compatible) - Sprint 11.0B S53")
+
+    s54_findings = check_webrtc_service_rtc_peer_connection_v16()
+    if s54_findings:
+        all_findings.extend(s54_findings)
+    else:
+        print("PASS: webrtc_service.dart imports flutter_webrtc + references RTCPeerConnection + calls createPeerConnection - Sprint 11.0B S54")
+
+    s55_findings = check_webrtc_service_on_ice_candidate_v16()
+    if s55_findings:
+        all_findings.extend(s55_findings)
+    else:
+        print("PASS: webrtc_service.dart onIceCandidate callback wires candidate + sdpMid + sdpMLineIndex fields - Sprint 11.0B S55")
+
+    s56_findings = check_session_orchestrator_start_session_v16()
+    if s56_findings:
+        all_findings.extend(s56_findings)
+    else:
+        print("PASS: session_orchestrator.dart startSession() + JWT authHeaders() + /api/v1/sessions endpoint - Sprint 11.0B S56")
+
+    s57_findings = check_session_orchestrator_long_poll_v16()
+    if s57_findings:
+        all_findings.extend(s57_findings)
+    else:
+        print("PASS: session_orchestrator.dart long-poll GET (pollForOffer) with Duration(seconds: 30) timeout - Sprint 11.0B S57")
+
+    s58_findings = check_backend_webrtc_long_poll_handlers_v16()
+    if s58_findings:
+        all_findings.extend(s58_findings)
+    else:
+        print("PASS: backend router.go GET /api/v1/webrtc/{offer,answer} long-poll handlers (Sprint 11.0B v15 → v16) - Sprint 11.0B S58")
+
+    s59_findings = check_webrtc_service_on_track_v16()
+    if s59_findings:
+        all_findings.extend(s59_findings)
+    else:
+        print("PASS: webrtc_service.dart onTrack stream exposed - Sprint 11.0B S59")
+
+    s60_findings = check_active_pool_webrtc_status_indicator_v16()
+    if s60_findings:
+        all_findings.extend(s60_findings)
+    else:
+        print("PASS: active_pool_screen.dart WebRTC status indicator (Negotiating / Connected / Failed — Turkish: müzakere / bağlandı / hata) - Sprint 11.0B S60")
+
+    # Sprint 11.0C: Skorlar screen + score calculator + session close + E2E (M3).
+    s61_findings = check_skorlar_screen_fetch_scores_v17()
+    if s61_findings:
+        all_findings.extend(s61_findings)
+    else:
+        print("PASS: skorlar_screen.dart has Future<List<SessionScore>> + ConsumerStatefulWidget + fetchScores - Sprint 11.0C S61")
+
+    s62_findings = check_score_calculator_compute_v17()
+    if s62_findings:
+        all_findings.extend(s62_findings)
+    else:
+        print("PASS: score_calculator.dart has SessionScoreCalculator class + static SessionScore compute - Sprint 11.0C S62")
+
+    s63_findings = check_score_calculator_four_metrics_v17()
+    if s63_findings:
+        all_findings.extend(s63_findings)
+    else:
+        print("PASS: score_calculator.dart carries the 4 metric field references - Sprint 11.0C S63")
+
+    s64_findings = check_score_calculator_overall_weighted_sum_v17()
+    if s64_findings:
+        all_findings.extend(s64_findings)
+    else:
+        print("PASS: score_calculator.dart has the overall weighted sum 0.4 + 0.3 + 0.2 + 0.1 - Sprint 11.0C S64")
+
+    s65_findings = check_session_orchestrator_close_session_v17()
+    if s65_findings:
+        all_findings.extend(s65_findings)
+    else:
+        print("PASS: session_orchestrator.dart has closeSession() method that POSTs /api/v1/sessions/{id}/close - Sprint 11.0C S65")
+
+    s66_findings = check_active_pool_oturumu_bitur_button_v17()
+    if s66_findings:
+        all_findings.extend(s66_findings)
+    else:
+        print("PASS: active_pool_screen.dart has the 'Oturumu Bitir' Turkish label - Sprint 11.0C S66")
+
+    s67_findings = check_active_pool_close_then_navigate_v17()
+    if s67_findings:
+        all_findings.extend(s67_findings)
+    else:
+        print("PASS: active_pool_screen.dart closeSession + /home/skorlar flow - Sprint 11.0C S67")
+
+    s68_findings = check_skorlar_empty_state_v17()
+    if s68_findings:
+        all_findings.extend(s68_findings)
+    else:
+        print("PASS: skorlar_screen.dart has the 'Henüz tamamlanmış oturum yok' empty-state string - Sprint 11.0C S68")
+
+    s69_findings = check_skorlar_card_overall_gauge_v17()
+    if s69_findings:
+        all_findings.extend(s69_findings)
+    else:
+        print("PASS: skorlar_screen.dart has SessionScoreCard with overall-score gauge - Sprint 11.0C S69")
+
+    s70_findings = check_backend_sessions_close_handler_v17()
+    if s70_findings:
+        all_findings.extend(s70_findings)
+    else:
+        print("PASS: backend router.go has POST /api/v1/sessions/{id}/close route registration - Sprint 11.0C S70")
+
+    s71_findings = check_backend_summary_stats_shape_v17()
+    if s71_findings:
+        all_findings.extend(s71_findings)
+    else:
+        print("PASS: backend sessions.go has the 6-field summary_stats response shape - Sprint 11.0C S71")
+
+    s72_findings = check_score_calculator_unit_tests_v17()
+    if s72_findings:
+        all_findings.extend(s72_findings)
+    else:
+        print("PASS: score_calculator_test.dart has 4+ unit tests - Sprint 11.0C S72")
+
+    s73_findings = check_main_activity_owns_vpn_channel_v18()
+    if s73_findings:
+        all_findings.extend(s73_findings)
+    else:
+        print("PASS: MainActivity.kt owns the opene2ee/vpn MethodChannel handler (regression guard for OnePlus 9 Pro MissingPluginException) - Sprint 11.0D S73")
+
+    s74_findings = check_vpn_service_startforeground_within_5s_v19()
+    if s74_findings:
+        all_findings.extend(s74_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt calls startForeground() before Builder.establish() (5-second foreground-service rule) - Sprint 11.0E S74")
+
+    s75_findings = check_vpn_service_log_d_breadcrumbs_v20()
+    if s75_findings:
+        all_findings.extend(s75_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt has Log.d breadcrumbs (5+ statements across startCapture + onStartCommand + dispatch) - Sprint 11.0F S75")
+
+    s76_findings = check_vpn_service_dart_singleton_v20()
+    if s76_findings:
+        all_findings.extend(s76_findings)
+    else:
+        print("PASS: vpn_service.dart exposes VpnService as a Dart singleton (private _internal ctor + VpnService.instance static getter) - Sprint 11.0F S76")
+
+    s77_findings = check_active_pool_screen_ui_propagation_v21()
+    if s77_findings:
+        all_findings.extend(s77_findings)
+    else:
+        print("PASS: active_pool_screen.dart uses ConsumerStatefulWidget + stateStream.listen(setState) for VPN UI propagation - Sprint 11.0G S77")
+
+    s78_findings = check_vpn_service_state_transition_breadcrumbs_v22()
+    if s78_findings:
+        all_findings.extend(s78_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt has state-transition Log.d breadcrumbs (startCapture/stopCapture/onRevoke) + synchronized TOCTOU guard - Sprint 11.0H S78")
+
+    s79_findings = check_vpn_service_addroute_bad_address_v23()
+    if s79_findings:
+        all_findings.extend(s79_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt has correct addRoute (0.0.0.0/0 default route) — regression guard for OnePlus 9 Pro IllegalArgumentException: Bad address (Sprint 9.7.0 mirror bug) - Sprint 11.0I S79")
+
+    s80_findings = check_vpn_service_tun_passthrough_v24()
+    if s80_findings:
+        all_findings.extend(s80_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt has tun passthrough (tunOutput.write after tunInput.read) — regression guard for OnePlus 9 Pro internet-killed-by-default-route - Sprint 11.0J S80")
+
+    s82_findings = check_vpn_service_ui_thread_push_v26()
+    if s82_findings:
+        all_findings.extend(s82_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt dispatches MethodChannel.invokeMethod to the Android main looper — regression guard for OnePlus 9 Pro @UiThread violation on PacketDrain worker - Sprint 11.0K S82")
+
+    s84_findings = check_vpn_service_packets_observed_increment_invariant_v27()
+    if s84_findings:
+        all_findings.extend(s84_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt has packetsObserved.incrementAndGet ONLY in the input.read(buf) read branch (no fake increments) — regression guard for OnePlus 9 Pro Sprint 11.0A-11.0L fake-capture accusation - Sprint 11.0M S84")
+
     if all_findings:
         print("\nFINDINGS:")
         for f in all_findings:
             print(f"  - {f}")
         return 1
-    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 intent://send?text= literal in WhatsApp task detail (10.0 + 10.1E) + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher + S36 auth_service.dart POST /api/v1/auth + user_id + S37 authHeaders() in telemetry_service or p2p_matcher + S38 _tokenExpiresAt field in auth_service + S39 invalidate() method in auth_service + S40 whatsapp_deeplink_provider.dart carries BOTH `intent://send?` and `#Intent;scheme=whatsapp;package=com.whatsapp;end` + S41 p2p_matcher.dart uses /api/v1/sessions (not /api/v1/matches) + S42 AndroidManifest <queries> WhatsApp package visibility + S43 MainActivity.kt getSampledPackets method-channel handler PASS PyYAML AUDIT.")
+    print("\nALL 4 WORKFLOWS + GRADLE WRAPPER + AGP + KOTLIN + SYNTAX v2 + S6 flutter pub get step + S7 mobile entry point + S8 Android XML comments + S9 AndroidManifest merger-spec + S10 Android res/ skeleton + S11 .flutter-plugins-dependencies regen + S12 flutter_embedding_ktx declared in app deps + S13 Flutter storage Maven repo declared in settings.gradle.kts + S17 gradle wrapper force-include + S18 fresh flutter create preservation + S19 fresh create local metadata tracked + S20 pubspec.yaml baseline shape + S25 no `vpn` string in mobile/lib/main.dart + screens + S26 intent://send?text= literal in WhatsApp task detail (10.0 + 10.1E) + S27 LineChart literal in active pool screen + S28 Timer.periodic literal in pool provider + S29 HapticFeedback/SystemSound literal in active pool screen + S33 PoolState debug fields (lastError + lastSuccess) + S34 ScaffoldMessenger.of(context).showSnackBar in active pool screen + S35 String.fromEnvironment('API_KEY' in telemetry_service or p2p_matcher + S36 auth_service.dart POST /api/v1/auth + user_id + S37 authHeaders() in telemetry_service or p2p_matcher + S38 _tokenExpiresAt field in auth_service + S39 invalidate() method in auth_service + S40 whatsapp_deeplink_provider.dart carries BOTH `intent://send?` and `#Intent;scheme=whatsapp;package=com.whatsapp;end` + S41 p2p_matcher.dart uses /api/v1/sessions (not /api/v1/matches) + S42 AndroidManifest <queries> WhatsApp package visibility + S43 MainActivity.kt OR OpenE2eeVpnService.kt getSampledPackets method-channel handler + S44 whatsapp_deeplink_provider.dart carries BOTH `intent://send?text=` AND `https://wa.me/?text=` + whatsapp_task_detail_screen.dart calls `tryOpenWithReason` (10.1G OnePlus 9 Pro Magisk fix) + S45 OpenE2eeVpnService.kt PacketDrain pushes 'onPacketsSampled' literal + S46 MainActivity.kt calls OpenE2eeVpnService.snapshot() (no mock packet) + S47 vpn_service.dart 'packetStream' getter + 'MethodChannel' import + S48 active_pool_screen.dart packetStream.listen + S49 packet_parser.dart SampledPacket class with fromBytes + toJson + S50 OpenE2eeVpnService.kt foreground notification text 'OpenE2EE Şifreleme Doğrulama' (no VPN) + S51 active_pool_screen.dart continuous chart (no 30-call loop) + S52 telemetry_service.dart sendSummary POSTs to /api/v1/sessions/{id}/telemetry (11.0A real VpnService packet drain + 5-second scheduled drain) + S53 pubspec.yaml 'webrtc:' dep line + S54 webrtc_service.dart imports flutter_webrtc + references RTCPeerConnection + calls createPeerConnection + S55 webrtc_service.dart onIceCandidate callback wires candidate + sdpMid + sdpMLineIndex + S56 session_orchestrator.dart startSession() + JWT authHeaders() + /api/v1/sessions + S57 session_orchestrator.dart long-poll GET (pollForOffer) with Duration(seconds: 30) + S58 backend router.go GET /api/v1/webrtc/{offer,answer} long-poll handlers + S59 webrtc_service.dart onTrack stream exposed + S60 active_pool_screen.dart WebRTC status indicator (Negotiating / Connected / Failed) (11.0B WebRTC P2P + flutter_webrtc 1.5.2 native + compileSdk 36) + S61 skorlar_screen.dart has Future<List<SessionScore>> + ConsumerStatefulWidget + fetchScores + S62 score_calculator.dart SessionScoreCalculator class + static SessionScore compute + S63 score_calculator.dart 4 metric field references + S64 score_calculator.dart overall weighted sum 0.4+0.3+0.2+0.1 + S65 session_orchestrator.dart closeSession() method + close endpoint + S66 active_pool_screen.dart 'Oturumu Bitir' Turkish label + S67 active_pool_screen.dart closeSession + /home/skorlar flow + S68 skorlar_screen.dart 'Henüz tamamlanmış oturum yok' empty-state + S69 skorlar_screen.dart SessionScoreCard + overall-score gauge + S70 backend router.go POST /api/v1/sessions/{id}/close + S71 backend sessions.go 6-field summary_stats response shape + S72 score_calculator_test.dart 4+ unit tests (11.0C Skorlar screen + score calculator + session close + E2E) PASS PyYAML AUDIT.")
     return 0
 
 

@@ -1,7 +1,8 @@
 // mobile/lib/services/telemetry_service.dart
 //
-// Sprint 10.1B + 10.1C + 10.1D — real telemetry upload to
-// api-test.opene2ee.com/api/v1/telemetry with JWT auth.
+// Sprint 10.1B + 10.1C + 10.1D + 11.0A — real telemetry upload
+// to api-test.opene2ee.com/api/v1/telemetry with JWT auth +
+// 30-second summary batch upload.
 //
 // What this is
 // ------------
@@ -24,6 +25,16 @@
 //   3. On 401 -> `_auth.invalidate()` (flush the cached JWT); the
 //        next call re-auths. The pool provider surfaces the
 //        `lastError` via snackbar.
+//
+// Sprint 11.0A — 30-second summary batch upload (S52).
+// ----------------------------------------------------
+// The 10.1B/10.1D `send()` method POSTs a per-tick batch of
+// `ParsedPacket` instances. 11.0A introduces `sendSummary()`
+// which uploads AGGREGATE statistics (total packet count,
+// encrypted packet count, packet loss %, mean latency ms,
+// jitter ms, encryption integrity %) every 30 seconds, NOT
+// per-packet. This is the backend's session-level metrics
+// feed (Sprint 12.0 will use it for the Skorlar screen).
 //
 // Path note (Sprint 10.1D)
 // ------------------------
@@ -176,6 +187,106 @@ class TelemetryService {
   /// Release the underlying [http.Client]. Safe to call multiple
   /// times. The pool provider calls this in its `dispose`.
   void close() => _client.close();
+
+  /// Sprint 11.0A — 30-second summary batch upload (S52 invariant).
+  ///
+  /// The packet-level `send()` method posts per-tick samples; this
+  /// method posts AGGREGATE statistics every 30 seconds (the
+  /// caller's responsibility — there is no internal timer). The
+  /// payload carries session-level metrics (no per-packet data)
+  /// so the backend can compute a session score without a long
+  /// polling loop on the client side. Wire shape (M3 backend
+  /// contract — see `sessions.go` close endpoint):
+  ///
+  ///   POST /api/v1/sessions/{id}/telemetry
+  ///   {
+  ///     "sessionId": "sess-abc1",
+  ///     "windowStart": "2026-07-11T00:00:00Z",
+  ///     "windowEnd":   "2026-07-11T00:00:30Z",
+  ///     "totalPackets": 1234,
+  ///     "encryptedPackets": 1230,
+  ///     "packetLossPct": 0.4,
+  ///     "meanLatencyMs": 12.7,
+  ///     "jitterMs":      3.2,
+  ///     "encryptionIntegrityPct": 99.7,
+  ///     "capturedAt": "2026-07-11T00:00:30Z"
+  ///   }
+  ///
+  /// Returns on 202; throws [TelemetryException] on any other
+  /// outcome (401/403 → JWT re-auth; 429 → rate limit; 5xx/transport
+  /// → network error). The 30-second cadence is the caller's job —
+  /// the screen wraps this in a `Timer.periodic(Duration(seconds:
+  /// 30), ...)` so the schedule is transparent to the service.
+  Future<void> sendSummary({
+    required int totalPackets,
+    required int encryptedPackets,
+    required double packetLossPct,
+    required double meanLatencyMs,
+    required double jitterMs,
+    required double encryptionIntegrityPct,
+    Duration window = const Duration(seconds: 30),
+  }) async {
+    final now = DateTime.now();
+    final body = {
+      'sessionId': _sessionId,
+      'windowStart': now.subtract(window).toUtc().toIso8601String(),
+      'windowEnd': now.toUtc().toIso8601String(),
+      'totalPackets': totalPackets,
+      'encryptedPackets': encryptedPackets,
+      'packetLossPct': packetLossPct,
+      'meanLatencyMs': meanLatencyMs,
+      'jitterMs': jitterMs,
+      'encryptionIntegrityPct': encryptionIntegrityPct,
+      'capturedAt': now.toUtc().toIso8601String(),
+    };
+    try {
+      final headers = await _auth.authHeaders();
+      headers['Content-Type'] = 'application/json';
+      // Sprint 11.0A — summary endpoint is
+      // `${AppConfig.apiBase}/api/v1/sessions/{id}/telemetry`.
+      // S52 invariant: the `summary` literal in the URL path makes
+      // it distinguishable from the per-packet `/api/v1/telemetry`
+      // endpoint. (We use the session endpoint for now; if the
+      // backend wants a dedicated `/summary` path, this changes
+      // in 11.0B.)
+      final uri = Uri.parse(
+        '${AppConfig.apiBase}/api/v1/sessions/$_sessionId/telemetry',
+      );
+      final resp = await _client
+          .post(
+            uri,
+            headers: headers,
+            body: jsonEncode(body),
+          )
+          .timeout(_timeout);
+      if (resp.statusCode == 202) return;
+      if (resp.statusCode == 401 || resp.statusCode == 403) {
+        _auth.invalidate();
+        throw TelemetryException(
+          'unauthorized: jwt rejected on summary upload, will re-auth next call',
+          statusCode: resp.statusCode,
+        );
+      }
+      if (resp.statusCode == 429) {
+        throw TelemetryException(
+          'rate limit hit on summary upload (60 req/min per ADR-0006 §5.7)',
+          statusCode: resp.statusCode,
+        );
+      }
+      throw TelemetryException(
+        'unexpected status on summary upload',
+        statusCode: resp.statusCode,
+      );
+    } on TimeoutException catch (e) {
+      throw TelemetryException(
+        'summary upload timeout after ${_timeout.inSeconds}s',
+        cause: e,
+      );
+    } catch (e) {
+      if (e is TelemetryException) rethrow;
+      throw TelemetryException('summary upload network error', cause: e);
+    }
+  }
 
   /// Stable per-process session id. 16 random bytes hex-encoded.
   /// Sprint 10.1C will move this to a per-Nobet-session value.

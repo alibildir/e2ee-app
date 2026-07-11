@@ -1,0 +1,50 @@
+Sprint 11.0M - packetsObserved increment invariant audit (S84)
+
+Owner 13:08 fake-capture accusation: the Owner thought
+the 258-packet counter was a fake increment because Chrome
+and WhatsApp have no internet (real traffic is not flowing).
+The audit dump proves otherwise: packetsObserved.incrementAndGet
+appears EXACTLY ONCE in OpenE2eeVpnService.kt (line 1342),
+inside startReaderThread, inside the read branch, AFTER
+extractMetadata returns non-null. The 258 counter IS real.
+
+The 258 packets ARE real because:
+  - The TUN reader does receive bytes from the kernel
+    (the OS routes them in via addRoute(0.0.0.0, 0)).
+  - The reader increments the counter once per real packet.
+  - The counter is read by PacketDrain and surfaced in
+    stateToMap() (line 1046 + 1056) and the Log.d breadcrumb
+    (line 1249).
+
+The user's "no internet" symptom is the 11.0L passthrough
+bug (output.write failing silently on OnePlus 9 Pro
+OxygenOS), not a fake increment. The packets enter the
+TUN, get counted, but the passthrough write fails, so the
+OS drops them and the user's real apps (Chrome, WhatsApp)
+see no internet.
+
+S84 audit (regression guard) asserts FIVE tokens in
+OpenE2eeVpnService.kt (comment-stripped):
+  1. EXACTLY ONE packetsObserved.incrementAndGet() call site.
+  2. That site is inside startReaderThread (NOT in
+     onStartCommand / onRevoke / stopCapture).
+  3. The site is preceded by extractMetadata (within 600
+     chars), confirming it's in the post-extract read branch.
+  4. packetsObserved.set( is allowed ONLY in startCapture
+     (the reset-on-new-session site).
+  5. NO anti-pattern packetsObserved.set(
+     packetsObserved.get() + 1) (fake-increment pattern).
+
+Audit dump (from current code):
+  - line 1342: packetsObserved.incrementAndGet() (the ONE
+    increment site, inside startReaderThread, after
+    extractMetadata)
+  - line 949: packetsObserved.set(0) (the ONE reset site,
+    inside startCapture)
+  - all other 14 references are .get() reads, docstrings,
+    or JSON string keys
+
+Verification: 135/135 audit-self-test PASS (134 + 1 for
+S84), S84 production audit PASS, S82 (Sprint 11.0K UI
+thread dispatch) still PASS, 37/37 flutter test PASS,
+fresh APK SHA captured in s110m-final-report.md.

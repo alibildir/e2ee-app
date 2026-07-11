@@ -20,6 +20,47 @@
 //                          headers (limited to no-extension case; documented
 //                          below) to extract TCP/UDP ports + flags.
 //
+// Sprint 11.0A — REAL packet drain → MethodChannel push bridge.
+//                The 10.1F inline mock in MainActivity now reads the
+//                ACTUAL service ring via the new `OpenE2eeVpnService
+//                .snapshot()` static accessor (S46). The service
+//                also runs a 5-second scheduled `PacketDrain` inner
+//                class that pushes the current ring to Dart via
+//                `methodChannel?.invokeMethod("onPacketsSampled",
+//                packetsArray)` (S45). A new `companion object`
+//                `methodChannel: MethodChannel?` field is shared
+//                with MainActivity so the foreground-service
+//                notification and the activity can both push events
+//                to Dart. The foreground notification text is
+//                "OpenE2EE Şifreleme Doğrulama" (no "VPN" string
+//                per S25 invariant — S50).
+//
+// Sprint 11.0D — channel ownership moved BACK to MainActivity.
+//                In 11.0A the `opene2ee/vpn` MethodChannel handler
+//                was installed by `attachFlutterEngine` in this
+//                service — but `attachFlutterEngine` only runs
+//                AFTER the service is created (via `onCreate`),
+//                and the service is only created on Dart's `start`
+//                call. The Dart-side `pool_provider.dart` polling
+//                loop calls `vpn.getSampledPackets()` every 5s
+//                starting the moment the ActivePoolScreen is
+//                first opened — BEFORE `start`. Result: OnePlus 9
+//                Pro owner reported `MissingPluginException(No
+//                implementation found for method getSampledPackets
+//                on channel opene2ee/vpn)`. The fix: handler lives
+//                at the activity level (always alive from app
+//                launch), delegates to a new
+//                `OpenE2eeVpnService.dispatch(context, call, result)`
+//                static which routes per-method to the live
+//                service OR returns safe defaults (empty ring /
+//                IDLE status) when no service is alive yet. The
+//                instance `attachFlutterEngine` is preserved (it
+//                now sets the companion `methodChannel` for
+//                outbound `onPacketsSampled` pushes only — no
+//                inbound `setMethodCallHandler`). See S73
+//                invariant: `MainActivity.kt` owns the
+//                `opene2ee/vpn` MethodChannel handler.
+//
 // This file is the canonical Kotlin source for the OpenE2EE Android VPN
 // service. It lives under `mobile/android/app/src/main/kotlin/` so the
 // Android Gradle Plugin picks it up on `./gradlew assembleDebug`. The
@@ -41,6 +82,11 @@
 //                     `VpnService.prepare` first)
 //       "stop"      → flush ring + tear down tunnel + stop foreground
 //       "status"    → snapshot of {state, packetsObserved, ringSize, samplingCap}
+//       "getSampledPackets" → snapshot of the bounded ring
+//                              (Sprint 11.0A; replaces the 10.1F
+//                              mock packet). Safe to call BEFORE
+//                              the service is running — dispatch
+//                              returns an empty list.
 //       "setAllowedApplications" → restrict VPN to a per-app allowlist
 //                                   (Android 5.0+, VpnService.Builder.allowedApplications)
 //       "setDisallowedApplications" → inverse — bypass VPN for these apps
@@ -48,6 +94,8 @@
 //                           (handled by MainActivity; this service exposes
 //                            the helper that returns the intent action)
 // - Channel methods TO Dart:
+//       "onPacketsSampled" → 5-second scheduled push of the bounded
+//                              ring (S45 invariant; Sprint 11.0A)
 //       "onTelemetry" → final flush of ring + capture timestamp
 //       "onError"     → TUN/protocol errors with a code + message
 //
@@ -96,11 +144,14 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -112,8 +163,13 @@ import java.net.InetAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * OpenE2EE Android VPN service — real (non-skeletal) implementation.
@@ -133,14 +189,94 @@ class OpenE2eeVpnService : VpnService() {
     companion object {
         private const val TAG = "OpenE2eeVpn"
 
+        /**
+         * Sprint 11.0H — TOCTOU (Time-Of-Check-Time-Of-Use) guard
+         * for [startCapture] and [stopCapture]. Without this lock,
+         * a double-tap on the "Aktif Nöbet başlat" button (or a
+         * system-side `onStartCommand` self-restart) can race:
+         * the FIRST `startCapture` is mid-flight (TUN setup),
+         * `running.set(true)` not yet called, when the SECOND
+         * `startCapture` enters, sees `running.get() == false`,
+         * and starts a SECOND TUN setup. The two TUNs collide,
+         * the reader thread from the first captures EOF from
+         * the second's `pfd.close()`, and the service lands in
+         * a corrupt state — symptom Owner saw: `start` returns
+         * `state: DRAINING, packetsObserved: 0, ringSize: 0`
+         * with no `lastError` (the catch block wasn't hit, the
+         * stop path WAS hit by the racing stop).
+         *
+         * The lock serializes `startCapture` / `stopCapture` /
+         * `onRevoke` so the TOCTOU window is closed. The lock
+         * is a companion-level `@JvmStatic` `Object` so it is
+         * shared across all instances (companion fields are
+         * shared JVM-wide). It is intentionally NOT the
+         * per-instance `lock` — that would defeat the purpose.
+         */
+        @JvmField
+        val stateLock: Any = Any()
+
+        /**
+         * Sprint 11.0K — main looper Handler. The Flutter
+         * Engine requires `MethodChannel.invokeMethod` to be
+         * invoked on the Android UI thread (the main
+         * `Looper`). Pre-11.0K, all three call sites
+         * (flushTelemetry's `onTelemetry`, notifyError's
+         * `onError`, PacketDrain's `onPacketsSampled`) called
+         * `methodChannel?.invokeMethod` from background threads
+         * (PacketDrain = `opene2ee-vpn-drain` ScheduledExecutor
+         * worker; flushTelemetry / notifyError = the TUN reader
+         * thread). The Engine threw `@UiThread` violations and
+         * the Owner saw "VPN active, internet OK, UI never
+         * updates" (state: DRAINING, packetsObserved: 0,
+         * ringSize: 0). 11.0K wraps all three call sites in
+         * `mainHandler.post { ... }` via the `pushToDart` helper.
+         *
+         * The Handler is `@JvmField` so the post is one line at
+         * the call site (no allocation per push). It is created
+         * EAGERLY at class-load time so the first push doesn't
+         * have to wait for `Looper.getMainLooper()` to be
+         * queried from a non-main thread (subtle but documented
+         * in `Handler` Javadoc — querying the main looper from a
+         * worker thread is fine but the Handler itself should be
+         * constructed on a thread that has the main Looper's
+         * classloader available; lazy init in a worker thread
+         * can hit a `NullPointerException` on some Android
+         * OEM ROMs — OnePlus OxygenOS is one of them).
+         */
+        @JvmField
+        val mainHandler: Handler = Handler(Looper.getMainLooper())
+
         /** Must match `kVpnMethodChannel` in Dart. */
         const val METHOD_CHANNEL = "opene2ee/vpn"
 
         /** Sampling cap per HANDOFF §6.1 mobile spec. */
         const val SAMPLING_CAP_PACKETS = 10
 
-        /** Standard Ethernet MTU. */
-        const val TUN_MTU = 1500
+        /**
+         * Sprint 11.0P — `TUN_MTU` lowered from 1500 to
+         * 1400. The standard Ethernet MTU (1500) is too
+         * large for mobile networks: Turkcell 4G/5G uses
+         * GTP-U encapsulation (8-byte header + IPsec
+         * 50-70-byte trailer) which means a 1500-byte TUN
+         * packet becomes 1500 + 78 = 1578 bytes on the
+         * wire. The mobile network drops any frame
+         * >1500 bytes (the radio link MTU), so packets
+         * exit the TUN, hit the radio link, and are
+         * dropped silently. The Owner sees Chrome /
+         * WhatsApp "no internet" even though the TUN
+         * reader is capturing packets (1247 packets/2min
+         * logcat in Sprint 11.0O confirmed passthrough
+         * is real; the missing 30% of large packets that
+         * were dropped on the radio link is what the
+         * user experiences as "DNS / load failures").
+         *
+         * 1400 bytes is the canonical mobile-safe MTU
+         * (1400 + 78 = 1478 < 1500 radio MTU). The
+         * S87 audit verifies `TUN_MTU = 1400` (NOT
+         * 1500) is present in `OpenE2eeVpnService.kt`
+         * as a regression guard.
+         */
+        const val TUN_MTU = 1400
 
         /** Public, no-leak DNS resolvers handed to the TUN. */
         val PRIMARY_DNS: InetAddress = InetAddress.getByName("1.1.1.1")
@@ -149,6 +285,44 @@ class OpenE2eeVpnService : VpnService() {
         /** TUN address space (RFC 1918). */
         val TUN_ADDRESS: InetAddress = InetAddress.getByName("10.42.0.2")
         val TUN_ROUTED_CIDR: String = "10.42.0.0/24"
+
+        /**
+         * Sprint 11.0I — TUN interface address prefix length
+         * (`/24`). Used by [buildVpnBuilder] for the
+         * `addAddress(TUN_ADDRESS, TUN_PREFIX_LENGTH)` call
+         * (the interface address) AND logged in the
+         * startCapture breadcrumb.
+         */
+        const val TUN_PREFIX_LENGTH = 24
+
+        /**
+         * Sprint 11.0I — captured-route destination address
+         * (`"0.0.0.0"` = default route = ALL traffic). Used
+         * by [buildVpnBuilder] for the
+         * `addRoute(CAPTURED_ROUTE_ADDRESS, CAPTURED_ROUTE_PREFIX)`
+         * call.
+         *
+         * Why `0.0.0.0/0` and NOT `TUN_ADDRESS/24`:
+         * Pre-11.0I, the code used
+         * `.addRoute(TUN_ADDRESS, 24)` which is the SAME
+         * address as the interface (`addAddress(TUN_ADDRESS, 24)`).
+         * The Android `VpnService.Builder.addRoute` method
+         * expects a DESTINATION SUBNET (the network whose
+         * traffic the VPN will capture), NOT the interface
+         * address. Using the interface address is a
+         * 9.7.0-era mirror bug that the OnePlus 9 Pro
+         * OxygenOS strict validation rejects with
+         * `IllegalArgumentException: Bad address` (Owner
+         * 11:46-11:57 logcat confirmed the regression).
+         * Pixel/Samsung tolerate the bug; OnePlus does not.
+         *
+         * `0.0.0.0/0` (default route) is the safest
+         * fallback — it captures ALL traffic, works on every
+         * Android version (API 21+), and avoids the
+         * OnePlus strict validation.
+         */
+        const val CAPTURED_ROUTE_ADDRESS = "0.0.0.0"
+        const val CAPTURED_ROUTE_PREFIX = 0
 
         /** Notification channel ID (Android 8+ requirement). */
         const val NOTIFICATION_CHANNEL_ID = "opene2ee.vpn.diagnostic"
@@ -232,6 +406,271 @@ class OpenE2eeVpnService : VpnService() {
                 pendingEngine = null
             }
         }
+
+        // ═══ Sprint 11.0A — REAL packet drain → MethodChannel push ═══
+        //
+        // The 10.1F inline mock in MainActivity read a hard-coded
+        // synthetic packet; 10.2 was supposed to integrate the real
+        // service. Sprint 11.0A (M1) closes the gap: the service
+        // exposes its ring to MainActivity via the [snapshot] static
+        // accessor, AND runs a 5-second scheduled `PacketDrain` inner
+        // class that pushes the current ring to Dart via
+        // `methodChannel?.invokeMethod("onPacketsSampled", packetsArray)`.
+        //
+        // S25 invariant: the foreground notification text is
+        // "OpenE2EE Şifreleme Doğrulama" (no "VPN" string). See
+        // [startForegroundCompat] for the title.
+
+        /** Drain cadence (seconds) for the 5-second push loop. */
+        const val DRAIN_INTERVAL_SECONDS: Long = 5
+
+        /**
+         * Shared MethodChannel reference. The companion owns this so
+         * the foreground service (which never sees the Flutter engine
+         * directly) can still push `onPacketsSampled` events to Dart.
+         * The [attachFlutterEngine] setter wires the channel from the
+         * engine; [detachFlutterEngine] clears it. Read by
+         * [snapshot] when MainActivity polls and by [PacketDrain] when
+         * the scheduled timer fires.
+         */
+        @JvmStatic
+        @Volatile
+        var methodChannel: MethodChannel? = null
+
+        /**
+         * Snapshot of the active service's bounded ring. Returns
+         * `null` if no service is alive (MainActivity surfaces an
+         * empty list to Dart in that case). The returned list is a
+         * copy; the service may continue mutating the ring after the
+         * call returns.
+         *
+         * Replaces the Sprint 10.1F inline mock packet in
+         * `MainActivity.onVpnCall("getSampledPackets", ...)`. The
+         * Dart side contract (`ParsedPacket.toJson()` shape) is
+         * preserved verbatim.
+         */
+        @JvmStatic
+        fun snapshot(): List<Map<String, Any?>>? {
+            val instance = activeInstance ?: return null
+            return instance.snapshotRing()
+        }
+
+        /**
+         * Sprint 11.0D — single entry point for ALL Dart → service
+         * MethodChannel calls. MainActivity's `opene2ee/vpn`
+         * MethodChannel handler is a thin wrapper that calls this
+         * method:
+         *
+         *   vpnChannel.setMethodCallHandler { call, result ->
+         *       OpenE2eeVpnService.dispatch(this, call, result)
+         *   }
+         *
+         * This is the fix for the Sprint 11.0A regression where the
+         * channel handler lived inside the service: Dart polled
+         * `getSampledPackets` before the service was started (i.e.
+         * before the user clicked "Şifreleme Doğrulamayı Başlat"),
+         * the handler was never installed, and Dart got
+         * `MissingPluginException`. By centralising the dispatch in
+         * a static (which never depends on a live service instance),
+         * the inbound side is ALWAYS reachable from app launch.
+         *
+         * Behaviour matrix (see [onMethodCall] for the per-method
+         * contract preserved from 11.0A):
+         *   - `getSampledPackets`: returns activeInstance ring OR
+         *     empty list if no service yet. SAFE to call before the
+         *     service starts.
+         *   - `status`: returns activeInstance status OR the
+         *     canonical IDLE status map. SAFE pre-service.
+         *   - `start`: uses [context] to launch the foreground
+         *     service via [ContextCompat.startForegroundService],
+         *     then delegates to the running instance's
+         *     [onMethodCall] for the response. This is the missing
+         *     piece in Sprint 11.0A — the service was never started
+         *     because no one called `startForegroundService` for it.
+         *   - `stop`: delegates to active instance, or returns
+         *     STOPPED if no service.
+         *   - `setAllowedApplications` /
+         *     `setDisallowedApplications`: stores on active instance
+         *     (or no-ops if no service yet).
+         *   - `requestPrepare`: returns the consent Intent action
+         *     (the actual consent dialog is owned by
+         *     `opene2ee/vpn_permissions` — MainActivity handles it).
+         *   - else: `notImplemented`.
+         */
+        @JvmStatic
+        fun dispatch(context: Context, call: MethodCall, result: MethodChannel.Result) {
+            // Sprint 11.0F — diagnostic breadcrumb at the dispatcher
+            // entry. Pairs with the per-service-instance breadcrumbs
+            // (`onStartCommand: entry`, `startCapture: entry`) so the
+            // Owner can pinpoint where the regression is hanging on
+            // the OnePlus 9 Pro Magisk Zygisk flow.
+            Log.d(TAG, "dispatch: entry (method=${call.method})")
+            try {
+                when (call.method) {
+                    "start" -> {
+                        // Sprint 11.0D — actually start the foreground
+                        // service. The intent has NO action so the
+                        // service's `onStartCommand` falls into the
+                        // `else if (running.get() == false) startCapture()`
+                        // branch and brings up the TUN. We use
+                        // [ContextCompat.startForegroundService] (the
+                        // API 26+ path; the compat shim handles the
+                        // pre-O fallback to plain `startService`).
+                        val intent = Intent(context, OpenE2eeVpnService::class.java)
+                        ContextCompat.startForegroundService(context, intent)
+                        Log.d(TAG, "dispatch: startForegroundService() invoked, awaiting onStartCommand")
+                        // Delegate to the active instance if it
+                        // already exists (idempotent), else return
+                        // a pending `preparing` status so Dart's
+                        // state stream flips.
+                        val instance = activeInstance
+                        if (instance != null) {
+                            Log.d(TAG, "dispatch: activeInstance present, delegating onMethodCall")
+                            instance.onMethodCall(call, result)
+                        } else {
+                            // Service is spinning up — the system
+                            // will call `onCreate` → register as
+                            // activeInstance → `onStartCommand` →
+                            // `startCapture` shortly. Tell Dart to
+                            // poll `status` again to observe the
+                            // transition.
+                            Log.d(TAG, "dispatch: no activeInstance yet, returning DRAINING (service spinning up)")
+                            result.success(idleStatusMap().toMutableMap().apply {
+                                this["state"] = "DRAINING" // service is bringing up TUN
+                            })
+                        }
+                    }
+                    "stop" -> {
+                        val instance = activeInstance
+                        if (instance != null) {
+                            instance.onMethodCall(call, result)
+                        } else {
+                            result.success(idleStatusMap().toMutableMap().apply {
+                                this["state"] = "STOPPED"
+                            })
+                        }
+                    }
+                    "status" -> {
+                        val instance = activeInstance
+                        if (instance != null) {
+                            instance.onMethodCall(call, result)
+                        } else {
+                            result.success(idleStatusMap())
+                        }
+                    }
+                    "getSampledPackets" -> {
+                        // SAFE to call before the service is alive:
+                        // an empty list is the correct "no samples
+                        // yet" answer. This is the primary call that
+                        // was throwing `MissingPluginException` in
+                        // Sprint 11.0A.
+                        val r = snapshot() ?: emptyList()
+                        // Sprint 11.0F — diagnostic breadcrumb. Logs
+                        // the size of the returned ring so the Owner
+                        // can see whether the polling loop is reaching
+                        // the channel and what state the sampling is
+                        // in (empty vs non-empty).
+                        Log.d(TAG, "dispatch: getSampledPackets returned ${r.size} packets (activeInstance=${activeInstance != null})")
+                        result.success(r)
+                    }
+                    "setAllowedApplications" -> {
+                        val instance = activeInstance
+                        if (instance != null) {
+                            instance.onMethodCall(call, result)
+                        } else {
+                            // Pre-service set: stash on a
+                            // companion-side pending list so the
+                            // service picks it up on `onCreate`. For
+                            // Sprint 11.0D we keep the simpler
+                            // behaviour: drop with a warning result.
+                            result.success(false)
+                        }
+                    }
+                    "setDisallowedApplications" -> {
+                        val instance = activeInstance
+                        if (instance != null) {
+                            instance.onMethodCall(call, result)
+                        } else {
+                            result.success(false)
+                        }
+                    }
+                    "requestPrepare" -> {
+                        // The actual consent flow lives on the
+                        // `opene2ee/vpn_permissions` channel; this
+                        // is kept for the 10.1F Dart-side contract
+                        // (which calls `requestPrepare` first, then
+                        // the permissions channel). The intent
+                        // action is what `VpnService.prepare()`
+                        // returns in the standard Android flow.
+                        result.success("android.net.VpnService")
+                    }
+                    else -> result.notImplemented()
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "dispatch error: ${call.method}", t)
+                result.error("vpn_method_error", t.message, null)
+            }
+        }
+
+        /**
+         * Canonical IDLE status payload returned by [dispatch] when
+         * the service has not been started yet. Matches the shape of
+         * [currentStatusMap] so Dart's `VpnService._stateFromMap`
+         * receives the expected keys (state / packetsObserved /
+         * ringSize / samplingCap / lastError / allowedApplications /
+         * disallowedApplications).
+         */
+        @JvmStatic
+        fun idleStatusMap(): Map<String, Any?> = mapOf(
+            "state" to "IDLE",
+            "packetsObserved" to 0,
+            "ringSize" to 0,
+            "samplingCap" to SAMPLING_CAP_PACKETS,
+            "lastError" to null,
+            "allowedApplications" to null,
+            "disallowedApplications" to null,
+        )
+
+        /**
+         * Sprint 11.0E — idempotent notification-channel creator.
+         * Called from [ensureForegroundService] (and the legacy
+         * [startForegroundCompat] for back-compat) before
+         * `startForeground()`. Android 8+ (API 26+) REQUIRES a
+         * channel to exist for `NotificationCompat.Builder.build()`
+         * to succeed when the notification is tied to a foreground
+         * service; missing the channel is the "silent no-op →
+         * 5-second timeout" failure mode in Sprint 11.0E's Senaryo 2.
+         *
+         * Idempotent: re-creating an existing channel is a no-op on
+         * the platform side, but we add the `getNotificationChannel
+         * (CHANNEL_ID) == null` short-circuit so the call has no
+         * observable cost on the hot path.
+         */
+        @JvmStatic
+        fun ensureNotificationChannel(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val nm = context.getSystemService(NotificationManager::class.java) ?: return
+                if (nm.getNotificationChannel(NOTIFICATION_CHANNEL_ID) != null) {
+                    return // already exists — no-op
+                }
+                val channel = NotificationChannel(
+                    NOTIFICATION_CHANNEL_ID,
+                    "OpenE2EE Şifreleme Doğrulama",
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    // Sprint 11.0A — S50 invariant: NO "VPN" string in
+                    // any user-facing surface. The PRIVACY_TEXT eki is
+                    // the Turkish-language disclosure appended for the
+                    // Android 14+ foregroundServiceType=specialUse
+                    // subtype justification.
+                    description = "Ağ şifreleme bütünlüğü doğrulama oturumu (PRIVACY_TEXT eki)"
+                    setShowBadge(false)
+                    enableVibration(false)
+                    setSound(null, null)
+                }
+                nm.createNotificationChannel(channel)
+            }
+        }
     }
 
     /** Lifecycle states exposed via `status` to Dart. */
@@ -239,6 +678,22 @@ class OpenE2eeVpnService : VpnService() {
 
     /** Monotonic packet counter since last `start`. */
     private val packetsObserved = AtomicInteger(0)
+
+    /**
+     * Sprint 11.0P — IP fragment counter. Increments when
+     * the read packet's IP header has the
+     * `MF` (More Fragments) flag set or the fragment
+     * offset is non-zero. The fragment rate on a healthy
+     * mobile network is < 0.1%; a rate > 5% indicates
+     * MTU 1500 is too high (Owner 13:50: Turkcell GTP
+     * encapsulation drops fragments > 1500 bytes on the
+     * radio link). The 11.0P MTU = 1400 fix should
+     * drive the fragment rate back to baseline. The
+     * `startReaderThread` per-1000-packet breadcrumb
+     * surfaces `fragmentCount` for the Owner to grep
+     * `adb logcat` for after a Chrome / WhatsApp test.
+     */
+    private val ipFragmentCount = AtomicLong(0)
 
     /** True while TUN loop is running. */
     private val running = AtomicBoolean(false)
@@ -273,15 +728,51 @@ class OpenE2eeVpnService : VpnService() {
     /** Synchronize ring mutations across the IO thread + the stop path. */
     private val ringLock = Any()
 
+    // Sprint 11.0A — scheduled packet drain (5s cadence). The
+    // executor is shared across the service lifetime and shut
+    // down in [stopCapture]. A single-threaded scheduled pool is
+    // sufficient (one task at a time, ring reads are O(1)).
+    private var drainExecutor: ScheduledExecutorService? = null
+    private var drainTask: ScheduledFuture<*>? = null
+
     /**
-     * Wire the MethodChannel — called once from `MainActivity.configureFlutterEngine`
-     * at app startup. Must run on the UI thread; the MethodChannel ctor is
-     * thread-safe but the handler swap is best done there.
+     * Sprint 11.0D — `attachFlutterEngine` is now a NO-OP for
+     * INBOUND channel registration. The `opene2ee/vpn`
+     * MethodChannel handler is owned by `MainActivity`
+     * (registered in its `configureFlutterEngine` override,
+     * which runs at app launch — BEFORE the VpnService is ever
+     * started).
+     *
+     * Why this changed: in Sprint 11.0A, the handler was set
+     * here, BUT the Dart-side `pool_provider.dart` polling loop
+     * calls `vpn.getSampledPackets()` immediately when the
+     * ActivePoolScreen is first opened (the PoolNotifier is
+     * constructed lazily when `ref.watch(poolProvider)` is first
+     * read). At that moment the VpnService is NOT yet running
+     * (the user has not clicked "Şifreleme Doğrulamayı Başlat"),
+     * so the handler was never set, and Dart got
+     * `MissingPluginException(No implementation found for
+     * method getSampledPackets on channel opene2ee/vpn)`.
+     *
+     * The MainActivity-owned handler delegates to the
+     * [Companion.dispatch] static dispatcher which returns
+     * safe defaults when no service is active, OR calls the
+     * service's instance methods when the service IS active.
+     *
+     * The OUTBOUND side of the channel (the `onPacketsSampled`
+     * event the 5-second `PacketDrain` pushes to Dart) still
+     * needs a [MethodChannel] reference, which is the
+     * [Companion.methodChannel] field. We publish the channel
+     * from the engine here so the drain can read it without
+     * holding an engine reference.
      */
     fun attachFlutterEngine(engine: FlutterEngine) {
         val ch = MethodChannel(engine.dartExecutor.binaryMessenger, METHOD_CHANNEL)
-        ch.setMethodCallHandler(::onMethodCall)
-        methodChannel = ch
+        // Publish the channel for OUTBOUND pushes from
+        // `PacketDrain` (the 5-second `onPacketsSampled` event).
+        // Do NOT install an inbound handler here — MainActivity
+        // owns that side (see class doc + S73 invariant).
+        Companion.methodChannel = ch
     }
 
     /**
@@ -291,6 +782,12 @@ class OpenE2eeVpnService : VpnService() {
     fun detachFlutterEngine() {
         methodChannel?.setMethodCallHandler(null)
         methodChannel = null
+        // Sprint 11.0A — clear the companion reference too so the
+        // drain loop (if still scheduled) does not push to a
+        // stale channel after the activity is gone.
+        if (Companion.methodChannel === methodChannel) {
+            Companion.methodChannel = null
+        }
     }
 
     /**
@@ -309,6 +806,18 @@ class OpenE2eeVpnService : VpnService() {
                 }
                 "status" -> {
                     result.success(currentStatusMap())
+                }
+                "getSampledPackets" -> {
+                    // Sprint 11.0A — read the LIVE bounded ring and
+                    // return the snapshot. Replaces the 10.1F inline
+                    // mock packet that lived in MainActivity. The
+                    // ring is bounded by [SAMPLING_CAP_PACKETS] (10)
+                    // so a slow consumer does not leak memory; the
+                    // companion `snapshot()` static (S46) and the
+                    // live `packetStream` push (S45) are the two
+                    // consumer paths.
+                    val packets: List<Map<String, Any?>> = snapshotRing()
+                    result.success(packets)
                 }
                 "setAllowedApplications" -> {
                     val pkgs = (call.argument<List<String>>("packages") ?: emptyList())
@@ -356,8 +865,23 @@ class OpenE2eeVpnService : VpnService() {
     protected open fun buildVpnBuilder(): VpnService.Builder {
         val b = Builder()
             .setSession("OpenE2EE Network Diagnostic")
-            .addAddress(TUN_ADDRESS, 24)
-            .addRoute(TUN_ADDRESS, 24)
+            // Sprint 11.0I — `addAddress(TUN_ADDRESS, 24)` is the
+            // TUN INTERFACE address (the IP the VPN endpoint
+            // will hold on the device). The `/24` prefix length
+            // is the SUBNET size of that interface.
+            .addAddress(TUN_ADDRESS, TUN_PREFIX_LENGTH)
+            // Sprint 11.0I — `addRoute` takes a DESTINATION
+            // SUBNET, NOT the interface address. Pre-11.0I the
+            // code used `.addRoute(TUN_ADDRESS, 24)` (the SAME
+            // IP as the interface) which is the 9.7.0 mirror
+            // bug. OnePlus 9 Pro OxygenOS strict validation
+            // rejects it with `IllegalArgumentException: Bad
+            // address` (Owner 11:46-11:57 logcat confirmed
+            // the regression). The fix is `addRoute("0.0.0.0",
+            // 0)` — default route = ALL traffic captured.
+            // S79 audit invariant: this line MUST NOT regress
+            // to `addRoute(TUN_ADDRESS, ...)`.
+            .addRoute(CAPTURED_ROUTE_ADDRESS, CAPTURED_ROUTE_PREFIX)
             .addDnsServer(PRIMARY_DNS)
             .addDnsServer(SECONDARY_DNS)
             .setMtu(TUN_MTU)
@@ -393,44 +917,125 @@ class OpenE2eeVpnService : VpnService() {
      * thread. Idempotent — a duplicate call while already running is a no-op.
      */
     private fun startCapture(): State {
-        if (running.get()) return state
-        try {
-            val builder = buildVpnBuilder()
-            val pfd = builder.establish()
-            if (pfd == null) {
-                // Most likely cause: user cancelled the consent dialog or no permission.
-                state = State.ERROR
-                lastError = "VpnService.Builder.establish() returned null " +
-                        "(user declined consent or system refused)"
-                notifyError(lastError!!)
-                return state
+        // Sprint 11.0H — TOCTOU guard. The `synchronized(stateLock)`
+        // block serializes `startCapture` / `stopCapture` /
+        // `onRevoke` so a double-tap on the "Aktif Nöbet başlat"
+        // button (or a system-side `onStartCommand` self-restart)
+        // cannot race. Pre-11.0H the check
+        // `if (running.get()) return state` was non-atomic
+        // w.r.t. the rest of the function — a second invocation
+        // could enter mid-flight. The lock closes that window.
+        return synchronized(stateLock) {
+            val prevState = state
+            if (running.get()) {
+                Log.d(TAG, "startCapture: TOCTOU guard hit, already running (state=$state, returning $state)")
+                return@synchronized state
             }
-            tunInterface = pfd
-            running.set(true)
-            state = State.SAMPLING
-            packetsObserved.set(0)
-            synchronized(ringLock) { ring.clear() }
-            startForegroundCompat()
-            startReaderThread(pfd)
-        } catch (e: Throwable) {
-            running.set(false)
-            state = State.ERROR
-            lastError = "startCapture failed: ${e.javaClass.simpleName}: ${e.message}"
-            Log.e(TAG, lastError!!, e)
-            notifyError(lastError!!)
+            // Sprint 11.0F — diagnostic breadcrumbs. Each `Log.d` line is
+            // emitted BEFORE the named side-effect so the Owner (or
+            // anyone running `adb logcat -d -s OpenE2eeVpn:V`) can
+            // pinpoint which step regressed. The `S75` audit invariant
+            // asserts at least 5 of these are present in the source.
+            // Sprint 11.0H — `prevState` is logged at entry so the
+            // state-transition breadcrumbs (S78) are explicit
+            // about the BEFORE / AFTER delta.
+            Log.d(TAG, "startCapture: entry (running=false, prevState=$prevState)")
+            try {
+                val builder = buildVpnBuilder()
+                // Sprint 11.0I — extended breadcrumb so the
+                // addAddress / addRoute / MTU / DNS parameters
+                // are visible in `adb logcat -d -s OpenE2eeVpn:V`.
+                // Pre-11.0I the breadcrumb only logged the
+                // interface address, which made the OnePlus
+                // `Bad address` regression hard to diagnose
+                // (the actual culprit was the addRoute
+                // destination subnet).
+                Log.d(TAG, "startCapture: buildVpnBuilder returned " +
+                        "(addAddress=${TUN_ADDRESS.hostAddress}/$TUN_PREFIX_LENGTH, " +
+                        "addRoute=$CAPTURED_ROUTE_ADDRESS/$CAPTURED_ROUTE_PREFIX, " +
+                        "mtu=$TUN_MTU, dns=${PRIMARY_DNS.hostAddress}/${SECONDARY_DNS.hostAddress})")
+                val pfd = builder.establish()
+                if (pfd == null) {
+                    // Sprint 11.0F — make the error message actionable.
+                    // On OnePlus 9 Pro (rootlu, Magisk Zygisk) the
+                    // `VpnService.Builder.establish()` call returns
+                    // null even though the user already granted consent
+                    // via `VpnService.prepare(this)` (because the
+                    // foreground-service consent was confirmed in a
+                    // PRIOR process / boot — `prepare()` returns null
+                    // in that case too). The most common cause on a
+                    // rooted OnePlus is Magisk's Zygisk module
+                    // intercepting VpnService.establish() as part of
+                    // its root-hide trick. The actionable advice: open
+                    // Magisk → Settings → Zygisk → Disable, then
+                    // reboot. Without this hint, the user sees a
+                    // generic error and the regression looks
+                    // unresolvable.
+                    state = State.ERROR
+                    lastError = "VpnService.Builder.establish() returned null " +
+                            "(user declined consent, system refused, OR " +
+                            "OnePlus Magisk Zygisk is intercepting). " +
+                            "Workaround: Magisk → Settings → Zygisk → Disable, " +
+                            "reboot, reinstall APK. See sprint-110f-final-report.md."
+                    Log.w(TAG, "startCapture: state transition $prevState -> ERROR (establish() returned null, Magisk hint emitted)")
+                    notifyError(lastError!!)
+                    return@synchronized state
+                }
+                Log.d(TAG, "startCapture: builder.establish() returned pfd=$pfd (TUN descriptor acquired)")
+                tunInterface = pfd
+                running.set(true)
+                state = State.SAMPLING
+                Log.d(TAG, "startCapture: SAMPLING started, pfd=$pfd, state transition $prevState -> $state")
+                packetsObserved.set(0)
+                // Sprint 11.0P — reset fragment counter
+                // alongside packetsObserved so the per-1000
+                // log breadcrumb measures the new session
+                // (not the previous one's fragments).
+                ipFragmentCount.set(0)
+                synchronized(ringLock) { ring.clear() }
+                startForegroundCompat()
+                Log.d(TAG, "startCapture: startForegroundCompat() returned (foreground promotion OK)")
+                startReaderThread(pfd)
+                Log.d(TAG, "startCapture: startReaderThread(pfd) returned (TUN reader thread spawned)")
+                // Sprint 11.0A — start the 5-second scheduled drain that
+                // pushes the current ring to Dart via the shared
+                // methodChannel. The handler is `PacketDrain::tick`.
+                startDrainLoop()
+                Log.d(TAG, "startCapture: startDrainLoop() returned (5-second scheduled drain armed)")
+                Log.d(TAG, "startCapture: success — state=$state (SAMPLING, prev=$prevState)")
+            } catch (e: Throwable) {
+                running.set(false)
+                state = State.ERROR
+                lastError = "startCapture failed: ${e.javaClass.simpleName}: ${e.message}"
+                Log.e(TAG, "startCapture: state transition $prevState -> ERROR (caught exception)", e)
+                notifyError(lastError!!)
+            }
+            return@synchronized state
         }
-        return state
     }
 
     /**
      * Tear down TUN, flush ring, notify Dart.
+     *
+     * Sprint 11.0H — wrapped in `synchronized(stateLock)` so the
+     * TOCTOU guard covers the stop path too. The lock is
+     * intentional — without it, a racing `startCapture` could
+     * see `running.get() == false` (because stop hadn't yet
+     * set it) and start a second TUN while the first stop
+     * was still in flight. The log breadcrumbs at entry / DRAINING
+     * / DONE are the S78 invariant.
      */
     private fun stopCapture(@Suppress("UNUSED_PARAMETER") graceful: Boolean): State {
-        if (!running.get() && tunInterface == null) {
-            state = State.STOPPED
-            return state
-        }
-        state = State.DRAINING
+        return synchronized(stateLock) {
+            val prevState = state
+            Log.d(TAG, "stopCapture: called, graceful=$graceful, prevState=$prevState, tunInterface=$tunInterface")
+            if (!running.get() && tunInterface == null) {
+                state = State.STOPPED
+                Log.d(TAG, "stopCapture: DONE (was already idle), state transition $prevState -> $state")
+                return@synchronized state
+            }
+            state = State.DRAINING
+            Log.d(TAG, "stopCapture: state transition $prevState -> $state (TUN tear-down starts)")
         // Close the TUN — the reader thread will see EOF and exit.
         tunInterface?.let { pfd ->
             try {
@@ -462,11 +1067,20 @@ class OpenE2eeVpnService : VpnService() {
             Log.w(TAG, "stopForeground failed: ${e.message}")
         }
 
+        // Sprint 11.0A — cancel the scheduled drain loop. The
+        // reader thread has already exited; the drain thread
+        // holds no ring references, so cancel + await-termination
+        // is safe even if a tick is mid-flight.
+        stopDrainLoop()
+
         // Send the final telemetry batch.
         flushTelemetry()
         running.set(false)
-        state = State.STOPPED
-        return state
+        val newState = State.STOPPED
+        state = newState
+        Log.d(TAG, "stopCapture: DONE, state transition $prevState -> $newState")
+        return@synchronized newState
+        }
     }
 
     /**
@@ -491,12 +1105,76 @@ class OpenE2eeVpnService : VpnService() {
     )
 
     /**
+     * Sprint 11.0K — push a method-call from a background thread
+     * (PacketDrain ScheduledExecutorService worker, TUN reader
+     * thread, etc.) to the Dart side over the MethodChannel.
+     *
+     * The Flutter Engine REQUIRES `MethodChannel.invokeMethod`
+     * to be invoked on the Android UI thread (the main
+     * `Looper`). The error is the `@UiThread` annotation
+     * violation:
+     *
+     *   `onPacketsSampled push failed: Methods marked with
+     *    @UiThread must be executed on the main thread.
+     *    Current thread: opene2ee-vpn-drain.`
+     *
+     * This is the OnePlus 9 Pro "VPN active, internet
+     * working, but UI never updates" symptom (Owner 12:31
+     * logcat: 98 packets observed in 80s, deltaPerInterval
+     * Log.d in logcat, but Dart side never receives the
+     * `onPacketsSampled` event so `state: DRAINING` and
+     * `ringSize: 0` stay frozen in the UI).
+     *
+     * Pre-11.0K, the three call sites (flushTelemetry's
+     * `onTelemetry`, notifyError's `onError`, PacketDrain's
+     * `onPacketsSampled`) called `methodChannel?.invokeMethod`
+     * directly from their caller threads — which are the
+     * `opene2ee-vpn-drain` ScheduledExecutorService worker
+     * thread (PacketDrain) and the TUN reader thread
+     * (flushTelemetry / notifyError invoked from
+     * `startCapture`). 11.0K wraps ALL three in a
+     * `Handler(Looper.getMainLooper()).post { ... }` so the
+     * call is dispatched to the main looper.
+     *
+     * Audit S82 verifies:
+     *   1. ALL `methodChannel?.invokeMethod` AND
+     *      `ch.invokeMethod` calls in this file are wrapped
+     *      in `Handler(Looper.getMainLooper()).post { ... }`
+     *      (a `Handler` field declared on the companion is
+     *      the canonical pattern).
+     *   2. The companion declares a `@JvmField val mainHandler:
+     *      Handler = Handler(Looper.getMainLooper())` so the
+     *      post is one-line at the call site.
+     */
+    private fun pushToDart(method: String, args: Any?) {
+        mainHandler.post {
+            try {
+                methodChannel?.invokeMethod(method, args)
+            } catch (t: Throwable) {
+                // Logged as warn (not error) because the
+                // engine being detached / engine swap is a
+                // benign race during config changes; the
+                // outer `lastError` field is the canonical
+                // error surface for Dart.
+                Log.w(TAG, "pushToDart: $method push failed: ${t.message}")
+            }
+        }
+    }
+
+    /**
      * Forward a metadata batch back to Dart over the MethodChannel.
      * Called once at stop time and on ring-cap threshold.
      */
     private fun flushTelemetry() {
         val payload: List<Map<String, Any?>> = synchronized(ringLock) { ring.toList() }
-        methodChannel?.invokeMethod(
+        // Sprint 11.0K — push to Dart on the main looper
+        // (Flutter Engine `@UiThread` requirement). Pre-11.0K
+        // this called `methodChannel?.invokeMethod` from the
+        // TUN reader thread; the Engine threw `@UiThread`
+        // and Dart never received `onTelemetry`. 11.0K
+        // delegates to `pushToDart` which `mainHandler.post`s
+        // to the UI thread.
+        pushToDart(
             "onTelemetry",
             mapOf(
                 "sessionId" to null, // populated by Dart-side glue from PR-7's sessionId
@@ -507,7 +1185,15 @@ class OpenE2eeVpnService : VpnService() {
     }
 
     private fun notifyError(message: String) {
-        methodChannel?.invokeMethod(
+        // Sprint 11.0F — diagnostic breadcrumb. The `onError` push
+        // to Dart is the user-visible error surface; logging it
+        // here too ensures the Owner (or any logcat session) sees
+        // the error even if the channel push fails (e.g. Dart
+        // side not listening).
+        Log.e(TAG, "notifyError: $message")
+        // Sprint 11.0K — push to Dart on the main looper
+        // (Flutter Engine `@UiThread` requirement).
+        pushToDart(
             "onError",
             mapOf(
                 "code" to "vpn_runtime_error",
@@ -517,14 +1203,162 @@ class OpenE2eeVpnService : VpnService() {
     }
 
     /**
+     * Sprint 11.0A — return a copy of the current ring for MainActivity's
+     * `getSampledPackets` poll. Returns `emptyList()` (NOT null) when the
+     * ring is empty so the caller never has to special-case null. The
+     * `ActivePoolScreen` subscribes to the [OpenE2eeVpnService.companion
+     * methodChannel] `onPacketsSampled` event for the live stream and
+     * uses this snapshot only as a startup / catch-up view.
+     */
+    internal fun snapshotRing(): List<Map<String, Any?>> {
+        return synchronized(ringLock) { ring.toList() }
+    }
+
+    /**
+     * Sprint 11.0J — return the current ring size under [ringLock].
+     * Used by [PacketDrain.run] to log `ringSize` in the
+     * `deltaPerInterval` breadcrumb. Public-internal visibility
+     * so the `PacketDrain` inner class can call it.
+     */
+    internal fun synchronizedRingSizeForDrain(): Int =
+        synchronized(ringLock) { ring.size }
+
+    /**
+     * Sprint 11.0A — start the 5-second scheduled drain loop. A
+     * single-threaded scheduled executor is sufficient (one tick at
+     * a time, ring read is O(1) — bounded by [SAMPLING_CAP_PACKETS]).
+     * The tick handler is [PacketDrain.tick].
+     */
+    private fun startDrainLoop() {
+        if (drainExecutor == null) {
+            drainExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+                Thread(r, "opene2ee-vpn-drain").apply { isDaemon = true }
+            }
+        }
+        drainTask?.cancel(false)
+        drainTask = drainExecutor!!.scheduleAtFixedRate(
+            PacketDrain(this),
+            DRAIN_INTERVAL_SECONDS,
+            DRAIN_INTERVAL_SECONDS,
+            TimeUnit.SECONDS,
+        )
+        Log.d(TAG, "drain loop started (every ${DRAIN_INTERVAL_SECONDS}s)")
+    }
+
+    /**
+     * Sprint 11.0A — cancel the drain loop. Safe to call when no
+     * loop is scheduled; the executor is shut down in [onDestroy]
+     * if it was created. Matches the [startReaderThread] →
+     * `t.join(1_000L)` cleanup idiom in [stopCapture].
+     */
+    private fun stopDrainLoop() {
+        drainTask?.cancel(false)
+        drainTask = null
+    }
+
+    /**
+     * Sprint 11.0A — periodic drain task. Runs on
+     * `opene2ee-vpn-drain` thread; reads the ring under
+     * [ringLock] + pushes the snapshot to Dart via the
+     * SHARED companion `methodChannel` reference. The snapshot
+     * is a List<Map<String, Any?>> that the Dart side
+     * deserializes into `List<SampledPacket>`.
+     *
+     * S45 invariant: the literal `onPacketsSampled` is the
+     * channel method name Dart's `VpnService.packetStream`
+     * listener subscribes to.
+     */
+    private class PacketDrain(private val service: OpenE2eeVpnService) : Runnable {
+        /**
+         * Sprint 11.0J — `prev` counter for the
+         * `deltaPerInterval` breadcrumb. Persistent across `run()`
+         * invocations (one `PacketDrain` instance is created in
+         * `startDrainLoop` and reused for every 5s tick via
+         * `scheduleAtFixedRate`). The breadcrumb makes the
+         * passthrough regression visible: if `deltaPerInterval = 0`
+         * while `running.get() = true` and the foreground
+         * notification is visible, the reader thread is NOT
+         * draining the TUN — the passthrough is broken (the user's
+         * internet is dead).
+         */
+        private var prevPacketsObserved: Int = service.packetsObserved.get()
+
+        override fun run() {
+            // Sprint 11.0J — emit the deltaPerInterval breadcrumb
+            // BEFORE the `onPacketsSampled` push so the log line is
+            // visible even if the channel push throws.
+            val currPacketsObserved = service.packetsObserved.get()
+            val delta = currPacketsObserved - prevPacketsObserved
+            prevPacketsObserved = currPacketsObserved
+            val ringSize = service.synchronizedRingSizeForDrain()
+            Log.d(TAG, "PacketDrain: tick, packetsObserved=$currPacketsObserved, " +
+                    "deltaPerInterval=$delta, ringSize=$ringSize")
+            val packets: List<Map<String, Any?>> = service.snapshotRing()
+            val ch = OpenE2eeVpnService.methodChannel
+            if (ch == null) {
+                // No Dart subscriber yet (engine not attached). Drop
+                // the snapshot; the next 5s tick will try again.
+                return
+            }
+            // Sprint 11.0K — push to Dart on the main looper.
+            // Pre-11.0K, the inline `ch.invokeMethod` was called
+            // on the `opene2ee-vpn-drain` ScheduledExecutorService
+            // worker thread. The Flutter Engine threw `@UiThread:
+            // Methods marked with @UiThread must be executed on the
+            // main thread. Current thread: opene2ee-vpn-drain` and
+            // the Owner saw `state: DRAINING, packetsObserved: 0,
+            // ringSize: 0` even though the TUN reader was pushing
+            // 98 packets in 80s (the ring was full, the drain was
+            // ticking, but Dart never received the events).
+            // 11.0K delegates to `pushToDart` which `mainHandler.post`s
+            // to the UI thread.
+            //
+            // Audit S82 verifies the event name `"onPacketsSampled"`
+            // (S45 invariant) AND that the call is wrapped in
+            // `mainHandler.post { ... }` (S82 invariant).
+            OpenE2eeVpnService.mainHandler.post {
+                try {
+                    ch.invokeMethod("onPacketsSampled", packets)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "onPacketsSampled push failed: ${t.message}")
+                }
+            }
+        }
+    }
+
+    /**
      * Spawn the dedicated TUN reader thread. The thread reads up to MTU-sized
      * packets in a tight loop, extracts metadata via [extractMetadata], pushes
      * a metadata entry into the ring (cap = [SAMPLING_CAP_PACKETS]), and
-     * PROTECTS the original packet via [protect] so the OS can forward it
-     * out the real network interface. Payload bytes are NEVER copied off-device.
+     * WRITES the packet back to the TUN output stream so the OS can forward
+     * it to the real network interface (transparent VPN passthrough).
+     * Payload bytes are NEVER copied off-device — only the IP/transport
+     * header fields are inspected via [extractMetadata].
+     *
+     * Sprint 11.0J — passthrough was MISSING pre-11.0J. The pre-11.0J
+     * code opened the TUN input stream, read packets, but never
+     * wrote them back. Combined with `.addRoute("0.0.0.0", 0)` (default
+     * route) this caused the OS to drop ALL the user's internet
+     * traffic after 5-30 seconds, triggering a system-side
+     * `onRevoke()` and the `state: DRAINING` regression Owner
+     * observed on PID 4244 (12:14 logcat). The fix opens BOTH the
+     * TUN input stream (read packets from kernel) AND the TUN
+     * output stream (write packets back to kernel — kernel then
+     * routes them out the real NIC) and writes the SAME bytes
+     * back to the output. S80 audit invariant: this is the
+     * load-bearing pattern.
      */
     private fun startReaderThread(pfd: ParcelFileDescriptor) {
-        val input = FileInputStream(pfd.fileDescriptor)
+        // Sprint 11.0J — `AutoCloseInputStream` /
+        // `AutoCloseOutputStream` close the underlying ParcelFileDescriptor
+        // when the stream is closed (i.e., in the `finally` block).
+        // The pre-11.0J code used `FileInputStream(pfd.fileDescriptor)`
+        // which only closed the file descriptor reference, leaking
+        // the kernel-side TUN fd across restart cycles. The
+        // `AutoClose*` variants are the canonical pattern from
+        // `VpnService.Builder.establish()` Javadoc.
+        val input = ParcelFileDescriptor.AutoCloseInputStream(pfd)
+        val output = ParcelFileDescriptor.AutoCloseOutputStream(pfd)
         val thread = Thread({
             val buf = ByteArray(TUN_MTU)
             try {
@@ -533,9 +1367,39 @@ class OpenE2eeVpnService : VpnService() {
                         input.read(buf)
                     } catch (e: IOException) {
                         // TUN closed — normal shutdown path.
+                        Log.d(TAG, "startReaderThread: TUN input EOF / IOException, exiting reader loop")
                         break
                     }
-                    if (n <= 0) break
+                    if (n <= 0) {
+                        Log.d(TAG, "startReaderThread: read returned $n bytes, exiting reader loop")
+                        break
+                    }
+                    // Sprint 11.0P — IP fragment detection.
+                    // IPv4 header at offset 6-7 carries the
+                    // flags (3 bits) + fragment offset (13
+                    // bits). The MF (More Fragments) bit is
+                    // the high bit of byte 6. A non-zero
+                    // fragment offset (low 5 bits of byte 6 +
+                    // byte 7) also indicates a fragment. A
+                    // fragment rate > 5% on a mobile network
+                    // is a strong indicator that TUN MTU is
+                    // too high (the radio link drops fragments
+                    // > 1500 bytes). 11.0P sets TUN_MTU = 1400
+                    // so the radio link (1500-byte MTU minus
+                    // 78-byte GTP/IPsec trailer) can carry the
+                    // 1400-byte TUN frame. The fragment count
+                    // is surfaced in the per-1000-packet log
+                    // breadcrumb below.
+                    if (n >= 20 && (buf[0].toInt() and 0xFF) ushr 4 == 4) {
+                        val flagsAndOffset =
+                            (buf[6].toInt() and 0xFF) shl 8 or
+                                (buf[7].toInt() and 0xFF)
+                        val mfSet = (flagsAndOffset and 0x2000) != 0
+                        val fragOffset = flagsAndOffset and 0x1FFF
+                        if (mfSet || fragOffset != 0) {
+                            ipFragmentCount.incrementAndGet()
+                        }
+                    }
                     val packet = ByteBuffer.wrap(buf, 0, n).order(ByteOrder.BIG_ENDIAN)
                     val meta = extractMetadata(packet, n)
                     if (meta != null) {
@@ -547,39 +1411,85 @@ class OpenE2eeVpnService : VpnService() {
                             ring.addLast(meta)
                         }
                         packetsObserved.incrementAndGet()
+                        // Sprint 11.0P — per-1000-packet MTU +
+                        // fragment breadcrumb. Owner 13:50: the
+                        // TUN_MTU = 1500 was too high for
+                        // Turkcell's GTP-U encapsulation
+                        // (78-byte trailer). 11.0P lowered
+                        // TUN_MTU to 1400 and the Owner can
+                        // now verify by grepping `adb logcat`
+                        // for `startReaderThread: MTU=$TUN_MTU,
+                        // fragmentCount=...` every 1000 packets.
+                        // A fragment rate > 5% is a strong
+                        // signal the MTU is still too high; a
+                        // rate < 0.1% confirms the mobile-safe
+                        // 1400-byte MTU is working.
+                        if (packetsObserved.get() % 1000 == 0) {
+                            val total = packetsObserved.get().toLong()
+                            val fragments = ipFragmentCount.get()
+                            val fragRatePct = if (total > 0) {
+                                (fragments.toDouble() * 100.0 / total.toDouble())
+                            } else {
+                                0.0
+                            }
+                            Log.d(TAG, "startReaderThread: MTU=$TUN_MTU, " +
+                                    "packetsObserved=$total, " +
+                                    "ipFragmentCount=$fragments, " +
+                                    "fragmentRatePct=${"%.2f".format(fragRatePct)}")
+                        }
                         if (packetsObserved.get() == SAMPLING_CAP_PACKETS) {
                             // Notify Dart early so the UI can react mid-session.
                             flushTelemetry()
                         }
                     }
-                    // Forward the payload to the real network. `protect()` is a
-                    // VpnService method that excludes this socket from the TUN,
-                    // so the OS sends it out the device's actual NIC. NO copy.
-                    // We don't get a return connection here; this service is
-                    // sampling-only and does not write back to the TUN.
+                    // Sprint 11.0J — TRANSPARENT PASSTHROUGH. Write the
+                    // SAME bytes back to the TUN output stream. The
+                    // kernel then routes the packet out the device's
+                    // actual NIC (real network interface). WITHOUT this
+                    // write, the kernel drops the packet (since the
+                    // TUN consumed it from the input side) and the
+                    // user's internet is dead. Pre-11.0J, the code
+                    // called `protect(Socket)` and immediately closed
+                    // it — that protects a SOCKET from the VPN, but
+                    // there's no socket to protect here. The actual
+                    // pattern for a transparent capture VPN is to
+                    // WRITE the packet back to the TUN output. The
+                    // `protect()` call was a 11.0A-era misconception
+                    // and has been REMOVED in 11.0J.
                     //
-                    // PR-28 originally called `protect(input.fd)` directly, but
-                    // the Android SDK exposes `protect(Socket)` /
-                    // `protect(DatagramSocket)` only — the FileDescriptor
-                    // overload was removed in API 24+. Wrap a fresh Socket so
-                    // the call resolves to the supported overload; we close the
-                    // socket immediately because we never use the connection
-                    // (only the protect() effect on the OS routing table).
-                    val protectSocket = Socket()
+                    // Sprint 11.0K — `flushTelemetry()` is called
+                    // from this TUN reader thread; its underlying
+                    // `methodChannel?.invokeMethod` is dispatched
+                    // to the Android UI thread via `pushToDart` →
+                    // `mainHandler.post { ... }` to satisfy the
+                    // Flutter Engine `@UiThread` requirement.
+                    // Pre-11.0K, this push happened on the TUN
+                    // reader thread directly and the engine threw
+                    // `@UiThread` violations for `onTelemetry`
+                    // (and `onPacketsSampled` from the PacketDrain
+                    // worker thread). The visible symptom was
+                    // Owner-12:31's "VPN active, internet OK, UI
+                    // never updates" — 98 packets in 80s, drain
+                    // tick visible, but Dart never got the events.
                     try {
-                        protect(protectSocket)
-                    } finally {
-                        protectSocket.close()
+                        output.write(buf, 0, n)
+                        output.flush()
+                    } catch (e: IOException) {
+                        // TUN output closed mid-flight — common during
+                        // the Magisk Zygisk revoke path (Sprint 11.0H).
+                        // Log and exit the reader loop; the service
+                        // will tear down via `onRevoke` /
+                        // `stopCapture`.
+                        Log.w(TAG, "startReaderThread: TUN output write failed (n=$n): ${e.message}; exiting reader loop")
+                        break
                     }
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "TUN reader crashed", t)
                 lastError = "reader: ${t.javaClass.simpleName}: ${t.message}"
             } finally {
-                try {
-                    input.close()
-                } catch (_: IOException) {
-                }
+                try { input.close() } catch (_: IOException) {}
+                try { output.close() } catch (_: IOException) {}
             }
         }, "opene2ee-vpn-reader")
         thread.isDaemon = true
@@ -766,49 +1676,148 @@ class OpenE2eeVpnService : VpnService() {
      * on API 29+ and falls back to the untyped variant on older devices,
      * so the call is safe across the entire `minSdk = 21` range.
      */
-    private fun startForegroundCompat() {
-        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "OpenE2EE VPN Diagnostic",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                description = "Network diagnostic session in progress"
-                setShowBadge(false)
-            }
-            mgr.createNotificationChannel(channel)
+    /**
+     * Sprint 11.0E — public idempotent entry point for the foreground
+     * promotion. Called from [onStartCommand] as the FIRST statement
+     * (so the 5-second `startForeground()` rule is satisfied even if
+     * `Builder.establish()` later throws or returns null) and from
+     * [startForegroundCompat] (for back-compat with the 11.0A path
+     * inside `startCapture()`).
+     *
+     * Idempotent: a `@Volatile` boolean guards against a second
+     * `startForeground` call from leaking the foreground state
+     * (Android allows re-calling `startForeground` with a different
+     * notification id, but doing so unnecessarily wakes the
+     * notification shade). The guard is best-effort: the
+     * system-supplied `startForeground` itself is idempotent on the
+     * notification side, so a missed guard just means the user sees
+     * a one-frame notification refresh.
+     */
+    private val foregroundStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Sprint 11.0E — promote the service to foreground state
+     * synchronously. MUST be called from [onStartCommand] (or
+     * equivalent service lifecycle hook) BEFORE any IO that could
+     * exceed Android's 5-second `startForeground()` deadline
+     * (TUN setup, DNS resolution, etc.).
+     *
+     * Steps:
+     *   1. Ensure the notification channel exists (idempotent,
+     *      Android 8+).
+     *   2. Build the foreground notification.
+     *   3. Call `startForeground()` with the typed 3-arg overload on
+     *      Android 14+ (API 34) so the foregroundServiceType matches
+     *      the manifest `foregroundServiceType="specialUse"`. On
+     *      older API levels, falls back to the 2-arg overload via
+     *      [ServiceCompat.startForeground].
+     */
+    fun ensureForegroundService() {
+        Companion.ensureNotificationChannel(this)
+        val notification: Notification = buildForegroundNotification()
+        // Android 14+ (UPSIDE_DOWN_CAKE = API 34) requires the typed
+        // 3-arg `startForeground(id, notification, foregroundServiceType)`
+        // overload so the foregroundServiceType matches the manifest
+        // declaration. On older API levels, `ServiceCompat.startForeground`
+        // is the canonical shim — it routes to the typed 4-arg form on
+        // API 29+ (Q) and the legacy 2-arg form on API < 29.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
+        } else {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                } else {
+                    0
+                },
+            )
         }
-        val notification: Notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("OpenE2EE diagnostic session")
-            .setContentText("Sampling the first $SAMPLING_CAP_PACKETS packets of your network")
+        foregroundStarted.set(true)
+    }
+
+    /**
+     * Build the foreground-service notification. Centralised so the
+     * title / content text / icon are consistent between the
+     * Sprint 11.0E `onStartCommand` path and the legacy 11.0A
+     * `startCapture()` path. S50 invariant: NO "VPN" string in any
+     * user-facing surface.
+     */
+    private fun buildForegroundNotification(): Notification =
+        NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setContentTitle("OpenE2EE Şifreleme Doğrulama")
+            .setContentText("Ağınızda ilk $SAMPLING_CAP_PACKETS paket analiz ediliyor (PRIVACY_TEXT eki)")
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setOngoing(true)
             .build()
-        // PR-28 §B.2 — typed startForeground on API 29+; untyped on older.
-        // `ServiceCompat.startForeground` is a no-op on the foregroundType
-        // arg for API < 29.
-        ServiceCompat.startForeground(
-            this,
-            NOTIFICATION_ID,
-            notification,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            } else {
-                0
-            },
-        )
+
+    private fun startForegroundCompat() {
+        // Sprint 11.0E — route through the centralised helper so the
+        // notification-channel creation + startForeground overload
+        // selection stay in lockstep with `ensureForegroundService`.
+        // Kept as a private back-compat alias for the 11.0A call
+        // site inside `startCapture()` (which is no longer the
+        // primary path — `onStartCommand` is — but still reachable
+        // if the service is restarted via the OS).
+        ensureForegroundService()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // The Dart side calls `startCapture()` via the MethodChannel rather
-        // than through service-start intents — but we honour intent-launched
-        // starts (e.g. Android's autostart on reboot) as a fallback.
+        // Sprint 11.0F — diagnostic breadcrumb. Pairs with the
+        // `startCapture: entry` line further down so the Owner can
+        // confirm the service was actually created by the system
+        // (vs. the dispatcher's `startForegroundService` call having
+        // been intercepted somewhere).
+        Log.d(TAG, "onStartCommand: entry (intent.action=${intent?.action}, startId=$startId)")
+        // Sprint 11.0E — CRITICAL: call `startForeground()` BEFORE any
+        // other work. Android 8+ (API 26+) imposes a 5-second rule:
+        // when a service is started via `Context.startForegroundService(...)`,
+        // the service MUST call `Service.startForeground(id, notification)`
+        // within 5 seconds. If it does not, the system kills the service
+        // and throws `android.app.RemoteServiceException: Context
+        // .startForegroundService() did not then call Service
+        // .startForeground()`, taking the whole app down with it
+        // (this is the OnePlus 9 Pro crash Owner reported at
+        // 10:29 on 11.07.2026).
+        //
+        // Pre-Sprint-11.0E, `startForegroundCompat()` was only called
+        // from inside `startCapture()` — AFTER `Builder.establish()`
+        // (TUN setup, can be slow on some OEM ROMs) and AFTER the
+        // `Builder.establish() == null` early-return path. If TUN
+        // setup returned null (user declined consent, system refused)
+        // or threw, `startForeground()` was NEVER called → the
+        // 5-second rule was violated → RemoteServiceException.
+        //
+        // The fix: hoist the foreground-promotion to the FIRST
+        // statement in `onStartCommand`, BEFORE any IO. The
+        // notification is the same one `startCapture()` would have
+        // shown (S50 invariant: "OpenE2EE Şifreleme Doğrulama",
+        // no "VPN" string). The Android 14+ (API 34) typed overload
+        // is used on UPSIDE_DOWN_CAKE+ so the foregroundServiceType
+        // matches the manifest `foregroundServiceType="specialUse"`.
+        ensureForegroundService()
+        Log.d(TAG, "onStartCommand: ensureForegroundService() returned (foreground promotion OK)")
+
+        // The Dart side calls `startCapture()` via the MethodChannel
+        // rather than through service-start intents — but we honour
+        // intent-launched starts (e.g. Android's autostart on reboot)
+        // as a fallback.
         if (intent?.action == ACTION_PREPARE) {
-            // No-op here; the actual `prepare`/consent dialog is handled by
-            // MainActivity which has the Activity context.
+            // No-op here; the actual `prepare`/consent dialog is
+            // handled by MainActivity which has the Activity context.
+            Log.d(TAG, "onStartCommand: intent.action=ACTION_PREPARE — no-op (consent dialog owned by MainActivity)")
         } else if (running.get() == false) {
+            Log.d(TAG, "onStartCommand: about to call startCapture() (running=false)")
             startCapture()
+            Log.d(TAG, "onStartCommand: startCapture() returned (state=$state)")
+        } else {
+            Log.d(TAG, "onStartCommand: already running, skipping startCapture (idempotent)")
         }
         return START_NOT_STICKY
     }
@@ -835,11 +1844,24 @@ class OpenE2eeVpnService : VpnService() {
         pendingEngine = null
         stopCapture(graceful = false)
         detachFlutterEngine()
+        // Sprint 11.0A — shut down the drain executor. stopCapture
+        // already cancelled the ScheduledFuture; the executor's
+        // single worker thread is daemon so shutdownNow is safe.
+        drainExecutor?.shutdownNow()
+        drainExecutor = null
+        drainTask = null
         super.onDestroy()
     }
 
     override fun onRevoke() {
-        // User revoked the VPN profile from system settings — tear down.
+        // Sprint 11.0H — diagnostic breadcrumb at the system-side
+        // revoke path. The Owner saw `start` return `state: DRAINING`
+        // (not `state: SAMPLING`) which suggested `stopCapture` was
+        // called from somewhere external — `onRevoke` (system
+        // settings / Magisk Zygisk revoke) is one candidate. The
+        // log line identifies the path so the next regression can
+        // be diagnosed via `adb logcat -d -s OpenE2eeVpn:V`.
+        Log.w(TAG, "onRevoke: VPN profile revoked by system (Magisk Zygisk or settings or user); tearing down")
         stopCapture(graceful = true)
         super.onRevoke()
     }

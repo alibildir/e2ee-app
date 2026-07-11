@@ -193,15 +193,25 @@ class PoolState {
   /// History capacity for the `paketGecmisi` ring buffer.
   static const int tarihceKapasite = 10;
 
-  /// Factory: initial state. Sprint 10.1A mock numbers + the
-  /// 5 new debug fields (all zero / null / false at start).
+  /// Factory: initial state. Sprint 11.0O — all-zero initial
+  /// values. Pre-11.0O, this factory returned Sprint 10.1A
+  /// mock numbers (`paketSayisi: 247`, `gonulluSayisi: 3`,
+  /// `testEdilenler: {rcs, whatsapp}`, `paketGecmisi:
+  /// [1,2,1,3,2,1,2,3,1,2]`) so the screen looked populated
+  /// before any data arrived. Owner 13:20: those mock
+  /// values plus the `_mockTick` ticker were the source of
+  /// the "numbers animate without VPN" symptom. 11.0O
+  /// returns zero/empty for everything that the API would
+  /// otherwise populate; the user sees "0 paket, 0 gönüllü"
+  /// until the first real API call (5s) or the first real
+  /// VPN packet arrives.
   factory PoolState.initial() {
     return const PoolState(
       isAlici: true,
-      paketSayisi: 247,
-      gonulluSayisi: 3,
-      testEdilenler: {'rcs', 'whatsapp'},
-      paketGecmisi: <int>[1, 2, 1, 3, 2, 1, 2, 3, 1, 2],
+      paketSayisi: 0,
+      gonulluSayisi: 0,
+      testEdilenler: <String>{},
+      paketGecmisi: <int>[],
       sonGuncelleme: null,
       lastError: null,
       lastSuccess: null,
@@ -220,7 +230,20 @@ class PoolNotifier extends StateNotifier<PoolState> {
     AuthService? auth,
   })  : _matcher = matcher ??
             P2PMatcher(apiKey: kApiKey, auth: auth),
-        _vpn = vpnService ?? VpnService(),
+        // Sprint 11.0G — `_vpn` now uses the canonical singleton
+        // accessor. Pre-11.0G, `VpnService()` was a factory that
+        // returned the singleton, but the call site form
+        // (`VpnService()`) was indistinguishable from a fresh
+        // instance constructor — so code review couldn't tell
+        // whether the call was intentional singleton access or
+        // an accidental fresh instance. The 11.0G fix removes
+        // the public `VpnService()` factory entirely; only
+        // `VpnService.instance` (singleton) and
+        // `VpnService.forTesting(...)` (test override) remain
+        // callable. The DI surface for production code is
+        // [vpnServiceProvider] — tests can override it via
+        // `ProviderScope(overrides: [vpnServiceProvider.overrideWithValue(mock)])`.
+        _vpn = vpnService ?? VpnService.instance,
         // Sprint 10.1C — use the build-time DEVICE_ID as the
         // session id so the backend BFF correlates every
         // telemetry + matcher poll with the same device
@@ -248,27 +271,39 @@ class PoolNotifier extends StateNotifier<PoolState> {
   /// hammering the BFF, short enough that the UI feels live).
   static const Duration _pollPeriod = kPoolPollPeriod;
 
-  /// 3-second tick for the `Timer.periodic` Sprint 10.1A
-  /// mock-only stat-advance. Kept so the S28 audit still
-  /// passes — the real API call happens on a separate
-  /// 5-second cadence.
-  static const Duration _mockTickPeriod = Duration(seconds: 3);
+  /// Sprint 11.0O — REMOVED the Sprint 10.1A `_mockTimer`
+  /// + `_mockTick` (3-second `Timer.periodic` ticker that
+  /// bumped `paketSayisi` and `gonulluSayisi` with no real
+  /// network call). Owner 13:20: the mock ticker was the
+  /// source of the "numbers animate without VPN" symptom.
+  /// 11.0O replaces it with REAL counts:
+  ///   - `paketSayisi` accumulates from
+  ///     `_vpn.getSampledPackets()` (the Kotlin TUN
+  ///     reader's `SampledPacket` list, surfaced via the
+  ///     MethodChannel on every 5s tick).
+  ///   - `gonulluSayisi` is the count of active receivers
+  ///     returned by `_matcher.findActiveReceivers(...)`
+  ///     (the canonical P2P matcher endpoint at
+  ///     `GET /api/v1/sessions`). If the matcher fails or
+  ///     the user is not opted in, `gonulluSayisi = 0`
+  ///     (NOT a mock 2-5).
+  ///
+  /// The S86 audit enforces: ZERO `Timer.periodic` /
+  /// `Future.delayed` / `setInterval` calls in this file
+  /// (outside docstrings) and ZERO mock initial values in
+  /// `PoolState.initial()`.
 
   final P2PMatcher _matcher;
   final VpnService _vpn;
   final TelemetryService _telemetry;
   late final String _sessionId;
   Timer? _pollTimer;
-  Timer? _mockTimer;
 
   void _start() {
     _pollTimer?.cancel();
-    _mockTimer?.cancel();
-    // Real API poll — 5s cadence.
+    // Sprint 11.0O — only the REAL 5s API poll remains.
+    // The mock 3s `_mockTimer` is REMOVED (Owner 13:20).
     _pollTimer = Timer.periodic(_pollPeriod, (_) => _apiTick());
-    // Mock stat-advance — 3s cadence. Kept for S28 audit +
-    // backwards-compat with the 10.1A "feels alive" UI.
-    _mockTimer = Timer.periodic(_mockTickPeriod, (_) => _mockTick());
   }
 
   /// Real API tick — pings the P2P matcher, drains the VPN
@@ -302,6 +337,27 @@ class PoolNotifier extends StateNotifier<PoolState> {
         );
       }
       final ts = DateTime.now();
+      // Sprint 11.0O — drive the count fields from REAL
+      // data. `samples.length` is the per-tick packet
+      // count; we add to a cumulative `paketSayisi` only
+      // when the VPN is actually running. If samples is
+      // empty (VPN not started, or no traffic), we DO NOT
+      // bump the counter — the UI shows 0 until real
+      // packets arrive. `peers.length` is the real
+      // volunteer count from the backend (no mock 2-5
+      // fallback). 11.0O closes the Owner 13:20
+      // "animated numbers without VPN" symptom at the
+      // data source: the state is now derived from real
+      // API responses, not a Timer.periodic.
+      final yeniPaketSayisi = samples.isNotEmpty
+          ? state.paketSayisi + samples.length
+          : state.paketSayisi;
+      final yeniTarihce = samples.isNotEmpty
+          ? (List<int>.from(state.paketGecmisi)..add(samples.length))
+          : state.paketGecmisi;
+      while (yeniTarihce.length > PoolState.tarihceKapasite) {
+        yeniTarihce.removeAt(0);
+      }
       state = state.copyWith(
         isLoading: false,
         sonGuncelleme: ts,
@@ -310,6 +366,10 @@ class PoolNotifier extends StateNotifier<PoolState> {
         lastSuccess: peers.isNotEmpty
             ? 'Eşleşme bulundu: ${peers.first.substring(0, peers.first.length.clamp(0, 8))}…'
             : 'Eşleşme kontrol edildi: yok (${samples.length} paket)',
+        // Sprint 11.0O — real counts.
+        gonulluSayisi: peers.length,
+        paketSayisi: yeniPaketSayisi,
+        paketGecmisi: yeniTarihce,
       );
     } catch (e) {
       final ts = DateTime.now();
@@ -321,24 +381,6 @@ class PoolNotifier extends StateNotifier<PoolState> {
         lastError: e.toString(),
       );
     }
-  }
-
-  /// Mock stat-advance tick — keeps the 10.1A "feels alive"
-  /// numbers moving every 3 seconds. S28 audit verifies the
-  /// `Timer.periodic` literal stays in this file.
-  void _mockTick() {
-    if (!state.isAlici) return;
-    final delta = 1 + (DateTime.now().millisecondsSinceEpoch % 3);
-    final yeniGonullu = 2 + (DateTime.now().microsecondsSinceEpoch % 4);
-    final yeniTarihce = List<int>.from(state.paketGecmisi)..add(delta);
-    while (yeniTarihce.length > PoolState.tarihceKapasite) {
-      yeniTarihce.removeAt(0);
-    }
-    state = state.copyWith(
-      paketSayisi: state.paketSayisi + delta,
-      gonulluSayisi: yeniGonullu,
-      paketGecmisi: yeniTarihce,
-    );
   }
 
   /// "Alıcı Ol" toggle — same semantics as 10.1A. Flipping
@@ -368,9 +410,8 @@ class PoolNotifier extends StateNotifier<PoolState> {
   @override
   void dispose() {
     _pollTimer?.cancel();
-    _mockTimer?.cancel();
     _pollTimer = null;
-    _mockTimer = null;
+    // Sprint 11.0O — `_mockTimer` is REMOVED (Owner 13:20).
     _matcher.close();
     _telemetry.close();
     super.dispose();

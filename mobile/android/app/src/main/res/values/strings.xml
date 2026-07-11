@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sprint 11.0A — Service description string for the
+  `OpenE2eeVpnService` foreground service. Sourced from
+  `AndroidManifest.xml`'s `android:description` attribute on
+  the `<service>` element so the system can display the
+  human-readable explanation in the FGS notification (Android
+  14+ requirement for `specialUse` subtype, see ADR-0003
+  risk B2).
+
+  S25 invariant: NO "VPN" string in any user-facing surface.
+  PRIVACY_TEXT eki discloses the privacy posture (masked IPs,
+  no payload, no device identifiers) per ADR-0006.
+-->
+<resources>
+    <string
+        name="open_e2ee_sifreleme_dogrulama_service_description"
+        translatable="false">OpenE2EE Şifreleme Doğrulama — ağınızda şifreleme bütünlüğü doğrulama oturumu (PRIVACY_TEXT eki: yalnızca /24 (IPv4) ve /48 (IPv6) maskeli IP üstbilgisi cihazdan dışarı çıkar; ham paket yükü, IMEI, MSISDN, telefon numarası, kişi listesi veya konum hiçbir zaman okunmaz veya iletilmez)</string>
+</resources>
