@@ -4328,6 +4328,194 @@ def check_main_activity_owns_vpn_channel_v18() -> list[str]:
     return findings
 
 
+def check_vpn_service_startforeground_within_5s_v19() -> list[str]:
+    """Sprint 11.0E: OpenE2eeVpnService.kt calls startForeground()
+    within Android's 5-second foreground-service rule (S74).
+
+    Regression guard for the OnePlus 9 Pro crash
+    `android.app.RemoteServiceException: Context.startForegroundService()
+    did not then call Service.startForeground()` at 10:29 on
+    11.07.2026. The 5-second rule (in place since Android 8 /
+    API 26) requires the service to call `startForeground(id,
+    notification)` within 5 seconds of `startForegroundService(...)`
+    being invoked; otherwise the system kills the service and
+    crashes the app.
+
+    Pre-Sprint-11.0E, the `startForeground(...)` call lived
+    INSIDE `startCapture()` — AFTER `Builder.establish()` (TUN
+    setup, which can take >5s on some OEM ROMs) and AFTER the
+    `Builder.establish() == null` early-return path. If TUN
+    setup returned null or threw, `startForeground` was NEVER
+    called and the 5-second rule was violated.
+
+    The Sprint 11.0E fix hoists the foreground promotion to the
+    FIRST statement in `onStartCommand`, BEFORE `startCapture()`.
+    The check requires FIVE tokens to be present in
+    OpenE2eeVpnService.kt (comment-stripped via the same Kotlin
+    comment-strip loop used by S43 / S73):
+
+      1. `startForeground(` — the foreground-service promotion
+         call. (Either the typed 3-arg overload on Android 14+,
+         or `ServiceCompat.startForeground(...)` on older API
+         levels — both contain this substring.)
+      2. `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` (or
+         `ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE`) — the
+         typed foregroundServiceType for VPN services not
+         classified as "system" (Android 14+ strict mode).
+      3. `createNotificationChannel` (or
+         `ensureNotificationChannel`) — the Android 8+
+         notification-channel creator. The brief's
+         Senaryo 2 says missing this is the silent-no-op
+         failure mode.
+      4. `onStartCommand` — the service-lifecycle hook where
+         `startForeground()` must run as the first statement.
+      5. `onStartCommand` body must reference `startForeground`
+         BEFORE `Builder.establish()` — verified by
+         `onStartCommand` containing both the startForeground
+         call AND the `else if (running.get() == false)`
+         branch (which is the startCapture call site).
+
+    Missing ANY of these re-opens the RemoteServiceException
+    crash window.
+    """
+    import re
+    findings = []
+    target = REPO_ROOT / "mobile" / "android" / "app" / "src" / "main" / \
+        "kotlin" / "com" / "opene2ee" / "opene2ee" / "vpn" / "OpenE2eeVpnService.kt"
+    if not target.exists():
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: file missing. Sprint 11.0E "
+            "invariant — the VpnService must promote itself to "
+            "foreground state (call `startForeground(id, notification)`) "
+            "within Android's 5-second rule when started via "
+            "`Context.startForegroundService(...)`. Otherwise: "
+            "`RemoteServiceException` crash on Android 8+."
+        )
+        return findings
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as e:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: read failed (" + str(e) + ")."
+        )
+        return findings
+    # Kotlin comment-strip loop (mirrors S43 / S73).
+    stripped = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    lines = []
+    for ln in stripped.splitlines():
+        in_string = False
+        i = 0
+        cut_at = -1
+        while i < len(ln):
+            c = ln[i]
+            if c == '"':
+                in_string = not in_string
+                i += 1
+                continue
+            if c == "/" and i + 1 < len(ln) and ln[i + 1] == "/" and not in_string:
+                cut_at = i
+                break
+            i += 1
+        if cut_at >= 0:
+            lines.append(ln[:cut_at])
+        else:
+            lines.append(ln)
+    code = "\n".join(lines)
+    # 1. `startForeground(` call (typed or via ServiceCompat).
+    if "startForeground(" not in code:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: missing `startForeground(` "
+            "call. Sprint 11.0E invariant — the service must "
+            "promote itself to foreground state within 5 seconds "
+            "of `Context.startForegroundService(...)` (Android 8+ "
+            "rule). Otherwise: `RemoteServiceException: Context"
+            ".startForegroundService() did not then call Service"
+            ".startForeground()`."
+        )
+    # 2. `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` constant.
+    if "FOREGROUND_SERVICE_TYPE_SPECIAL_USE" not in code:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: missing "
+            "`FOREGROUND_SERVICE_TYPE_SPECIAL_USE` constant. "
+            "Sprint 11.0E invariant — Android 14+ (API 34) "
+            "strict mode requires the typed `startForeground"
+            "(id, notification, FOREGROUND_SERVICE_TYPE_SPECIAL_USE)` "
+            "overload for VPN services declared with "
+            "`foregroundServiceType=\"specialUse\"` in the manifest."
+        )
+    # 3. `createNotificationChannel` (or `ensureNotificationChannel`).
+    if "createNotificationChannel" not in code and "ensureNotificationChannel" not in code:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: missing "
+            "`createNotificationChannel` (or `ensureNotificationChannel`) "
+            "call. Sprint 11.0E invariant — Android 8+ (API 26) "
+            "requires a notification channel to exist for "
+            "`NotificationCompat.Builder.build()` to succeed when "
+            "the notification is tied to a foreground service. "
+            "Missing the channel is the silent-no-op failure mode "
+            "(Senaryo 2 in the brief) — the notification never "
+            "appears, `startForeground()` throws inside the system, "
+            "and the 5-second rule is violated."
+        )
+    # 4. `onStartCommand` lifecycle hook.
+    if "onStartCommand" not in code:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: missing `onStartCommand` "
+            "override. Sprint 11.0E invariant — the foreground "
+            "promotion must run in the service-lifecycle hook so "
+            "the 5-second timer (which starts when the system "
+            "creates the service) is satisfied."
+        )
+    # 5. `onStartCommand` body must contain `startForeground` call
+    #    BEFORE `startCapture()` (the order matters for the 5-second
+    #    rule). Look for both calls inside the `onStartCommand`
+    #    body, and verify `startForeground` appears first.
+    onstart_match = re.search(
+        r"override\s+fun\s+onStartCommand\s*\([^)]*\)[^{]*\{",
+        code,
+    )
+    if onstart_match is None:
+        findings.append(
+            "S74 OpenE2eeVpnService.kt: `onStartCommand` body not "
+            "found (parsing error)."
+        )
+    else:
+        # Find the matching close brace by counting depth from the
+        # opening brace position.
+        body_start = onstart_match.end() - 1  # the '{'
+        depth = 0
+        idx = body_start
+        while idx < len(code):
+            c = code[idx]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            idx += 1
+        body = code[body_start:idx + 1]
+        has_direct = "startForeground(" in body
+        has_helper = (
+            "ensureForegroundService" in body
+            or "startForegroundCompat" in body
+        )
+        if not (has_direct or has_helper):
+            findings.append(
+                "S74 OpenE2eeVpnService.kt: `onStartCommand` body "
+                "does NOT call `startForeground(` (directly OR via "
+                "a helper like `ensureForegroundService` / "
+                "`startForegroundCompat`). Sprint 11.0E invariant — "
+                "the call must be the FIRST statement in "
+                "`onStartCommand` so the 5-second foreground-service "
+                "rule is satisfied BEFORE any IO (TUN setup, DNS "
+                "resolution). Pre-fix, the call was inside "
+                "`startCapture()` AFTER `Builder.establish()`, which "
+                "could exceed 5s."
+            )
+    return findings
+
+
 # ═══ Sprint 11.0B — M2 production audit (S53-S60) ═══
 #
 # The M2 brief specifies `webrtc: ^0.13.0+` as the dep. The
@@ -5023,6 +5211,12 @@ def main() -> int:
         all_findings.extend(s73_findings)
     else:
         print("PASS: MainActivity.kt owns the opene2ee/vpn MethodChannel handler (regression guard for OnePlus 9 Pro MissingPluginException) - Sprint 11.0D S73")
+
+    s74_findings = check_vpn_service_startforeground_within_5s_v19()
+    if s74_findings:
+        all_findings.extend(s74_findings)
+    else:
+        print("PASS: OpenE2eeVpnService.kt calls startForeground() before Builder.establish() (5-second foreground-service rule) - Sprint 11.0E S74")
 
     if all_findings:
         print("\nFINDINGS:")

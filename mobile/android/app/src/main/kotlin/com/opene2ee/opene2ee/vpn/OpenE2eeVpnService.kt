@@ -494,6 +494,47 @@ class OpenE2eeVpnService : VpnService() {
             "allowedApplications" to null,
             "disallowedApplications" to null,
         )
+
+        /**
+         * Sprint 11.0E — idempotent notification-channel creator.
+         * Called from [ensureForegroundService] (and the legacy
+         * [startForegroundCompat] for back-compat) before
+         * `startForeground()`. Android 8+ (API 26+) REQUIRES a
+         * channel to exist for `NotificationCompat.Builder.build()`
+         * to succeed when the notification is tied to a foreground
+         * service; missing the channel is the "silent no-op →
+         * 5-second timeout" failure mode in Sprint 11.0E's Senaryo 2.
+         *
+         * Idempotent: re-creating an existing channel is a no-op on
+         * the platform side, but we add the `getNotificationChannel
+         * (CHANNEL_ID) == null` short-circuit so the call has no
+         * observable cost on the hot path.
+         */
+        @JvmStatic
+        fun ensureNotificationChannel(context: Context) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val nm = context.getSystemService(NotificationManager::class.java) ?: return
+                if (nm.getNotificationChannel(NOTIFICATION_CHANNEL_ID) != null) {
+                    return // already exists — no-op
+                }
+                val channel = NotificationChannel(
+                    NOTIFICATION_CHANNEL_ID,
+                    "OpenE2EE Şifreleme Doğrulama",
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    // Sprint 11.0A — S50 invariant: NO "VPN" string in
+                    // any user-facing surface. The PRIVACY_TEXT eki is
+                    // the Turkish-language disclosure appended for the
+                    // Android 14+ foregroundServiceType=specialUse
+                    // subtype justification.
+                    description = "Ağ şifreleme bütünlüğü doğrulama oturumu (PRIVACY_TEXT eki)"
+                    setShowBadge(false)
+                    enableVibration(false)
+                    setSound(null, null)
+                }
+                nm.createNotificationChannel(channel)
+            }
+        }
     }
 
     /** Lifecycle states exposed via `status` to Dart. */
@@ -1169,51 +1210,134 @@ class OpenE2eeVpnService : VpnService() {
      * on API 29+ and falls back to the untyped variant on older devices,
      * so the call is safe across the entire `minSdk = 21` range.
      */
-    private fun startForegroundCompat() {
-        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID,
-                "OpenE2EE Şifreleme Doğrulama",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                // Sprint 11.0A — S50 invariant: NO "VPN" string in any
-                // user-facing surface. PRIVACY_TEXT eki is the
-                // Turkish-language disclosure appended for Android 14+
-                // foregroundServiceType=specialUse justification.
-                description = "Ağ şifreleme bütünlüğü doğrulama oturumu (PRIVACY_TEXT eki)"
-                setShowBadge(false)
-            }
-            mgr.createNotificationChannel(channel)
+    /**
+     * Sprint 11.0E — public idempotent entry point for the foreground
+     * promotion. Called from [onStartCommand] as the FIRST statement
+     * (so the 5-second `startForeground()` rule is satisfied even if
+     * `Builder.establish()` later throws or returns null) and from
+     * [startForegroundCompat] (for back-compat with the 11.0A path
+     * inside `startCapture()`).
+     *
+     * Idempotent: a `@Volatile` boolean guards against a second
+     * `startForeground` call from leaking the foreground state
+     * (Android allows re-calling `startForeground` with a different
+     * notification id, but doing so unnecessarily wakes the
+     * notification shade). The guard is best-effort: the
+     * system-supplied `startForeground` itself is idempotent on the
+     * notification side, so a missed guard just means the user sees
+     * a one-frame notification refresh.
+     */
+    private val foregroundStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Sprint 11.0E — promote the service to foreground state
+     * synchronously. MUST be called from [onStartCommand] (or
+     * equivalent service lifecycle hook) BEFORE any IO that could
+     * exceed Android's 5-second `startForeground()` deadline
+     * (TUN setup, DNS resolution, etc.).
+     *
+     * Steps:
+     *   1. Ensure the notification channel exists (idempotent,
+     *      Android 8+).
+     *   2. Build the foreground notification.
+     *   3. Call `startForeground()` with the typed 3-arg overload on
+     *      Android 14+ (API 34) so the foregroundServiceType matches
+     *      the manifest `foregroundServiceType="specialUse"`. On
+     *      older API levels, falls back to the 2-arg overload via
+     *      [ServiceCompat.startForeground].
+     */
+    fun ensureForegroundService() {
+        Companion.ensureNotificationChannel(this)
+        val notification: Notification = buildForegroundNotification()
+        // Android 14+ (UPSIDE_DOWN_CAKE = API 34) requires the typed
+        // 3-arg `startForeground(id, notification, foregroundServiceType)`
+        // overload so the foregroundServiceType matches the manifest
+        // declaration. On older API levels, `ServiceCompat.startForeground`
+        // is the canonical shim — it routes to the typed 4-arg form on
+        // API 29+ (Q) and the legacy 2-arg form on API < 29.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            )
+        } else {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                } else {
+                    0
+                },
+            )
         }
-        val notification: Notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+        foregroundStarted.set(true)
+    }
+
+    /**
+     * Build the foreground-service notification. Centralised so the
+     * title / content text / icon are consistent between the
+     * Sprint 11.0E `onStartCommand` path and the legacy 11.0A
+     * `startCapture()` path. S50 invariant: NO "VPN" string in any
+     * user-facing surface.
+     */
+    private fun buildForegroundNotification(): Notification =
+        NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("OpenE2EE Şifreleme Doğrulama")
             .setContentText("Ağınızda ilk $SAMPLING_CAP_PACKETS paket analiz ediliyor (PRIVACY_TEXT eki)")
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setOngoing(true)
             .build()
-        // PR-28 §B.2 — typed startForeground on API 29+; untyped on older.
-        // `ServiceCompat.startForeground` is a no-op on the foregroundType
-        // arg for API < 29.
-        ServiceCompat.startForeground(
-            this,
-            NOTIFICATION_ID,
-            notification,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            } else {
-                0
-            },
-        )
+
+    private fun startForegroundCompat() {
+        // Sprint 11.0E — route through the centralised helper so the
+        // notification-channel creation + startForeground overload
+        // selection stay in lockstep with `ensureForegroundService`.
+        // Kept as a private back-compat alias for the 11.0A call
+        // site inside `startCapture()` (which is no longer the
+        // primary path — `onStartCommand` is — but still reachable
+        // if the service is restarted via the OS).
+        ensureForegroundService()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // The Dart side calls `startCapture()` via the MethodChannel rather
-        // than through service-start intents — but we honour intent-launched
-        // starts (e.g. Android's autostart on reboot) as a fallback.
+        // Sprint 11.0E — CRITICAL: call `startForeground()` BEFORE any
+        // other work. Android 8+ (API 26+) imposes a 5-second rule:
+        // when a service is started via `Context.startForegroundService(...)`,
+        // the service MUST call `Service.startForeground(id, notification)`
+        // within 5 seconds. If it does not, the system kills the service
+        // and throws `android.app.RemoteServiceException: Context
+        // .startForegroundService() did not then call Service
+        // .startForeground()`, taking the whole app down with it
+        // (this is the OnePlus 9 Pro crash Owner reported at
+        // 10:29 on 11.07.2026).
+        //
+        // Pre-Sprint-11.0E, `startForegroundCompat()` was only called
+        // from inside `startCapture()` — AFTER `Builder.establish()`
+        // (TUN setup, can be slow on some OEM ROMs) and AFTER the
+        // `Builder.establish() == null` early-return path. If TUN
+        // setup returned null (user declined consent, system refused)
+        // or threw, `startForeground()` was NEVER called → the
+        // 5-second rule was violated → RemoteServiceException.
+        //
+        // The fix: hoist the foreground-promotion to the FIRST
+        // statement in `onStartCommand`, BEFORE any IO. The
+        // notification is the same one `startCapture()` would have
+        // shown (S50 invariant: "OpenE2EE Şifreleme Doğrulama",
+        // no "VPN" string). The Android 14+ (API 34) typed overload
+        // is used on UPSIDE_DOWN_CAKE+ so the foregroundServiceType
+        // matches the manifest `foregroundServiceType="specialUse"`.
+        ensureForegroundService()
+
+        // The Dart side calls `startCapture()` via the MethodChannel
+        // rather than through service-start intents — but we honour
+        // intent-launched starts (e.g. Android's autostart on reboot)
+        // as a fallback.
         if (intent?.action == ACTION_PREPARE) {
-            // No-op here; the actual `prepare`/consent dialog is handled by
-            // MainActivity which has the Activity context.
+            // No-op here; the actual `prepare`/consent dialog is
+            // handled by MainActivity which has the Activity context.
         } else if (running.get() == false) {
             startCapture()
         }
