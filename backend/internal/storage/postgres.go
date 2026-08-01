@@ -248,6 +248,42 @@ func (s *PostgresStore) GetSession(ctx context.Context, id uuid.UUID) (*Session,
 	return &sess, nil
 }
 
+// DeleteSession hard-deletes a session row + its cached
+// TelemetryAggregate (Sprint 12.0+). Idempotent — a second
+// call for the same id returns ErrNotFound so the caller
+// can distinguish "I deleted it" from "it was already gone".
+//
+// Telemetry rows are NOT touched — those are scoped to the
+// device and live until DeleteUser fires (KVKK 7-day SLA).
+func (s *PostgresStore) DeleteSession(ctx context.Context, id uuid.UUID) error {
+	if id == uuid.Nil {
+		return fmt.Errorf("storage: DeleteSession: zero uuid")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("storage: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `DELETE FROM telemetry_aggregates WHERE session_id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("storage: delete aggregates for session %s: %w", id, err)
+	}
+	_ = tag // aggregates count is informational only
+
+	tag, err = tx.Exec(ctx, `DELETE FROM sessions WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("storage: delete session %s: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("storage: commit delete-session tx: %w", err)
+	}
+	return nil
+}
+
 // ListSessions returns the most recent sessions (newest first), capped by limit.
 // limit <= 0 means default (50).
 func (s *PostgresStore) ListSessions(ctx context.Context, limit int) ([]Session, error) {

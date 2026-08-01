@@ -143,6 +143,17 @@ func (a *API) buildRouter() http.Handler {
 			// into `SessionScoreCalculator.compute(...)`.
 			r.Post("/sessions/{id}/close", a.handleCloseSession())
 			r.Post("/sessions/{id}/telemetry", a.handlePostTelemetry())
+			// Sprint 12.0+ — DELETE /sessions/{id} used by the
+			// mobile session_orchestrator.tearDown() flow
+			// (best-effort). Idempotent — 200 on second call.
+			r.Delete("/sessions/{id}", a.handleDeleteSession())
+			// Sprint 12.0+ — legacy /telemetry route (Sprint
+			// 10.1D contract). session_id is supplied in the
+			// request body rather than the URL path. The mobile
+			// `TelemetryService.send` (per-packet batch) still
+			// calls this URL — restoring it closes the 404
+			// gap without forcing a mobile rebuild.
+			r.Post("/telemetry", a.handlePostTelemetryLegacy())
 
 			// users (KVKK delete)
 			r.Delete("/users/{device_id_hash}", a.handleDeleteUser())

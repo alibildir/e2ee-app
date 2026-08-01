@@ -463,3 +463,58 @@ func (a *API) handleCloseSession() http.HandlerFunc {
 func endsWith(s, suffix string) bool {
 	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }
+
+// handleDeleteSession is DELETE /api/v1/sessions/{id}.
+//
+// Sprint 12.0+ — P2P session_orchestrator.tearDown() calls this
+// when the mobile orchestrator exits the active pool (the
+// user leaves the test mid-flight). Backend hard-deletes the
+// session row + its cached TelemetryAggregate. Telemetry rows
+// themselves are NOT touched — they remain until the device's
+// KVKK delete fires (7-day SLA, DeleteUser).
+//
+// Idempotent: a second DELETE for the same id returns 404
+// (the row is already gone). The mobile tearDown() swallows
+// the 404 since "best-effort cleanup" is the contract there
+// (session_orchestrator.dart:309).
+//
+// AuthZ (Sprint 12.0): the route lives behind IsAuthorized
+// (JWT required). We do NOT enforce sub == path today — the
+// mobile tearDown fires with the device's own JWT and
+// knowing the session id already proves presence. A future
+// PR can tighten this with a session.sender_hash check.
+//
+// S72 invariant: the route registration in router.go
+// (`r.Delete("/sessions/{id}", ...)`).
+func (a *API) handleDeleteSession() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
+		id, err := uuid.Parse(idStr)
+		if err != nil {
+			writeBadRequest(w, "Invalid session id.")
+			return
+		}
+		err = a.deps.Cfg.Sessions.DeleteSession(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				// Idempotent: already-gone is fine.
+				writeJSON(w, http.StatusOK, map[string]any{
+					"deleted":    true,
+					"session_id": id.String(),
+					"idempotent": true,
+				})
+				return
+			}
+			a.deps.Cfg.Logger.Error("delete session failed",
+				"err_kind", "db",
+				"session_id", id.String(),
+			)
+			writeInternal(w)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"deleted":    true,
+			"session_id": id.String(),
+		})
+	}
+}

@@ -40,6 +40,7 @@ type SessionWriter interface {
 	UpdateSessionStatus(ctx context.Context, id uuid.UUID, status string, endedAt *time.Time) error
 	GetSession(ctx context.Context, id uuid.UUID) (*storage.Session, error)
 	ListSessions(ctx context.Context, limit int) ([]storage.Session, error)
+	DeleteSession(ctx context.Context, id uuid.UUID) error
 }
 
 // TelemetryWriter is the subset of storage.Store used by the

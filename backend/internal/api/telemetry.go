@@ -53,90 +53,123 @@ func (a *API) handlePostTelemetry() http.HandlerFunc {
 		// (1) Path param: validate the session id before we
 		// waste cycles on body parsing.
 		idStr := chi.URLParam(r, "id")
-		sessionID, err := uuid.Parse(idStr)
+		pathSessionID, err := uuid.Parse(idStr)
 		if err != nil {
 			writeBadRequest(w, "Invalid session id.")
 			return
 		}
-
-		// (2) Read body (bounded by MaxBytesMiddleware).
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			var mbe *http.MaxBytesError
-			if errors.As(err, &mbe) {
-				writeError(w, http.StatusRequestEntityTooLarge, ErrorBody{
-					Code:    CodePayloadTooLarge,
-					Message: "Request body exceeds size limit.",
-				})
-				return
-			}
-			writeBadRequest(w, "Failed to read request body.")
-			return
-		}
-		if len(body) == 0 {
-			writeBadRequest(w, "Empty request body.")
-			return
-		}
-
-		// (3) Schema-validate the raw bytes against the
-		// telemetry schema. This is the MANDATORY check
-		// (HANDOFF §4.1 PR-7 telemetry.go).
-		if err := a.deps.Schemas.Validate(SchemaTelemetry, body); err != nil {
-			if ve, ok := isValidationError(err); ok {
-				writeValidation(w, ve)
-				return
-			}
-			a.deps.Cfg.Logger.Error("telemetry schema validation error",
-				"err_kind", "schema",
-				"session_id", sessionID.String(),
-			)
-			writeBadRequest(w, "Schema validation failed.")
-			return
-		}
-
-		// (4) Decode into the storage type. We re-decode (not
-		// reuse the schema-validated bytes) so a future schema
-		// field rename doesn't accidentally change storage.
-		var t decodedTelemetry
-		if err := json.Unmarshal(body, &t); err != nil {
-			writeBadRequest(w, "Malformed JSON.")
-			return
-		}
-
-		// (5) Defence in depth: cross-check the session_id in
-		// the body (if present) against the URL path. A body
-		// claiming a different session than the URL is
-		// silently dropped — most likely a stale retry from
-		// the mobile client.
-		if t.SessionID != nil && *t.SessionID != sessionID {
-			writeBadRequest(w, "Session id in body does not match URL.")
-			return
-		}
-
-		// (6) Persist via storage. The TelemetryWriter interface
-		// is satisfied by storage.PostgresStore; tests use a
-		// fake (see telemetry_test.go).
-		storageRow, err := t.toStorage(sessionID)
-		if err != nil {
-			writeBadRequest(w, err.Error())
-			return
-		}
-		id, err := a.deps.Cfg.Telemetry.InsertTelemetry(r.Context(), storageRow)
-		if err != nil {
-			a.deps.Cfg.Logger.Error("insert telemetry failed",
-				"err_kind", "db",
-				"session_id", sessionID.String(),
-			)
-			writeInternal(w)
-			return
-		}
-
-		writeJSON(w, http.StatusAccepted, telemetryResponse{
-			ID:        id,
-			Accepted:  true,
-			SessionID: sessionID.String(),
-		})
+		handleTelemetryInsert(a, w, r, &pathSessionID)
 	}
+}
+
+// handlePostTelemetryLegacy is POST /api/v1/telemetry.
+//
+// Sprint 10.1D era — the original Sprint 7 wire-up contract
+// carried session_id in the body rather than the URL path.
+// That contract never had a matching backend handler, so any
+// mobile client (10.1B / 10.1D) that POSTed here received a
+// 404. This endpoint restores backward compatibility: the
+// body must carry `session_id` (the schema accepts it as
+// optional, but the legacy path requires it explicitly).
+//
+// We delegate to the shared handleTelemetryInsert helper so
+// both routes share the schema validation, JSON decode,
+// session-id cross-check, and storage insert logic.
+func (a *API) handlePostTelemetryLegacy() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		handleTelemetryInsert(a, w, r, nil)
+	}
+}
+
+// handleTelemetryInsert is the shared body for the two
+// telemetry POST handlers. `pathSessionID` is the path-level
+// session id when present (the canonical
+// /sessions/{id}/telemetry route) or nil when the route is
+// the legacy /telemetry POST (in which case the body must
+// carry session_id).
+//
+// Behaviour:
+//   - Reads the body, validates against telemetry.schema.json,
+//     JSON-decodes into the storage type.
+//   - Resolves the session id: prefers the path argument,
+//     falls back to the body's `session_id` field, and 400s
+//     when neither is set.
+//   - Persists via storage.TelemetryWriter (same as the path
+//     route).
+//   - Returns 202 with the new telemetry row id.
+func handleTelemetryInsert(a *API, w http.ResponseWriter, r *http.Request, pathSessionID *uuid.UUID) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusRequestEntityTooLarge, ErrorBody{
+				Code:    CodePayloadTooLarge,
+				Message: "Request body exceeds size limit.",
+			})
+			return
+		}
+		writeBadRequest(w, "Failed to read request body.")
+		return
+	}
+	if len(body) == 0 {
+		writeBadRequest(w, "Empty request body.")
+		return
+	}
+
+	if err := a.deps.Schemas.Validate(SchemaTelemetry, body); err != nil {
+		if ve, ok := isValidationError(err); ok {
+			writeValidation(w, ve)
+			return
+		}
+		a.deps.Cfg.Logger.Error("telemetry schema validation error",
+			"err_kind", "schema",
+		)
+		writeBadRequest(w, "Schema validation failed.")
+		return
+	}
+
+	var t decodedTelemetry
+	if err := json.Unmarshal(body, &t); err != nil {
+		writeBadRequest(w, "Malformed JSON.")
+		return
+	}
+
+	// Resolve the session id: path first, body fallback,
+	// 400 when neither is present (legacy route).
+	sessionID := pathSessionID
+	if sessionID == nil {
+		if t.SessionID == nil {
+			writeBadRequest(w, "session_id is required (legacy /telemetry route).")
+			return
+		}
+		sessionID = t.SessionID
+	} else if t.SessionID != nil && *t.SessionID != *sessionID {
+		// Defence in depth: body session_id, if present, must
+		// match the URL path (catches stale mobile retries).
+		writeBadRequest(w, "Session id in body does not match URL.")
+		return
+	}
+
+	storageRow, err := t.toStorage(*sessionID)
+	if err != nil {
+		writeBadRequest(w, err.Error())
+		return
+	}
+	id, err := a.deps.Cfg.Telemetry.InsertTelemetry(r.Context(), storageRow)
+	if err != nil {
+		a.deps.Cfg.Logger.Error("insert telemetry failed",
+			"err_kind", "db",
+			"session_id", sessionID.String(),
+		)
+		writeInternal(w)
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, telemetryResponse{
+		ID:        id,
+		Accepted:  true,
+		SessionID: sessionID.String(),
+	})
 }
 
 // decodedTelemetry is the request-side shape of one telemetry

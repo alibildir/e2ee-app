@@ -163,6 +163,50 @@ func TestPostgresStore_UpdateSessionStatus_NotFound(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+// =====================================================================
+// Sprint 12.0+ — DeleteSession
+// =====================================================================
+
+func TestPostgresStore_DeleteSession_HappyPath(t *testing.T) {
+	s, mock := newMockStore(t)
+	sid := uuid.New()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`DELETE FROM telemetry_aggregates`).
+		WithArgs(sid).
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`DELETE FROM sessions`).
+		WithArgs(sid).
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, s.DeleteSession(context.Background(), sid))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_DeleteSession_NotFound(t *testing.T) {
+	s, mock := newMockStore(t)
+	sid := uuid.New()
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`DELETE FROM telemetry_aggregates`).
+		WithArgs(sid).
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectExec(`DELETE FROM sessions`).
+		WithArgs(sid).
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectCommit()
+
+	err := s.DeleteSession(context.Background(), sid)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestPostgresStore_DeleteSession_RejectsZeroUUID(t *testing.T) {
+	s, _ := newMockStore(t)
+	require.Error(t, s.DeleteSession(context.Background(), uuid.Nil))
+}
+
 func TestPostgresStore_GetSession(t *testing.T) {
 	s, mock := newMockStore(t)
 	sid := uuid.New()

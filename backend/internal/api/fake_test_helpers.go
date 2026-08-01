@@ -251,6 +251,23 @@ func (f *fakeStore) ListTelemetryAggregates(ctx context.Context, ids []uuid.UUID
 	return out, nil
 }
 
+// DeleteSession hard-deletes a session row (Sprint 12.0+).
+func (f *fakeStore) DeleteSession(ctx context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id == uuid.Nil {
+		return fmt.Errorf("fakeStore: DeleteSession: zero uuid")
+	}
+	if _, ok := f.Sessions[id]; !ok {
+		return storage.ErrNotFound
+	}
+	delete(f.Sessions, id)
+	if f.TelemetryAggregates != nil {
+		delete(f.TelemetryAggregates, id)
+	}
+	return nil
+}
+
 // UserPurger interface
 func (f *fakeStore) DeleteUser(ctx context.Context, deviceIDHash string) error {
 	f.mu.Lock()

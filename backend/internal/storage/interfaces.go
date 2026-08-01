@@ -142,6 +142,14 @@ type Store interface {
 	UpdateSessionStatus(ctx context.Context, id uuid.UUID, status string, endedAt *time.Time) error
 	GetSession(ctx context.Context, id uuid.UUID) (*Session, error)
 	ListSessions(ctx context.Context, limit int) ([]Session, error)
+	// DeleteSession hard-deletes a session row plus its
+	// cached aggregate (Sprint 12.0+). Used by the
+	// P2P session_orchestrator's tearDown() flow. Returns
+	// (nil, ErrNotFound) if the row did not exist (idempotent
+	// DELETE semantics). Telemetry rows are NOT touched —
+	// those belong to the device and are cleaned by
+	// DeleteUser (KVKK).
+	DeleteSession(ctx context.Context, id uuid.UUID) error
 	// ListTelemetryAggregates returns the cached aggregates for a
 	// batch of session IDs (used by GET /api/v1/sessions to embed
 	// summary_stats without N+1 queries). Missing aggregates are
