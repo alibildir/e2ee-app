@@ -224,6 +224,11 @@ func (a *API) handleGetSession() http.HandlerFunc {
 // dashboard for the session-history view. Privacy: this is an
 // admin/dashboard endpoint in MVP — when consumer-facing
 // listing lands, it must be filtered by device_id_hash.
+//
+// Sprint 12.0: when a SummaryAggregator is wired in
+// (cfg.SummaryAggregator != nil), the response embeds a
+// `summary_stats` block per session, fetched in a single
+// batched call (ListForSessions) to avoid N+1 queries.
 func (a *API) handleListSessions() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		limit := 50
@@ -238,16 +243,41 @@ func (a *API) handleListSessions() http.HandlerFunc {
 			writeInternal(w)
 			return
 		}
+
+		// Sprint 12.0 — batch-fetch the per-session aggregates
+		// in a single call so the Skorlar screen can render
+		// each card with real numbers.
+		aggregates := map[uuid.UUID]storage.TelemetryAggregate{}
+		if a.deps.Cfg.SummaryAggregator != nil && len(sessions) > 0 {
+			ids := make([]uuid.UUID, 0, len(sessions))
+			for _, s := range sessions {
+				ids = append(ids, s.ID)
+			}
+			aggs, err := a.deps.Cfg.SummaryAggregator.ListForSessions(r.Context(), ids)
+			if err != nil {
+				a.deps.Cfg.Logger.Warn("list session aggregates failed",
+					"err_kind", "aggregate",
+				)
+				// Graceful degradation: continue without summary_stats.
+			} else {
+				aggregates = aggs
+			}
+		}
+
 		out := make([]sessionResponse, 0, len(sessions))
 		for _, s := range sessions {
-			out = append(out, sessionResponse{
+			resp := sessionResponse{
 				ID:        s.ID,
 				Mode:      s.Mode,
 				TaskType:  s.TaskType,
 				Status:    s.Status,
 				StartedAt: s.StartedAt,
 				EndedAt:   s.EndedAt,
-			})
+			}
+			if agg, ok := aggregates[s.ID]; ok {
+				resp.SummaryStats = summaryStatsFromAggregate(&agg)
+			}
+			out = append(out, resp)
 		}
 		writeJSON(w, http.StatusOK, listSessionsResponse{
 			Sessions: out,
@@ -256,23 +286,48 @@ func (a *API) handleListSessions() http.HandlerFunc {
 	}
 }
 
+// summaryStatsFromAggregate converts a TelemetryAggregate into
+// the canonical map[string]any shape that the Skorlar screen
+// (`SessionTelemetry.fromJson`) consumes. Kept as a helper so
+// handleCloseSession and handleListSessions stay in sync.
+func summaryStatsFromAggregate(agg *storage.TelemetryAggregate) map[string]any {
+	if agg == nil {
+		return nil
+	}
+	return map[string]any{
+		"total_packets":            agg.TotalPackets,
+		"encrypted_packets":        agg.EncryptedPackets,
+		"packet_loss_pct":          agg.PacketLossPct,
+		"mean_latency_ms":          agg.MeanLatencyMs,
+		"jitter_ms":                agg.JitterMs,
+		"encryption_integrity_pct": agg.EncryptionIntegrityPct,
+		"captured_at":              agg.CapturedAt.Format(time.RFC3339),
+	}
+}
+
 // sessionResponse is the JSON shape returned to clients. It is
 // a SUBSET of session.schema.json (omits device_id_hash and
 // receiver_device_id_hash on GET responses for privacy; the
 // device reading its own session already knows its own hash).
+//
+// Sprint 12.0 — SummaryStats is populated when the api layer
+// has a wired SummaryAggregator; the field is omitted when no
+// aggregate exists yet (mobile falls back to placeholder 0
+// values via SessionTelemetry.fromJson default-value handling).
 type sessionResponse struct {
-	ID                   uuid.UUID  `json:"id"`
-	DeviceIDHash         string     `json:"device_id_hash,omitempty"`
-	ReceiverDeviceIDHash string     `json:"receiver_device_id_hash,omitempty"`
-	Mode                 string     `json:"mode"`
-	TaskType             string     `json:"task_type"`
-	TestText             string     `json:"test_text,omitempty"`
-	TargetPhoneHash      string     `json:"target_phone_hash,omitempty"`
-	TargetOperator       string     `json:"target_operator,omitempty"`
-	Status               string     `json:"status"`
-	CreatedAt            time.Time  `json:"created_at,omitempty"`
-	StartedAt            time.Time  `json:"started_at"`
-	EndedAt              *time.Time `json:"ended_at,omitempty"`
+	ID                   uuid.UUID             `json:"id"`
+	DeviceIDHash         string                `json:"device_id_hash,omitempty"`
+	ReceiverDeviceIDHash string                `json:"receiver_device_id_hash,omitempty"`
+	Mode                 string                `json:"mode"`
+	TaskType             string                `json:"task_type"`
+	TestText             string                `json:"test_text,omitempty"`
+	TargetPhoneHash      string                `json:"target_phone_hash,omitempty"`
+	TargetOperator       string                `json:"target_operator,omitempty"`
+	Status               string                `json:"status"`
+	CreatedAt            time.Time             `json:"created_at,omitempty"`
+	StartedAt            time.Time             `json:"started_at"`
+	EndedAt              *time.Time            `json:"ended_at,omitempty"`
+	SummaryStats         map[string]any        `json:"summary_stats,omitempty"`
 }
 
 type listSessionsResponse struct {
@@ -318,10 +373,12 @@ func nilIfEmpty(s string) *string {
 // encrypted/total pair). The Skorlar screen reads these
 // into `SessionScoreCalculator.compute(...)`.
 //
-// The summary block is computed in-memory; Sprint 12.0 will
-// persist it to TimescaleDB (Sprint 7's storage layer
-// already exposes the `SessionSummary` table) so the Skorlar
-// screen can show historical scores after a process restart.
+// Sprint 12.0 — `summary_stats` is computed from the
+// `telemetry_aggregates` table (the AggregateSession service
+// reads the raw `telemetry` rows on cache miss, persists the
+// aggregate, and returns the cached value). When no aggregator
+// is wired, the handler falls back to the placeholder block
+// so existing wiring keeps working unchanged.
 func (a *API) handleCloseSession() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Extract the session id from the URL. chi's URL
@@ -366,14 +423,10 @@ func (a *API) handleCloseSession() http.HandlerFunc {
 				)
 			}
 		}
-		// Build the summary_stats block. The values below
-		// are placeholder zeros for Sprint 11.0C — the
-		// in-memory `summary_stats` is wired in Sprint 12.0
-		// against the TelemetryAggregate table. The 6 fields
-		// are emitted verbatim so the mobile `fromJson`
-		// factory can decode the response shape today; the
-		// zero-valued fields drive a `Skorlar 0/100` empty
-		// card for the M3 demo.
+		// Compute the summary_stats block. Sprint 12.0 — when
+		// the SummaryAggregator is wired, use it; otherwise
+		// emit the placeholder block the mobile fromJson
+		// factory expects.
 		now := time.Now().UTC()
 		summary := map[string]any{
 			"total_packets":            0,
@@ -383,6 +436,19 @@ func (a *API) handleCloseSession() http.HandlerFunc {
 			"jitter_ms":                0.0,
 			"encryption_integrity_pct": 100.0,
 			"captured_at":              now.Format(time.RFC3339),
+		}
+		if a.deps.Cfg.SummaryAggregator != nil {
+			if id, err := uuid.Parse(sessionID); err == nil {
+				agg, err := a.deps.Cfg.SummaryAggregator.AggregateSession(r.Context(), id)
+				if err != nil {
+					a.deps.Cfg.Logger.Warn("aggregate session failed; using empty placeholder",
+						"err_kind", "aggregate",
+						"session_id", sessionID,
+					)
+				} else if agg != nil {
+					summary = summaryStatsFromAggregate(agg)
+				}
+			}
 		}
 		out := map[string]any{
 			"session_id":    sessionID,

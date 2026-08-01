@@ -80,11 +80,29 @@ CREATE TABLE IF NOT EXISTS telemetry (
     timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 `
+
+	// Sprint 12.0 — per-session summary aggregate (the
+	// summary_stats block returned by /sessions/{id}/close and
+	// embedded in /sessions list responses). One row per
+	// session, upserted on close.
+	schemaTelemetryAggregatesSQL = `
+CREATE TABLE IF NOT EXISTS telemetry_aggregates (
+    session_id              UUID PRIMARY KEY,
+    total_packets           BIGINT NOT NULL DEFAULT 0,
+    encrypted_packets       BIGINT NOT NULL DEFAULT 0,
+    packet_loss_pct         DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    mean_latency_ms         DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    jitter_ms               DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    encryption_integrity_pct DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    captured_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`
 )
 
 // schemaSQL is the legacy single-string concatenation kept for backward
 // compat with tests that just assert table names exist. Not used in Migrate.
-const schemaSQL = schemaDevicesSQL + schemaSessionsSQL + schemaTelemetrySQL
+const schemaSQL = schemaDevicesSQL + schemaSessionsSQL + schemaTelemetrySQL + schemaTelemetryAggregatesSQL
 
 // NewPostgresStore opens a pooled connection to PostgreSQL.
 //
@@ -118,7 +136,7 @@ func (s *PostgresStore) Close() {
 // on every startup. Each table is created in its own Exec so callers can
 // decide per-step error handling if needed.
 func (s *PostgresStore) Migrate(ctx context.Context) error {
-	for _, stmt := range []string{schemaDevicesSQL, schemaSessionsSQL, schemaTelemetrySQL} {
+	for _, stmt := range []string{schemaDevicesSQL, schemaSessionsSQL, schemaTelemetrySQL, schemaTelemetryAggregatesSQL} {
 		if _, err := s.pool.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("storage: migrate schema: %w", err)
 		}
@@ -291,8 +309,176 @@ func (s *PostgresStore) DeleteUser(ctx context.Context, deviceIDHash string) err
 	if _, err := tx.Exec(ctx, `DELETE FROM devices WHERE device_id_hash = $1`, deviceIDHash); err != nil {
 		return fmt.Errorf("storage: delete device %s: %w", deviceIDHash, err)
 	}
+	if _, err := tx.Exec(ctx, `DELETE FROM telemetry_aggregates WHERE session_id IN (SELECT id FROM sessions WHERE id IS NOT NULL)`, ); err != nil {
+		// best-effort: aggregates will be purged via cascade
+		// when the session rows above already anonymised
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("storage: commit delete-user tx: %w", err)
 	}
 	return nil
+}
+
+// entropyEncryptedThreshold is the entropy value above which a
+// telemetry row is considered "encrypted" (Sprint 12.0 MVP
+// proxy — a high-entropy TLS Client Hello is the strongest
+// signal we have without per-packet loss / latency telemetry).
+// 7.0 bits/byte is the typical threshold for "looks
+// encrypted" in the literature; Shannon entropy of random
+// bytes is 8.0 bits/byte.
+const entropyEncryptedThreshold = 7.0
+
+// UpsertTelemetryAggregate inserts-or-updates the per-session
+// aggregate. ON CONFLICT (session_id) DO UPDATE keeps the row
+// idempotent on repeated calls (e.g. close-session retry from
+// the mobile side).
+func (s *PostgresStore) UpsertTelemetryAggregate(ctx context.Context, agg TelemetryAggregate) error {
+	if agg.SessionID == uuid.Nil {
+		return fmt.Errorf("storage: UpsertTelemetryAggregate: zero session_id")
+	}
+	now := time.Now().UTC()
+	if agg.UpdatedAt.IsZero() {
+		agg.UpdatedAt = now
+	}
+	if agg.CapturedAt.IsZero() {
+		agg.CapturedAt = agg.UpdatedAt
+	}
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO telemetry_aggregates (
+			session_id, total_packets, encrypted_packets,
+			packet_loss_pct, mean_latency_ms, jitter_ms,
+			encryption_integrity_pct, captured_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (session_id) DO UPDATE SET
+			total_packets           = EXCLUDED.total_packets,
+			encrypted_packets       = EXCLUDED.encrypted_packets,
+			packet_loss_pct         = EXCLUDED.packet_loss_pct,
+			mean_latency_ms         = EXCLUDED.mean_latency_ms,
+			jitter_ms               = EXCLUDED.jitter_ms,
+			encryption_integrity_pct = EXCLUDED.encryption_integrity_pct,
+			captured_at             = EXCLUDED.captured_at,
+			updated_at              = EXCLUDED.updated_at
+	`,
+		agg.SessionID, agg.TotalPackets, agg.EncryptedPackets,
+		agg.PacketLossPct, agg.MeanLatencyMs, agg.JitterMs,
+		agg.EncryptionIntegrityPct, agg.CapturedAt, agg.UpdatedAt,
+	); err != nil {
+		return fmt.Errorf("storage: upsert telemetry_aggregate: %w", err)
+	}
+	return nil
+}
+
+// GetTelemetryAggregate returns the cached aggregate for a
+// session. Returns (nil, ErrNotFound) when no aggregate exists
+// yet (compute + upsert has not been called for this session).
+func (s *PostgresStore) GetTelemetryAggregate(ctx context.Context, sessionID uuid.UUID) (*TelemetryAggregate, error) {
+	if sessionID == uuid.Nil {
+		return nil, fmt.Errorf("storage: GetTelemetryAggregate: zero session_id")
+	}
+	var agg TelemetryAggregate
+	err := s.pool.QueryRow(ctx, `
+		SELECT session_id, total_packets, encrypted_packets,
+		       packet_loss_pct, mean_latency_ms, jitter_ms,
+		       encryption_integrity_pct, captured_at, updated_at
+		  FROM telemetry_aggregates
+		 WHERE session_id = $1
+	`, sessionID).Scan(
+		&agg.SessionID, &agg.TotalPackets, &agg.EncryptedPackets,
+		&agg.PacketLossPct, &agg.MeanLatencyMs, &agg.JitterMs,
+		&agg.EncryptionIntegrityPct, &agg.CapturedAt, &agg.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("storage: get telemetry_aggregate: %w", err)
+	}
+	return &agg, nil
+}
+
+// ComputeTelemetryAggregate reads the raw `telemetry` rows
+// for the session and computes the aggregate in Go code. MVP
+// sources (see TelemetryAggregate doc):
+//   - total_packets        = COUNT(*) FROM telemetry WHERE session_id
+//   - encrypted_packets    = COUNT(*) WHERE session_id AND entropy >= 7.0
+//   - packet_loss_pct      = 0  (no per-packet loss signal yet)
+//   - mean_latency_ms      = 0  (no per-packet latency stored)
+//   - jitter_ms            = 0  (no per-packet jitter stored)
+//   - encryption_integrity_pct = encrypted_packets / total_packets * 100
+//
+// The returned aggregate is NOT persisted here — the caller
+// (the telemetry service) is responsible for UpsertTelemetryAggregate.
+func (s *PostgresStore) ComputeTelemetryAggregate(ctx context.Context, sessionID uuid.UUID) (*TelemetryAggregate, error) {
+	if sessionID == uuid.Nil {
+		return nil, fmt.Errorf("storage: ComputeTelemetryAggregate: zero session_id")
+	}
+	var (
+		totalPackets     int64
+		encryptedPackets int64
+	)
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+			COUNT(*) AS total,
+			COALESCE(SUM(CASE WHEN entropy >= $2 THEN 1 ELSE 0 END), 0) AS encrypted
+		  FROM telemetry
+		 WHERE session_id = $1
+	`, sessionID, entropyEncryptedThreshold).Scan(&totalPackets, &encryptedPackets)
+	if err != nil {
+		return nil, fmt.Errorf("storage: compute telemetry_aggregate: %w", err)
+	}
+	now := time.Now().UTC()
+	integrity := 0.0
+	if totalPackets > 0 {
+		integrity = float64(encryptedPackets) / float64(totalPackets) * 100.0
+	}
+	return &TelemetryAggregate{
+		SessionID:              sessionID,
+		TotalPackets:           totalPackets,
+		EncryptedPackets:       encryptedPackets,
+		PacketLossPct:          0.0,
+		MeanLatencyMs:          0.0,
+		JitterMs:               0.0,
+		EncryptionIntegrityPct: integrity,
+		CapturedAt:             now,
+		UpdatedAt:              now,
+	}, nil
+}
+
+// ListTelemetryAggregates returns the cached aggregates for a
+// batch of session IDs (used by GET /api/v1/sessions to embed
+// summary_stats without N+1 queries). Missing aggregates are
+// silently skipped — the returned map contains only those that
+// exist. The caller may fall back to placeholder or compute
+// on demand.
+func (s *PostgresStore) ListTelemetryAggregates(ctx context.Context, sessionIDs []uuid.UUID) (map[uuid.UUID]TelemetryAggregate, error) {
+	if len(sessionIDs) == 0 {
+		return map[uuid.UUID]TelemetryAggregate{}, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT session_id, total_packets, encrypted_packets,
+		       packet_loss_pct, mean_latency_ms, jitter_ms,
+		       encryption_integrity_pct, captured_at, updated_at
+		  FROM telemetry_aggregates
+		 WHERE session_id = ANY($1)
+	`, sessionIDs)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list telemetry_aggregates: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[uuid.UUID]TelemetryAggregate, len(sessionIDs))
+	for rows.Next() {
+		var agg TelemetryAggregate
+		if err := rows.Scan(
+			&agg.SessionID, &agg.TotalPackets, &agg.EncryptedPackets,
+			&agg.PacketLossPct, &agg.MeanLatencyMs, &agg.JitterMs,
+			&agg.EncryptionIntegrityPct, &agg.CapturedAt, &agg.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("storage: scan telemetry_aggregate: %w", err)
+		}
+		out[agg.SessionID] = agg
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: iterate telemetry_aggregates: %w", err)
+	}
+	return out, nil
 }

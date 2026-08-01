@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -30,6 +31,7 @@ import (
 	"github.com/opene2ee-com/e2ee-app/backend/internal/auth"
 	"github.com/opene2ee-com/e2ee-app/backend/internal/operator"
 	"github.com/opene2ee-com/e2ee-app/backend/internal/storage"
+	"github.com/opene2ee-com/e2ee-app/backend/internal/telemetry"
 )
 
 // -----------------------------------------------------------------------------
@@ -47,6 +49,7 @@ type fakeStore struct {
 	Sessions      map[uuid.UUID]storage.Session
 	TelemetryRows []storage.Telemetry
 	TelemetryIDs  []int64
+	TelemetryAggregates map[uuid.UUID]storage.TelemetryAggregate
 	Devices       map[string]fakeDevice // device_id_hash → row
 	DeletedHashes []string
 
@@ -75,9 +78,10 @@ type fakeDevice struct {
 // background state.
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		Sessions:        make(map[uuid.UUID]storage.Session),
-		Devices:         make(map[string]fakeDevice),
-		nextTelemetryID: 0,
+		Sessions:           make(map[uuid.UUID]storage.Session),
+		Devices:            make(map[string]fakeDevice),
+		TelemetryAggregates: make(map[uuid.UUID]storage.TelemetryAggregate),
+		nextTelemetryID:    0,
 	}
 }
 
@@ -170,6 +174,81 @@ func (f *fakeStore) InsertTelemetry(ctx context.Context, t storage.Telemetry) (i
 	f.TelemetryRows = append(f.TelemetryRows, t)
 	f.TelemetryIDs = append(f.TelemetryIDs, id)
 	return id, nil
+}
+
+// =====================================================================
+// Sprint 12.0 — TelemetryAggregate (4 methods on the Store surface)
+// =====================================================================
+
+func (f *fakeStore) UpsertTelemetryAggregate(ctx context.Context, agg storage.TelemetryAggregate) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.TelemetryAggregates == nil {
+		f.TelemetryAggregates = map[uuid.UUID]storage.TelemetryAggregate{}
+	}
+	if agg.SessionID == uuid.Nil {
+		return fmt.Errorf("fakeStore: UpsertTelemetryAggregate: zero session_id")
+	}
+	if agg.UpdatedAt.IsZero() {
+		agg.UpdatedAt = time.Now().UTC()
+	}
+	if agg.CapturedAt.IsZero() {
+		agg.CapturedAt = agg.UpdatedAt
+	}
+	f.TelemetryAggregates[agg.SessionID] = agg
+	return nil
+}
+
+func (f *fakeStore) GetTelemetryAggregate(ctx context.Context, id uuid.UUID) (*storage.TelemetryAggregate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	agg, ok := f.TelemetryAggregates[id]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	return &agg, nil
+}
+
+func (f *fakeStore) ComputeTelemetryAggregate(ctx context.Context, id uuid.UUID) (*storage.TelemetryAggregate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var total, encrypted int64
+	for _, row := range f.TelemetryRows {
+		if row.SessionID != nil && *row.SessionID == id {
+			total++
+			if row.Entropy >= 7.0 {
+				encrypted++
+			}
+		}
+	}
+	now := time.Now().UTC()
+	integrity := 0.0
+	if total > 0 {
+		integrity = float64(encrypted) / float64(total) * 100.0
+	}
+	return &storage.TelemetryAggregate{
+		SessionID:              id,
+		TotalPackets:           total,
+		EncryptedPackets:       encrypted,
+		PacketLossPct:          0.0,
+		MeanLatencyMs:          0.0,
+		JitterMs:               0.0,
+		EncryptionIntegrityPct: integrity,
+		CapturedAt:             now,
+		UpdatedAt:              now,
+	}, nil
+}
+
+func (f *fakeStore) ListTelemetryAggregates(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]storage.TelemetryAggregate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[uuid.UUID]storage.TelemetryAggregate{}
+	for _, id := range ids {
+		if agg, ok := f.TelemetryAggregates[id]; ok {
+			out[id] = agg
+		}
+	}
+	return out, nil
 }
 
 // UserPurger interface
@@ -361,16 +440,17 @@ func newTestAPI(t *testing.T) *testAPI {
 	rl := NewRateLimiter(DefaultRateLimitConfig)
 
 	a, err := New(Config{
-		Logger:          logger,
-		Sessions:        store,
-		Telemetry:       store,
-		Users:           store,
-		Operator:        op,
-		Matrix:          mq,
-		Devices:         store,
-		RateLimit:       rl,
-		MaxBodyBytes:    1024 * 1024, // 1 MB in tests
-		JWTSecret:       TestJWTSecret,
+		Logger:           logger,
+		Sessions:         store,
+		Telemetry:        store,
+		Users:            store,
+		Operator:         op,
+		Matrix:           mq,
+		Devices:          store,
+		RateLimit:        rl,
+		MaxBodyBytes:     1024 * 1024, // 1 MB in tests
+		JWTSecret:        TestJWTSecret,
+		SummaryAggregator: telemetry.NewAggregator(store),
 	})
 	if err != nil {
 		t.Fatalf("api.New: %v", err)

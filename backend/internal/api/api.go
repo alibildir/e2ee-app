@@ -75,6 +75,20 @@ type MatrixQuerier interface {
 	Aggregate(ctx context.Context, f MatrixFilter) ([]MatrixRow, error)
 }
 
+// SummaryAggregator is the per-session summary_stats pipeline
+// (Sprint 12.0). It powers the `summary_stats` block returned
+// by `POST /api/v1/sessions/{id}/close` and embedded in the
+// `GET /api/v1/sessions` response.
+//
+// The internal/telemetry.Aggregator satisfies this interface.
+// When nil, the api handlers degrade gracefully: handleCloseSession
+// returns the existing placeholder block; handleListSessions
+// simply omits summary_stats from each row.
+type SummaryAggregator interface {
+	AggregateSession(ctx context.Context, sessionID uuid.UUID) (*storage.TelemetryAggregate, error)
+	ListForSessions(ctx context.Context, sessionIDs []uuid.UUID) (map[uuid.UUID]storage.TelemetryAggregate, error)
+}
+
 // DeviceRegistrar is used by the sessions handler when the
 // client supplies a public_key + public_key_fp at session
 // creation time. May be nil if the caller already registered
@@ -138,6 +152,13 @@ type Config struct {
 	// /api/v1/webrtc/* endpoints (Sprint 3 PR-21a). If nil,
 	// the four endpoints 500 with "internal_error".
 	WebRTC matching.WebRTCManagerIface
+	// SummaryAggregator powers the per-session `summary_stats`
+	// block (Sprint 12.0). When nil, the API handlers fall back
+	// to the existing placeholder behaviour (zeros on close,
+	// no field on list). Wire-up in cmd/server/main.go should
+	// pass telemetry.NewAggregator(pgStore) to enable real
+	// computation.
+	SummaryAggregator SummaryAggregator
 	// JWTSecret is the HS256 shared secret used by /api/v1/auth
 	// to mint bearer tokens AND by IsAuthorized to verify them
 	// (defence-in-depth — the Kong JWT plugin in infra/kong is

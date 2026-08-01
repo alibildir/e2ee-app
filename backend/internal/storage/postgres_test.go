@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/pashagolub/pgxmock/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,12 +26,14 @@ func newMockStore(t *testing.T) (*PostgresStore, pgxmock.PgxPoolIface) {
 
 func TestPostgresStore_Migrate(t *testing.T) {
 	s, mock := newMockStore(t)
-	// Migrate runs three Exec calls — one per table.
+	// Migrate runs four Exec calls — one per table.
 	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS devices`).
 		WillReturnResult(pgxmock.NewResult("CREATE", 0))
 	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS sessions`).
 		WillReturnResult(pgxmock.NewResult("CREATE", 0))
 	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS telemetry`).
+		WillReturnResult(pgxmock.NewResult("CREATE", 0))
+	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS telemetry_aggregates`).
 		WillReturnResult(pgxmock.NewResult("CREATE", 0))
 
 	require.NoError(t, s.Migrate(context.Background()))
@@ -231,6 +234,7 @@ func TestSchemaContainsAllTables(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS devices",
 		"CREATE TABLE IF NOT EXISTS sessions",
 		"CREATE TABLE IF NOT EXISTS telemetry",
+		"CREATE TABLE IF NOT EXISTS telemetry_aggregates",
 		"device_id_hash",
 		"public_key_fp",
 		"ip_subnet",
@@ -301,4 +305,176 @@ func TestPostgresStore_Pool(t *testing.T) {
 	s := &PostgresStore{pool: mock}
 	got := s.Pool()
 	assert.Same(t, mock, got, "Pool() must return the underlying pool")
+}
+
+// =====================================================================
+// Sprint 12.0 — TelemetryAggregate
+// =====================================================================
+
+func TestPostgresStore_UpsertTelemetryAggregate_Insert(t *testing.T) {
+	s, mock := newMockStore(t)
+	sid := uuid.New()
+	now := time.Now().UTC()
+
+	mock.ExpectExec(`INSERT INTO telemetry_aggregates`).
+		WithArgs(sid, int64(100), int64(98), 0.5, 12.7, 3.2, 98.0, now, now).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+
+	require.NoError(t, s.UpsertTelemetryAggregate(context.Background(), TelemetryAggregate{
+		SessionID:              sid,
+		TotalPackets:           100,
+		EncryptedPackets:       98,
+		PacketLossPct:          0.5,
+		MeanLatencyMs:          12.7,
+		JitterMs:               3.2,
+		EncryptionIntegrityPct: 98.0,
+		CapturedAt:             now,
+		UpdatedAt:              now,
+	}))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_UpsertTelemetryAggregate_DefaultsTimestamps(t *testing.T) {
+	s, mock := newMockStore(t)
+	sid := uuid.New()
+	// CapturedAt + UpdatedAt intentionally zero.
+
+	mock.ExpectExec(`INSERT INTO telemetry_aggregates`).
+		WithArgs(sid, int64(0), int64(0), 0.0, 0.0, 0.0, 0.0,
+			pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+
+	require.NoError(t, s.UpsertTelemetryAggregate(context.Background(), TelemetryAggregate{
+		SessionID: sid,
+	}))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_UpsertTelemetryAggregate_RejectsZeroUUID(t *testing.T) {
+	s, _ := newMockStore(t)
+	require.Error(t, s.UpsertTelemetryAggregate(context.Background(), TelemetryAggregate{}))
+}
+
+func TestPostgresStore_GetTelemetryAggregate(t *testing.T) {
+	s, mock := newMockStore(t)
+	sid := uuid.New()
+	cap := time.Now().UTC().Truncate(time.Second)
+	upd := cap.Add(time.Second)
+
+	rows := pgxmock.NewRows([]string{
+		"session_id", "total_packets", "encrypted_packets",
+		"packet_loss_pct", "mean_latency_ms", "jitter_ms",
+		"encryption_integrity_pct", "captured_at", "updated_at",
+	}).AddRow(sid, int64(50), int64(48), 1.0, 8.5, 2.1, 96.0, cap, upd)
+
+	mock.ExpectQuery(`SELECT session_id, total_packets`).
+		WithArgs(sid).
+		WillReturnRows(rows)
+
+	got, err := s.GetTelemetryAggregate(context.Background(), sid)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, int64(50), got.TotalPackets)
+	assert.Equal(t, int64(48), got.EncryptedPackets)
+	assert.Equal(t, 96.0, got.EncryptionIntegrityPct)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_GetTelemetryAggregate_NotFound(t *testing.T) {
+	s, mock := newMockStore(t)
+	sid := uuid.New()
+
+	// WillReturnError on QueryRow surfaces as pgx.ErrNoRows from Scan.
+	mock.ExpectQuery(`SELECT session_id, total_packets`).
+		WithArgs(sid).
+		WillReturnError(pgx.ErrNoRows)
+
+	got, err := s.GetTelemetryAggregate(context.Background(), sid)
+	require.Nil(t, got)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestPostgresStore_GetTelemetryAggregate_RejectsZeroUUID(t *testing.T) {
+	s, _ := newMockStore(t)
+	_, err := s.GetTelemetryAggregate(context.Background(), uuid.Nil)
+	require.Error(t, err)
+}
+
+func TestPostgresStore_ComputeTelemetryAggregate_WithData(t *testing.T) {
+	s, mock := newMockStore(t)
+	sid := uuid.New()
+
+	mock.ExpectQuery(`SELECT`).
+		WithArgs(sid, entropyEncryptedThreshold).
+		WillReturnRows(pgxmock.NewRows([]string{"total", "encrypted"}).
+			AddRow(int64(10), int64(8)))
+
+	got, err := s.ComputeTelemetryAggregate(context.Background(), sid)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, sid, got.SessionID)
+	assert.Equal(t, int64(10), got.TotalPackets)
+	assert.Equal(t, int64(8), got.EncryptedPackets)
+	assert.InDelta(t, 80.0, got.EncryptionIntegrityPct, 0.001)
+	// MVP: latency/loss are 0 (not yet derived).
+	assert.Equal(t, 0.0, got.PacketLossPct)
+	assert.Equal(t, 0.0, got.MeanLatencyMs)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_ComputeTelemetryAggregate_Empty(t *testing.T) {
+	s, mock := newMockStore(t)
+	sid := uuid.New()
+
+	mock.ExpectQuery(`SELECT`).
+		WithArgs(sid, entropyEncryptedThreshold).
+		WillReturnRows(pgxmock.NewRows([]string{"total", "encrypted"}).
+			AddRow(int64(0), int64(0)))
+
+	got, err := s.ComputeTelemetryAggregate(context.Background(), sid)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), got.TotalPackets)
+	assert.Equal(t, int64(0), got.EncryptedPackets)
+	// Empty session: integrity stays 0 (not divide-by-zero).
+	assert.Equal(t, 0.0, got.EncryptionIntegrityPct)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_ComputeTelemetryAggregate_RejectsZeroUUID(t *testing.T) {
+	s, _ := newMockStore(t)
+	_, err := s.ComputeTelemetryAggregate(context.Background(), uuid.Nil)
+	require.Error(t, err)
+}
+
+func TestPostgresStore_ListTelemetryAggregates(t *testing.T) {
+	s, mock := newMockStore(t)
+	sid1 := uuid.New()
+	sid2 := uuid.New()
+	now := time.Now().UTC()
+
+	rows := pgxmock.NewRows([]string{
+		"session_id", "total_packets", "encrypted_packets",
+		"packet_loss_pct", "mean_latency_ms", "jitter_ms",
+		"encryption_integrity_pct", "captured_at", "updated_at",
+	}).
+		AddRow(sid1, int64(10), int64(8), 0.0, 0.0, 0.0, 80.0, now, now).
+		AddRow(sid2, int64(20), int64(20), 0.0, 0.0, 0.0, 100.0, now, now)
+
+	mock.ExpectQuery(`SELECT session_id, total_packets`).
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnRows(rows)
+
+	out, err := s.ListTelemetryAggregates(context.Background(), []uuid.UUID{sid1, sid2})
+	require.NoError(t, err)
+	assert.Len(t, out, 2)
+	assert.Equal(t, int64(10), out[sid1].TotalPackets)
+	assert.Equal(t, int64(20), out[sid2].TotalPackets)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_ListTelemetryAggregates_Empty(t *testing.T) {
+	s, _ := newMockStore(t)
+	out, err := s.ListTelemetryAggregates(context.Background(), nil)
+	assert.Empty(t, out)
+	require.NoError(t, err)
 }

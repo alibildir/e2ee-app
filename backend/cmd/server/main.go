@@ -61,6 +61,7 @@ import (
 
 	"github.com/opene2ee-com/e2ee-app/backend/internal/api"
 	"github.com/opene2ee-com/e2ee-app/backend/internal/matching"
+	"github.com/opene2ee-com/e2ee-app/backend/internal/telemetry"
 	"github.com/opene2ee-com/e2ee-app/backend/internal/operator"
 	"github.com/opene2ee-com/e2ee-app/backend/internal/storage"
 )
@@ -586,17 +587,29 @@ func main() {
 	// separate PR.
 	matrix := api.NewMemoryMatrixQuerier()
 
+	// Sprint 12.0 — per-session summary_stats pipeline.
+	// The Aggregator reads raw telemetry rows on cache miss,
+	// persists to telemetry_aggregates, and returns the
+	// cached value. pgStore satisfies the
+	// telemetry.TelemetryAggregatorStore interface via the
+	// four new methods (UpsertTelemetryAggregate,
+	// GetTelemetryAggregate, ComputeTelemetryAggregate,
+	// ListTelemetryAggregates).
+	summaryAggregator := telemetry.NewAggregator(pgStore)
+	logger.Info("summary aggregator ready")
+
 	// Build the REST surface. operator.Service satisfies
 	// api.OperatorLookup (LookupByPhone + LookupByIP). pgStore
 	// satisfies every storage.* subset the api package depends on.
 	apiSvc, err := api.New(api.Config{
-		Logger:    logger,
-		Sessions:  pgStore,
-		Telemetry: pgStore,
-		Users:     pgStore,
-		Operator:  opSvc,
-		Matrix:    matrix,
-		Devices:   pgStore,
+		Logger:           logger,
+		Sessions:         pgStore,
+		Telemetry:        pgStore,
+		Users:            pgStore,
+		Operator:         opSvc,
+		Matrix:           matrix,
+		Devices:          pgStore,
+		SummaryAggregator: summaryAggregator,
 		// Sprint 5 PR-32 (ADV-3): JWT_SECRET — HS256 shared secret
 		// used by /api/v1/auth (IssueJWT) and the IsAuthorized
 		// middleware. MUST match Kong's JWT_SECRET (see
